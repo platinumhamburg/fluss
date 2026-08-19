@@ -22,6 +22,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.replica.ReplicaTestBase;
 
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -34,7 +35,7 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Tests TTL-based cleanup when remote log is disabled. */
+/** Tests local log TTL cleanup when remote log tiering is disabled. */
 final class LocalSegmentTTLTest extends ReplicaTestBase {
 
     @BeforeEach
@@ -95,10 +96,36 @@ final class LocalSegmentTTLTest extends ReplicaTestBase {
 
         addMultiSegmentsToLogTablet(logTablet, 5);
         manualClock.advanceTime(Duration.ofHours(2));
+
         logManager.cleanupExpiredLocalLogSegments();
 
         assertThat(logTablet.getSegments()).hasSize(1);
         assertThat(logTablet.localLogStartOffset()).isEqualTo(40L);
         assertThat(logTablet.activeLogSegment().getBaseOffset()).isEqualTo(40L);
+    }
+
+    @Test
+    void testExpiredSegmentsDeletedUsingHighWatermarkWhenRemoteLogDisabled() throws Exception {
+        TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID, 0);
+        makeLogTableAsLeader(tableBucket, false);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tableBucket).getLogTablet();
+
+        addMultiSegmentsToLogTablet(logTablet, 5);
+        manualClock.advanceTime(Duration.ofMinutes(90));
+        logManager.cleanupExpiredLocalLogSegments();
+
+        assertThat(logTablet.getSegments()).hasSize(1);
+        assertThat(logTablet.localLogStartOffset()).isEqualTo(40L);
+    }
+
+    @Test
+    void testLogTtlRemainsEffectiveWhenRemoteLogDisabled() throws Exception {
+        TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID, 0);
+        makeLogTableAsLeader(tableBucket, false);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tableBucket).getLogTablet();
+
+        logTablet.updateLogTtls(Duration.ofHours(2).toMillis(), Duration.ofMinutes(30).toMillis());
+
+        assertThat(logTablet.getEffectiveLocalLogTtlMs()).isEqualTo(Duration.ofHours(2).toMillis());
     }
 }

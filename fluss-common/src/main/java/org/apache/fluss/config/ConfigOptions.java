@@ -1841,9 +1841,12 @@ public class ConfigOptions {
                     .durationType()
                     .defaultValue(Duration.ofDays(7))
                     .withDescription(
-                            "The time to live for log segments. The configuration controls the maximum time "
-                                    + "we will retain a log before we will delete old segments to free up "
-                                    + "space. If set to -1, the log will not be deleted.");
+                            "The time to live for log segments. The configuration controls the "
+                                    + "maximum time log segments are retained before they become "
+                                    + "eligible for deletion. When remote log tiering is enabled, "
+                                    + "this value controls the retention of remote log segments. "
+                                    + "Setting the value to -1 disables TTL-based deletion. "
+                                    + "The default value is 7 days.");
 
     public static final ConfigOption<Integer> TABLE_TIERED_LOG_LOCAL_SEGMENTS =
             key("table.log.tiered.local-segments")
@@ -1852,6 +1855,20 @@ public class ConfigOptions {
                     .withDescription(
                             "The number of log segments to retain in local for each table when log tiered storage is enabled. "
                                     + "It must be greater that 0. The default is 2.");
+
+    public static final ConfigOption<Duration> TABLE_LOG_LOCAL_TTL =
+            key("table.log.local-ttl")
+                    .durationType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "The time to live for local log segments. The configuration controls the "
+                                    + "maximum time local log segments are retained before they become "
+                                    + "eligible for deletion. When remote log tiering is enabled, an "
+                                    + "expired local segment is deleted only after it has been copied "
+                                    + "to remote storage. Setting the value to -1 disables TTL-based "
+                                    + "deletion. If not configured, the value inherits `table.log.ttl`. "
+                                    + "When both values are positive, it must be less than or equal to "
+                                    + "`table.log.ttl`.");
 
     public static final ConfigOption<Boolean> TABLE_DATALAKE_ENABLED =
             key("table.datalake.enabled")

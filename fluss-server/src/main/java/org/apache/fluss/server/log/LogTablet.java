@@ -108,8 +108,10 @@ public final class LogTablet {
     private volatile int tieredLogLocalSegments;
     private final Clock clock;
     private final boolean isChangeLog;
-    private final long logTtlMs;
+
     private final AtomicBoolean rollExpiredActiveSegmentEnabled;
+    private final boolean remoteLogEnabled;
+    private volatile long effectiveLocalLogTtlMs;
 
     @GuardedBy("lock")
     private volatile LogOffsetMetadata highWatermarkMetadata;
@@ -152,6 +154,7 @@ public final class LogTablet {
             LogFormat logFormat,
             int tieredLogLocalSegments,
             long logTtlMs,
+            long localLogTtlMs,
             boolean isChangelog,
             Clock clock) {
         this.dataDir = dataDir;
@@ -163,11 +166,13 @@ public final class LogTablet {
                 (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_CHECK_INTERVAL).toMillis();
         this.writerStateManager = writerStateManager;
         this.highWatermarkMetadata = new LogOffsetMetadata(0L);
-        this.logTtlMs = logTtlMs;
         this.rollExpiredActiveSegmentEnabled =
                 checkNotNull(
                         rollExpiredActiveSegmentEnabled,
                         "rollExpiredActiveSegmentEnabled must not be null");
+        this.remoteLogEnabled =
+                conf.get(ConfigOptions.REMOTE_LOG_TASK_INTERVAL_DURATION).toMillis() > 0L;
+        this.effectiveLocalLogTtlMs = effectiveLocalLogTtlMs(logTtlMs, localLogTtlMs);
 
         this.scheduler = scheduler;
         // scheduler the writer expiration interval check.
@@ -357,6 +362,7 @@ public final class LogTablet {
             LogFormat logFormat,
             int tieredLogLocalSegments,
             long logTtlMs,
+            long localLogTtlMs,
             boolean isChangelog,
             Clock clock,
             boolean isCleanShutdown)
@@ -407,6 +413,7 @@ public final class LogTablet {
                 logFormat,
                 tieredLogLocalSegments,
                 logTtlMs,
+                localLogTtlMs,
                 isChangelog,
                 clock);
     }
@@ -440,6 +447,7 @@ public final class LogTablet {
                 logFormat,
                 tieredLogLocalSegments,
                 tableConfig.getLogTTLMs(),
+                tableConfig.getLocalLogTTLMs(),
                 isChangelog,
                 clock,
                 isCleanShutdown);
@@ -685,6 +693,16 @@ public final class LogTablet {
         return tieredLogLocalSegments;
     }
 
+    /** Updates the remote and local log TTLs used to derive the effective local log TTL. */
+    public void updateLogTtls(long logTtlMs, long localLogTtlMs) {
+        this.effectiveLocalLogTtlMs = effectiveLocalLogTtlMs(logTtlMs, localLogTtlMs);
+    }
+
+    /** Returns the effective TTL used by local log segment cleanup, in milliseconds. */
+    public long getEffectiveLocalLogTtlMs() {
+        return effectiveLocalLogTtlMs;
+    }
+
     public void updateLakeTableSnapshotId(long snapshotId) {
         if (snapshotId > this.lakeTableSnapshotId) {
             this.lakeTableSnapshotId = snapshotId;
@@ -770,14 +788,14 @@ public final class LogTablet {
         cleanupSegments(highestCopiedEndOffset, this::cleanupTieredSegments);
     }
 
-    /** Deletes inactive local segments that have expired according to the table log TTL. */
+    /**
+     * Deletes inactive local segments that have expired according to the local log TTL.
+     *
+     * <p>When remote log tiering is enabled, cleanup is bounded by the highest offset copied to
+     * remote storage. Otherwise, cleanup is bounded by the high watermark.
+     */
     public void deleteExpiredSegments() {
-        // A missing remote end offset can mean either that no segment has been uploaded or that
-        // all remote segments have expired. In both cases, table.log.ttl remains authoritative for
-        // local retention, while the high watermark and minRetainOffset still protect data that
-        // cannot be deleted yet.
-        long cleanupToOffset =
-                highestCopiedEndOffset == -1L ? getHighWatermark() : highestCopiedEndOffset;
+        long cleanupToOffset = remoteLogEnabled ? highestCopiedEndOffset : getHighWatermark();
         cleanupSegments(cleanupToOffset, this::cleanupExpiredSegments);
     }
 
@@ -1387,7 +1405,7 @@ public final class LogTablet {
         List<LogSegment> deletableSegments = new ArrayList<>();
         for (int i = 0; i < logSegments.size() - 1; i++) {
             if (logSegments.get(i + 1).getBaseOffset() > endOffset
-                    || !isSegmentExpired(now, logSegments.get(i), logTtlMs)) {
+                    || !isSegmentExpired(now, logSegments.get(i), effectiveLocalLogTtlMs)) {
                 break;
             }
             deletableSegments.add(logSegments.get(i));
@@ -1400,8 +1418,12 @@ public final class LogTablet {
             throws IOException {
         return rollExpiredActiveSegmentEnabled.get()
                 && activeSegment.getSizeInBytes() > 0
-                && isSegmentExpired(now, activeSegment, logTtlMs)
+                && isSegmentExpired(now, activeSegment, effectiveLocalLogTtlMs)
                 && getHighWatermark() >= localLogEndOffset();
+    }
+
+    private long effectiveLocalLogTtlMs(long logTtlMs, long localLogTtlMs) {
+        return remoteLogEnabled ? localLogTtlMs : logTtlMs;
     }
 
     @FunctionalInterface

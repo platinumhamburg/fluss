@@ -702,6 +702,22 @@ public final class Replica {
                 tieredLogLocalSegments);
     }
 
+    /** Updates the log TTLs after the table configuration is altered. */
+    public void updateLogTtls(long logTtlMs, long localLogTtlMs) {
+        long oldValue = logTablet.getEffectiveLocalLogTtlMs();
+        logTablet.updateLogTtls(logTtlMs, localLogTtlMs);
+        long newValue = logTablet.getEffectiveLocalLogTtlMs();
+        if (oldValue == newValue) {
+            return;
+        }
+
+        LOG.info(
+                "Replica for {} effectiveLocalLogTtlMs changed from {} to {}",
+                tableBucket,
+                oldValue,
+                newValue);
+    }
+
     private void createKv() {
         try {
             // create a closeable registry for the closable related to kv
@@ -2296,6 +2312,7 @@ public final class Replica {
                         tableConfig.getLogFormat(),
                         tableConfig.getTieredLogLocalSegments(),
                         tableConfig.getLogTTLMs(),
+                        tableConfig.getLocalLogTTLMs(),
                         isKvTable());
         // update high watermark.
         Optional<Long> watermarkOpt = lazyHighWatermarkCheckpoint.fetch(tableBucket);

@@ -23,11 +23,14 @@ import org.apache.fluss.server.log.LogSegment;
 import org.apache.fluss.server.log.LogTablet;
 
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
@@ -40,12 +43,15 @@ final class TieredLocalSegmentTTLTest extends RemoteLogTestBase {
     @BeforeEach
     public void setup() throws Exception {
         super.setup();
+        Map<String, String> properties = new HashMap<>();
+        properties.put(ConfigOptions.TABLE_LOG_TTL.key(), "2h");
+        properties.put(ConfigOptions.TABLE_LOG_LOCAL_TTL.key(), "1h");
         registerTableInZkClient(
                 DATA1_TABLE_PATH,
                 DATA1_SCHEMA,
                 DATA1_TABLE_ID,
                 Collections.emptyList(),
-                Collections.singletonMap(ConfigOptions.TABLE_LOG_TTL.key(), "1h"));
+                properties);
     }
 
     @ParameterizedTest
@@ -70,7 +76,7 @@ final class TieredLocalSegmentTTLTest extends RemoteLogTestBase {
         assertThat(logTablet.localLogStartOffset()).isEqualTo(30L);
         assertThat(remoteLog.allRemoteLogSegments()).hasSize(4);
 
-        manualClock.advanceTime(Duration.ofHours(2));
+        manualClock.advanceTime(Duration.ofMinutes(90));
         // Run local retention without updating the remote manifest or uploading another segment.
         logManager.cleanupExpiredLocalLogSegments();
 
@@ -94,8 +100,29 @@ final class TieredLocalSegmentTTLTest extends RemoteLogTestBase {
 
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
-    void testExpiredActiveSegmentWaitsForHighWatermarkWithoutRemoteLogEndOffset(
-            boolean partitionTable) throws Exception {
+    void testExpiredLocalSegmentsRetainedWithoutHighestCopiedEndOffset(boolean partitionTable)
+            throws Exception {
+        TableBucket tb =
+                partitionTable
+                        ? new TableBucket(DATA1_TABLE_ID, 0L, 0)
+                        : new TableBucket(DATA1_TABLE_ID, 0);
+        makeLogTableAsLeader(tb, partitionTable);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+
+        addMultiSegmentsToLogTablet(logTablet, 5);
+        assertThat(remoteLogManager.remoteLogTablet(tb).getRemoteLogEndOffset()).isEmpty();
+
+        manualClock.advanceTime(Duration.ofHours(3));
+        logManager.cleanupExpiredLocalLogSegments();
+
+        assertThat(logTablet.getSegments()).hasSize(5);
+        assertThat(logTablet.localLogStartOffset()).isZero();
+        assertThat(logTablet.activeLogSegment().getBaseOffset()).isEqualTo(40L);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testExpiredActiveSegmentWaitsForHighWatermark(boolean partitionTable) throws Exception {
         TableBucket tb =
                 partitionTable
                         ? new TableBucket(DATA1_TABLE_ID, 0L, 0)
@@ -106,21 +133,18 @@ final class TieredLocalSegmentTTLTest extends RemoteLogTestBase {
         LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
 
         addMultiSegmentsToLogTablet(logTablet, 5);
-        assertThat(remoteLogManager.remoteLogTablet(tb).getRemoteLogEndOffset()).isEmpty();
-
-        manualClock.advanceTime(Duration.ofHours(2));
+        logTablet.updateHighestCopiedEndOffset(40L);
+        manualClock.advanceTime(Duration.ofMinutes(90));
         logTablet.updateHighWatermark(logTablet.localLogEndOffset() - 1L);
         logManager.cleanupExpiredLocalLogSegments();
 
         assertThat(logTablet.getSegments()).hasSize(1);
-        assertThat(logTablet.localLogStartOffset()).isEqualTo(40L);
         assertThat(logTablet.activeLogSegment().getBaseOffset()).isEqualTo(40L);
 
         logTablet.updateHighWatermark(logTablet.localLogEndOffset());
         logManager.cleanupExpiredLocalLogSegments();
 
         assertThat(logTablet.getSegments()).hasSize(2);
-        assertThat(logTablet.localLogStartOffset()).isEqualTo(40L);
         assertThat(logTablet.activeLogSegment().getBaseOffset()).isEqualTo(50L);
     }
 
@@ -132,7 +156,7 @@ final class TieredLocalSegmentTTLTest extends RemoteLogTestBase {
                 DATA1_SCHEMA,
                 DATA1_TABLE_ID,
                 Collections.emptyList(),
-                Collections.singletonMap(ConfigOptions.TABLE_LOG_TTL.key(), "0ms"));
+                Collections.singletonMap(ConfigOptions.TABLE_LOG_LOCAL_TTL.key(), "0ms"));
         TableBucket tb =
                 partitionTable
                         ? new TableBucket(DATA1_TABLE_ID, 0L, 0)
@@ -153,7 +177,7 @@ final class TieredLocalSegmentTTLTest extends RemoteLogTestBase {
 
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
-    void testTtlCleanupBoundedByRemoteLogEndOffset(boolean partitionTable) throws Exception {
+    void testTtlCleanupBoundedByHighestCopiedEndOffset(boolean partitionTable) throws Exception {
         TableBucket tb =
                 partitionTable
                         ? new TableBucket(DATA1_TABLE_ID, 0L, 0)
@@ -165,9 +189,9 @@ final class TieredLocalSegmentTTLTest extends RemoteLogTestBase {
 
         addMultiSegmentsToLogTablet(logTablet, 5);
         logTablet.updateTieredLogLocalSegments(5);
-        logTablet.updateRemoteLogEndOffset(20L);
+        logTablet.updateHighestCopiedEndOffset(20L);
 
-        manualClock.advanceTime(Duration.ofHours(2));
+        manualClock.advanceTime(Duration.ofMinutes(90));
         logManager.cleanupExpiredLocalLogSegments();
 
         assertThat(logTablet.getSegments()).hasSize(3);
@@ -180,5 +204,27 @@ final class TieredLocalSegmentTTLTest extends RemoteLogTestBase {
         assertThat(logTablet.getSegments()).hasSize(2);
         assertThat(logTablet.localLogStartOffset()).isEqualTo(40L);
         assertThat(logTablet.activeLogSegment().getBaseOffset()).isEqualTo(50L);
+    }
+
+    @Test
+    void testUpdatedLocalTtlTakesEffectImmediately() throws Exception {
+        TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID, 0);
+        makeLogTableAsLeader(tableBucket, false);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tableBucket).getLogTablet();
+        logTablet.updateTieredLogLocalSegments(5);
+
+        addMultiSegmentsToLogTablet(logTablet, 5);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        logTablet.updateLogTtls(Duration.ofHours(2).toMillis(), Duration.ofHours(2).toMillis());
+        assertThat(logTablet.getEffectiveLocalLogTtlMs()).isEqualTo(Duration.ofHours(2).toMillis());
+
+        manualClock.advanceTime(Duration.ofMinutes(90));
+        logManager.cleanupExpiredLocalLogSegments();
+        assertThat(logTablet.getSegments()).hasSize(5);
+
+        logTablet.updateLogTtls(Duration.ofHours(2).toMillis(), Duration.ofHours(1).toMillis());
+        logManager.cleanupExpiredLocalLogSegments();
+        assertThat(logTablet.getSegments()).hasSize(1);
+        assertThat(logTablet.localLogStartOffset()).isEqualTo(40L);
     }
 }

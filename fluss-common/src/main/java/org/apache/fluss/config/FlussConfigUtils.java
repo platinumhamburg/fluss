@@ -52,6 +52,7 @@ public class FlussConfigUtils {
                         ConfigOptions.TABLE_DATALAKE_FRESHNESS.key(),
                         ConfigOptions.TABLE_DATALAKE_AUTO_COMPACTION.key(),
                         ConfigOptions.TABLE_TIERED_LOG_LOCAL_SEGMENTS.key(),
+                        ConfigOptions.TABLE_LOG_LOCAL_TTL.key(),
                         ConfigOptions.TABLE_AUTO_PARTITION_ENABLED.key(),
                         ConfigOptions.TABLE_AUTO_PARTITION_NUM_RETENTION.key(),
                         ConfigOptions.TABLE_AUTO_PARTITION_NUM_PRECREATE.key(),
