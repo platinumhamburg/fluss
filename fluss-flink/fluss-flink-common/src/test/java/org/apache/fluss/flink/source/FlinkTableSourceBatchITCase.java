@@ -51,6 +51,7 @@ import java.util.stream.Collectors;
 
 import static org.apache.fluss.flink.FlinkConnectorOptions.BOOTSTRAP_SERVERS;
 import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.assertResultsIgnoreOrder;
+import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.collectRowsUntilEndWithTimeout;
 import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.collectRowsWithTimeout;
 import static org.apache.fluss.server.testutils.FlussClusterExtension.BUILTIN_DATABASE;
 import static org.apache.fluss.testutils.DataTestUtils.row;
@@ -349,6 +350,52 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
                             "+I[5, address5, name5]");
         }
         assertResultsIgnoreOrder(collected, expected, true);
+    }
+
+    @Test
+    void testFilteredLogTableBatchScanCompletesWhenNoRecordsMatch() throws Exception {
+        String tableName = String.format("test_filtered_log_table_%s", RandomUtils.nextInt());
+        tEnv.executeSql(
+                String.format(
+                        "create table %s (id int, name varchar) with ("
+                                + "'bucket.num' = '1', "
+                                + "'table.statistics.columns' = 'id')",
+                        tableName));
+
+        TablePath tablePath = TablePath.of(databaseName, tableName);
+        try (Table table = conn.getTable(tablePath)) {
+            AppendWriter appendWriter = table.newAppend().createWriter();
+            for (int i = 1; i <= 5; i++) {
+                appendWriter.append(row(i, "name" + i));
+            }
+            appendWriter.flush();
+        }
+
+        String query = String.format("SELECT * FROM %s WHERE id > 100", tableName);
+        assertThat(tEnv.explainSql(query)).contains("filter=[>(id, 100)]");
+
+        CloseableIterator<Row> collected = tEnv.executeSql(query).collect();
+        assertThat(collectRowsUntilEndWithTimeout(collected)).isEmpty();
+    }
+
+    @Test
+    void testBatchLogTableScanWithEmptyBucket() throws Exception {
+        tEnv.getConfig().set(ExecutionConfigOptions.TABLE_EXEC_RESOURCE_DEFAULT_PARALLELISM, 1);
+        String tableName = String.format("test_empty_bucket_log_table_%s", RandomUtils.nextInt());
+        tEnv.executeSql(
+                String.format(
+                        "create table %s (id int, name varchar) with ('bucket.num' = '2')",
+                        tableName));
+
+        try (Table table = conn.getTable(TablePath.of(databaseName, tableName))) {
+            AppendWriter appendWriter = table.newAppend().createWriter();
+            appendWriter.append(row(1, "alpha"));
+            appendWriter.flush();
+        }
+
+        CloseableIterator<Row> collected =
+                tEnv.executeSql(String.format("SELECT * FROM %s", tableName)).collect();
+        assertThat(collectRowsUntilEndWithTimeout(collected)).containsExactly("+I[1, alpha]");
     }
 
     @Test
