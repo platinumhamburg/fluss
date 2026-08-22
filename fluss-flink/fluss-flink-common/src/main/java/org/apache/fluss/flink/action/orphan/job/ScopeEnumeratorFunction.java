@@ -101,7 +101,8 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             throws Exception {
         Configuration flussConfig = createFlussClientConfiguration(config);
 
-        try (Connection connection = ConnectionFactory.createConnection(flussConfig);
+        try (Connection connection =
+                        ConnectionFactory.createConnectionWithRemoteFileSystemAccess(flussConfig);
                 Admin admin = connection.getAdmin()) {
             // Fail fast on incompatible servers: the action jar may be deployed against an
             // older cluster that does not implement ListRemoteLogManifests / ListKvSnapshots.

@@ -20,6 +20,7 @@ package org.apache.fluss.flink.action.orphan;
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.Admin;
+import org.apache.fluss.client.token.DefaultSecurityTokenManager;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
@@ -162,6 +163,36 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
     }
 
     private static final Duration OLD_ENOUGH = Duration.ofDays(2);
+
+    @Test
+    @MultiVersionTest
+    void initializesRemoteFileAccessTokensForScopeAndScan() throws Exception {
+        String dbName = newDatabaseName("remote_access_tokens");
+        createLogTable(dbName, "token_delivery");
+        LoggerContext context = (LoggerContext) LogManager.getContext(false);
+        org.apache.logging.log4j.core.config.Configuration logConfig = context.getConfiguration();
+        LoggerConfig tokenLoggerConfig =
+                logConfig.getLoggerConfig(DefaultSecurityTokenManager.class.getName());
+        CapturingAppender tokenAppender = new CapturingAppender("orphan-token-lifecycle");
+        tokenAppender.start();
+        tokenLoggerConfig.addAppender(tokenAppender, Level.INFO, null);
+        context.updateLoggers();
+        try {
+            runCleanerForDatabase(true, dbName, "--parallelism", "1");
+
+            assertThat(
+                            tokenAppender.messages().stream()
+                                    .filter(
+                                            message ->
+                                                    message.equals("Starting tokens update task"))
+                                    .count())
+                    .isGreaterThanOrEqualTo(2L);
+        } finally {
+            tokenLoggerConfig.removeAppender(tokenAppender.getName());
+            context.updateLoggers();
+            tokenAppender.stop();
+        }
+    }
 
     @Test
     @MultiVersionTest

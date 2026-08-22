@@ -73,10 +73,7 @@ public final class OrphanFilesCleanJob {
         // Stage 2: ScanAndClean (parallelism=N)
         SingleOutputStreamOperator<CleanStats> stats =
                 tasks.rebalance()
-                        .process(
-                                new ScanAndCleanFunction(
-                                        config.remoteFsOpRateLimitPerSecond(),
-                                        config.extraConfigs()))
+                        .process(new ScanAndCleanFunction(config))
                         .returns(TypeInformation.of(new TypeHint<CleanStats>() {}))
                         .name("ScanAndClean");
         if (parallelism != null) {

@@ -18,8 +18,10 @@
 package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.annotation.Internal;
-import org.apache.fluss.config.Configuration;
+import org.apache.fluss.client.Connection;
+import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
 import org.apache.fluss.flink.action.orphan.fs.SafeDeleter;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
 import org.apache.fluss.flink.action.orphan.rule.Decision;
@@ -39,7 +41,6 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.Deque;
-import java.util.Map;
 
 /**
  * Stage 2 of the orphan files cleanup job. Runs at user-configured parallelism (N) and performs
@@ -65,25 +66,23 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     private static final long serialVersionUID = 1L;
     private static final Logger LOG = LoggerFactory.getLogger(ScanAndCleanFunction.class);
 
-    private final long remoteFsOpRateLimitPerSecond;
-    private final Map<String, String> extraConfigs;
+    private final OrphanCleanConfig config;
 
     private transient AuditLogger audit;
     private transient RateLimiter remoteFsOpRateLimiter;
+    private transient Connection connection;
 
-    public ScanAndCleanFunction(
-            long remoteFsOpRateLimitPerSecond, Map<String, String> extraConfigs) {
-        this.remoteFsOpRateLimitPerSecond = remoteFsOpRateLimitPerSecond;
-        this.extraConfigs = extraConfigs;
+    public ScanAndCleanFunction(OrphanCleanConfig config) {
+        this.config = config;
     }
 
     @Override
     public void open(org.apache.flink.api.common.functions.OpenContext openContext)
             throws Exception {
         super.open(openContext);
-        if (!extraConfigs.isEmpty()) {
-            FileSystem.initialize(Configuration.fromMap(extraConfigs), null);
-        }
+        connection =
+                ConnectionFactory.createConnectionWithRemoteFileSystemAccess(
+                        ScopeEnumeratorFunction.createFlussClientConfiguration(config));
         audit = new AuditLogger();
         int parallelism = getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks();
         int subtaskIndex = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
@@ -93,7 +92,19 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         // effective aggregate can exceed the target by that floor.
         remoteFsOpRateLimiter =
                 RateLimiter.create(
-                        perSubtaskRate(remoteFsOpRateLimitPerSecond, parallelism, subtaskIndex));
+                        perSubtaskRate(
+                                config.remoteFsOpRateLimitPerSecond(), parallelism, subtaskIndex));
+    }
+
+    @Override
+    public void close() throws Exception {
+        try {
+            if (connection != null) {
+                connection.close();
+            }
+        } finally {
+            super.close();
+        }
     }
 
     @Override

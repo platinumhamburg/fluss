@@ -166,10 +166,17 @@ public final class FlussConnection implements Connection {
                             new RemoteFileDownloader(
                                     conf.getInt(ConfigOptions.REMOTE_FILE_DOWNLOAD_THREAD_NUM));
                 }
-                // access remote files requires setting up filesystem security token manager
+            }
+        }
+        initializeRemoteFileSystemAccess();
+        return remoteFileDownloader;
+    }
+
+    void initializeRemoteFileSystemAccess() {
+        if (securityTokenManager == null) {
+            synchronized (this) {
                 if (securityTokenManager == null) {
-                    // prepare security token manager
-                    // create the admin read only gateway
+                    // Create the admin read-only gateway used by the existing token manager.
                     // todo: may add retry logic when no any available tablet server?
                     AdminReadOnlyGateway gateway =
                             GatewayClientProxy.createGatewayProxy(
@@ -198,7 +205,6 @@ public final class FlussConnection implements Connection {
                 }
             }
         }
-        return remoteFileDownloader;
     }
 
     @Override

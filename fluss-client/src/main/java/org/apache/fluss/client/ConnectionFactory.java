@@ -17,6 +17,7 @@
 
 package org.apache.fluss.client;
 
+import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.config.ConfigOptions;
@@ -55,6 +56,17 @@ public class ConnectionFactory {
      */
     public static Connection createConnection(Configuration conf) {
         return new FlussConnection(resolveConfigProviders(conf));
+    }
+
+    /**
+     * Creates a connection and starts the security-token lifecycle required for direct remote
+     * filesystem access.
+     */
+    @Internal
+    public static Connection createConnectionWithRemoteFileSystemAccess(Configuration conf) {
+        FlussConnection connection = new FlussConnection(resolveConfigProviders(conf));
+        connection.initializeRemoteFileSystemAccess();
+        return connection;
     }
 
     /**
