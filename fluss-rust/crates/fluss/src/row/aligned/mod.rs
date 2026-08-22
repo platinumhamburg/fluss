@@ -15,17 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod binary_writer;
-pub(crate) mod encoding;
-mod iceberg_binary_row_writer;
+mod aligned_row_writer;
 
-pub use binary_writer::*;
-pub use iceberg_binary_row_writer::IcebergBinaryRowWriter;
-
-/// The binary row format types, it indicates the generated row type by the [`BinaryWriter`]
-#[allow(dead_code)]
-pub enum BinaryRowFormat {
-    Compacted,
-    Aligned,
-    Indexed,
-}
+pub use aligned_row_writer::AlignedRowWriter;
