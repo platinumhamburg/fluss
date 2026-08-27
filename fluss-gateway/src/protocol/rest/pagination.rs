@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Keyset pagination for the FIP-49 list endpoints.
+//! Keyset pagination for catalog list endpoints.
 //!
 //! The page token is self-describing: it carries the cluster and collection it belongs to, its scope,
 //! and the last name of the page it follows, base64url-encoded. Nothing is stored server-side, so any
@@ -36,9 +36,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
-/// Page size when the request does not ask for one (FIP-49).
+/// Default page size.
 const DEFAULT_MAX_RESULTS: usize = 100;
-/// Largest page the gateway serves (FIP-49). Not configurable: it bounds one response body.
+/// Maximum page size, bounding one response body.
 const MAX_MAX_RESULTS: usize = 1000;
 /// Current token layout. A token from another version is rejected, never reinterpreted.
 const TOKEN_VERSION: u32 = 1;
@@ -48,6 +48,7 @@ const TOKEN_VERSION: u32 = 1;
 pub enum Collection {
     Databases,
     Tables,
+    Partitions,
 }
 
 impl Collection {
@@ -55,6 +56,7 @@ impl Collection {
         match self {
             Self::Databases => "databases",
             Self::Tables => "tables",
+            Self::Partitions => "partitions",
         }
     }
 }
@@ -90,7 +92,7 @@ impl Page {
                     max_results = value
                         .parse()
                         .ok()
-                        .filter(is_supported_page_size)
+                        .filter(|value| (1..=MAX_MAX_RESULTS).contains(value))
                         .ok_or_else(|| {
                             GatewayError::invalid_argument(format!(
                                 "max_results must be between 1 and {MAX_MAX_RESULTS}"
@@ -120,25 +122,37 @@ impl Page {
     ///
     /// The gateway sorts by UTF-8 byte order, because Fluss does not promise an order and keyset
     /// pagination needs one.
-    pub fn apply(&self, mut names: Vec<String>) -> (Vec<String>, Option<String>) {
-        names.sort_unstable();
+    pub fn apply(&self, names: Vec<String>) -> (Vec<String>, Option<String>) {
+        self.apply_by(names, |name| Cow::Borrowed(name))
+    }
+
+    /// Paginates entries by a borrowed or computed name.
+    pub fn apply_by<T>(
+        &self,
+        mut entries: Vec<T>,
+        key: impl Fn(&T) -> Cow<'_, str>,
+    ) -> (Vec<T>, Option<String>) {
+        entries.sort_unstable_by(|left, right| key(left).cmp(&key(right)));
         let start = match &self.after {
-            Some(after) => names.partition_point(|name| name.as_str() <= after.as_str()),
+            Some(after) => entries.partition_point(|entry| key(entry).as_ref() <= after.as_str()),
             None => 0,
         };
-        let remaining = &names[start..];
-        let has_more = remaining.len() > self.max_results;
-        let page: Vec<String> = remaining.iter().take(self.max_results).cloned().collect();
-        let next = page
-            .last()
-            .filter(|_| has_more)
-            .map(|last| encode_token(&self.cluster, self.collection, self.scope.as_deref(), last));
+        let has_more = entries.len() - start > self.max_results;
+        let page: Vec<T> = entries
+            .into_iter()
+            .skip(start)
+            .take(self.max_results)
+            .collect();
+        let next = page.last().filter(|_| has_more).map(|last| {
+            encode_token(
+                &self.cluster,
+                self.collection,
+                self.scope.as_deref(),
+                &key(last),
+            )
+        });
         (page, next)
     }
-}
-
-fn is_supported_page_size(value: &usize) -> bool {
-    (1..=MAX_MAX_RESULTS).contains(value)
 }
 
 /// The token payload. Compact field names keep the encoded token short.
@@ -317,7 +331,7 @@ mod tests {
         }
     }
 
-    /// The FIP-49 page-size contract, and the parameters the endpoints do not define.
+    /// Page-size bounds and unsupported query parameters.
     #[test]
     fn the_page_size_is_bounded_and_unknown_parameters_are_refused() {
         let parse = |query: &str| Page::parse(&uri(query), "default", Collection::Databases, None);

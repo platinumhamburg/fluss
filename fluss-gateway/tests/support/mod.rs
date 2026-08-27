@@ -67,6 +67,58 @@ impl Api {
         assert_eq!(response.status(), 200, "GET {path}");
         response.json().await.expect("JSON body")
     }
+
+    pub async fn post(&self, path: &str, body: &Value) -> (u16, Option<String>, Value) {
+        self.send(self.client.post(self.url(path)).json(body), path)
+            .await
+    }
+
+    pub async fn patch(&self, path: &str, body: &Value) -> (u16, Option<String>, Value) {
+        self.send(self.client.patch(self.url(path)).json(body), path)
+            .await
+    }
+
+    pub async fn delete(&self, path: &str) -> u16 {
+        self.send(self.client.delete(self.url(path)), path).await.0
+    }
+
+    pub async fn post_created(&self, path: &str, body: &Value) -> (String, Value) {
+        let (status, location, answered) = self.post(path, body).await;
+        assert_eq!(status, 201, "POST {path}: {answered}");
+        (
+            location.unwrap_or_else(|| panic!("POST {path} answers a Location header")),
+            answered,
+        )
+    }
+
+    /// Reports an empty body as JSON null in test results.
+    async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+        path: &str,
+    ) -> (u16, Option<String>, Value) {
+        let response = request.send().await.expect("request");
+        let status = response.status().as_u16();
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .map(|value| {
+                value
+                    .to_str()
+                    .unwrap_or_else(|_| panic!("{path} answers an ASCII Location"))
+                    .to_string()
+            });
+        let bytes = response.bytes().await.expect("response body");
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(
+                serde_json::from_slice(&bytes)
+                    .unwrap_or_else(|error| panic!("{path} answers a JSON object: {error}")),
+            )
+        };
+        (status, location, body)
+    }
 }
 
 /// Starts an in-process gateway over `lifecycle::start` with an ephemeral port and no metrics listener.

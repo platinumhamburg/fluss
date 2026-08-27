@@ -26,23 +26,25 @@
 //! [`RequestContext`] carries into the backend.
 
 pub mod clusters;
+pub mod datatype;
+pub mod ddl;
 pub mod health;
 pub mod metadata;
 pub mod openapi;
 pub mod pagination;
 
-use crate::backend::FlussBackend;
 use crate::backend::context::RequestContext;
 use crate::backend::types::ClusterId;
+use crate::backend::{FlussBackend, unknown_cluster};
 #[cfg(test)]
 use crate::config::REST_RESPONSE_GRACE;
 use crate::config::{RestServerConfig, rest_handler_timeout};
-use crate::error::{ErrorEnvelope, ErrorKind, GatewayError, panic_message};
+use crate::error::{ErrorEnvelope, ErrorKind, GatewayError, GatewayResult, panic_message};
 use crate::lifecycle::Readiness;
 use crate::observability;
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
+use axum::extract::{DefaultBodyLimit, FromRequest, MatchedPath, Request};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -141,7 +143,7 @@ struct ShapedResponse;
 
 /// Renders the error envelope with the status its kind maps to, marks the response as already shaped, and adds
 /// `Retry-After` where the taxonomy calls for it.
-pub fn error_response(error: &GatewayError, request_id: &RequestId) -> Response {
+fn error_response(error: &GatewayError, request_id: &RequestId) -> Response {
     let status = StatusCode::from_u16(error.kind().http_status())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut response =
@@ -157,12 +159,12 @@ pub fn error_response(error: &GatewayError, request_id: &RequestId) -> Response 
 }
 
 /// Serializes `value` as a 200 JSON response. Fails only when serialization fails, which is reported as internal.
-pub fn json_response<T: Serialize>(value: &T) -> Result<Response, GatewayError> {
+fn json_response<T: Serialize>(value: &T) -> Result<Response, GatewayError> {
     json_response_with_status(StatusCode::OK, value)
 }
 
 /// Serializes `value` as a JSON response with the given status. Serialization failures are reported as internal.
-pub(crate) fn json_response_with_status<T: Serialize>(
+fn json_response_with_status<T: Serialize>(
     status: StatusCode,
     value: &T,
 ) -> Result<Response, GatewayError> {
@@ -177,17 +179,22 @@ pub(crate) fn json_response_with_status<T: Serialize>(
     Ok(response)
 }
 
-/// Deserializes a JSON request body, requiring a JSON `Content-Type`.
-pub fn parse_json_body<T: DeserializeOwned>(
-    headers: &HeaderMap,
-    body: &Bytes,
-) -> Result<T, GatewayError> {
-    validate_json_content_type(headers)?;
-    serde_json::from_slice(body)
+/// Reads a size-limited request body and deserializes it as JSON.
+async fn parse_json_body<T: DeserializeOwned>(mut request: Request) -> Result<T, GatewayError> {
+    let headers = std::mem::take(request.headers_mut());
+    let body = Bytes::from_request(request, &()).await.map_err(|error| {
+        if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            GatewayError::limit_exceeded("request body exceeds the configured limit")
+        } else {
+            GatewayError::invalid_argument(format!("unreadable request body: {error}"))
+        }
+    })?;
+    validate_json_content_type(&headers)?;
+    serde_json::from_slice(&body)
         .map_err(|error| GatewayError::invalid_argument(format!("invalid JSON body: {error}")))
 }
 
-pub(crate) fn validate_json_content_type(headers: &HeaderMap) -> Result<(), GatewayError> {
+fn validate_json_content_type(headers: &HeaderMap) -> Result<(), GatewayError> {
     let Some(value) = headers.get(header::CONTENT_TYPE) else {
         return Err(GatewayError::new(
             crate::error::ErrorKind::UnsupportedMediaType,
@@ -217,7 +224,7 @@ pub(crate) fn validate_json_content_type(headers: &HeaderMap) -> Result<(), Gate
 }
 
 /// The request ID the outermost middleware assigned, for a handler rendering its own envelope.
-pub(crate) fn request_id(request: &Request) -> RequestId {
+fn request_id(request: &Request) -> RequestId {
     request
         .extensions()
         .get::<RequestId>()
@@ -225,11 +232,24 @@ pub(crate) fn request_id(request: &Request) -> RequestId {
         .unwrap_or_default()
 }
 
+/// Resolves a configured cluster and builds its backend request context.
+fn resolve_cluster(
+    state: &RestState,
+    request: &Request,
+    cluster: &str,
+) -> GatewayResult<(Arc<dyn FlussBackend>, RequestContext)> {
+    if !state.backend.has_cluster(cluster) {
+        return Err(unknown_cluster(cluster));
+    }
+    let cluster = ClusterId::try_from(cluster).expect("the backend serves this cluster ID");
+    Ok((state.backend.clone(), request_context(cluster, request)))
+}
+
 /// Builds the backend context of one cluster-scoped request from the middleware-assigned metadata.
 ///
 /// The caller is anonymous until the authenticator lands; the deadline and the cancellation signal are
 /// the ones the middleware also enforces, so a backend call cannot outlive its request.
-pub(crate) fn request_context(cluster_id: ClusterId, request: &Request) -> RequestContext {
+fn request_context(cluster_id: ClusterId, request: &Request) -> RequestContext {
     let deadline = request
         .extensions()
         .get::<RequestDeadline>()
@@ -248,13 +268,6 @@ pub(crate) fn request_context(cluster_id: ClusterId, request: &Request) -> Reque
         cancellation,
         None,
     )
-}
-
-/// Marks a response as final so the error-normalising middleware does not rewrite its body. Use it for handler
-/// responses that already carry their own envelope.
-pub fn shaped(mut response: Response) -> Response {
-    response.extensions_mut().insert(ShapedResponse);
-    response
 }
 
 /// Assembles the REST frontend from the REST configuration and the shared process services.
@@ -291,6 +304,7 @@ pub fn build_router(state: RestState, options: &RestOptions) -> Router {
         .split_for_parts();
     let (metadata_router, metadata_api) = OpenApiRouter::new()
         .merge(metadata::routes())
+        .merge(ddl::routes())
         .split_for_parts();
     let (open_router, open_api) = OpenApiRouter::new()
         .merge(health::routes())
@@ -357,27 +371,16 @@ fn apply_acceptance_guard(router: Router, readiness: Arc<Readiness>) -> Router {
         let readiness = readiness.clone();
         async move {
             if let Err(error) = readiness.ensure_accepting() {
-                let request_id = request
-                    .extensions()
-                    .get::<RequestId>()
-                    .cloned()
-                    .unwrap_or_default();
-                return error_response(&error, &request_id);
+                return error_response(&error, &request_id(&request));
             }
             next.run(request).await
         }
     }))
 }
 
-/// Applies the cross-cutting middleware stack to an already-routed app.
-///
-/// Exposed separately so tests can wrap purpose-built routers with the production middleware.
-/// The body-limit layer is a streaming-body backstop. Requests with a declared length are rejected earlier with an
-/// envelope.
-///
-/// Order (outermost first): request-id assignment and error normalisation, then access logging, then the
-/// body size and deadline limits.
-pub fn apply_middleware(router: Router, options: &RestOptions) -> Router {
+/// Wraps a test router with the production middleware.
+#[cfg(test)]
+fn apply_middleware(router: Router, options: &RestOptions) -> Router {
     apply_common_middleware(apply_data_limits(router, options), None)
 }
 
@@ -416,11 +419,7 @@ fn apply_data_limits(router: Router, options: &RestOptions) -> Router {
     let max_body_bytes = options.max_body_bytes;
 
     let limits = move |mut request: Request, next: Next| async move {
-        let request_id = request
-            .extensions()
-            .get::<RequestId>()
-            .cloned()
-            .unwrap_or_default();
+        let request_id = request_id(&request);
         request
             .extensions_mut()
             .insert(deadline_from_now(request_timeout));
@@ -487,11 +486,7 @@ fn apply_common_middleware(router: Router, backend: Option<Arc<dyn FlussBackend>
 /// response, where a dropped connection would have been recorded nowhere. The payload goes to the
 /// log, never into the response, since it can carry internal detail.
 async fn catch_panic(request: Request, next: Next) -> Response {
-    let request_id = request
-        .extensions()
-        .get::<RequestId>()
-        .cloned()
-        .unwrap_or_default();
+    let request_id = request_id(&request);
     match AssertUnwindSafe(next.run(request)).catch_unwind().await {
         Ok(response) => response,
         Err(payload) => {
@@ -526,11 +521,7 @@ fn request_log(
                 .to_string();
             let cluster =
                 cluster_label(backend.as_deref(), &route, request.uri().path()).to_string();
-            let request_id = request
-                .extensions()
-                .get::<RequestId>()
-                .cloned()
-                .unwrap_or_default();
+            let request_id = request_id(&request);
             let response = next.run(request).await;
             let elapsed = started.elapsed();
             let status = response.status();
@@ -636,11 +627,7 @@ fn normalize_error(response: Response, request_id: &RequestId) -> Response {
 }
 
 async fn unknown_route(method: Method, uri: Uri, request: Request) -> Response {
-    let request_id = request
-        .extensions()
-        .get::<RequestId>()
-        .cloned()
-        .unwrap_or_default();
+    let request_id = request_id(&request);
     error_response(
         &GatewayError::not_found(format!("no route for {method} {}", uri.path())),
         &request_id,
@@ -690,7 +677,7 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::routing::{get, post};
+    use axum::routing::get;
     use http_body_util::BodyExt;
     use serde::Deserialize;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -712,33 +699,48 @@ mod tests {
         serde_json::from_slice(&bytes).expect("json body")
     }
 
-    #[test]
-    fn shared_json_parser_enforces_media_type_and_serde_strictness() {
-        let body = Bytes::from_static(br#"{"value": 7}"#);
-        assert!(parse_json_body::<BodyFixture>(&HeaderMap::new(), &body).is_err());
-
-        let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-        assert!(parse_json_body::<BodyFixture>(&headers, &body).is_err());
-
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/vnd.fluss+json; charset=utf-8"),
-        );
-        assert_eq!(
-            parse_json_body::<BodyFixture>(&headers, &body).unwrap(),
-            BodyFixture { value: 7 }
-        );
-        for bad in [
-            br#"{"value": 7, "unknown": true}"#.as_slice(),
-            br#"{"value": 7, "value": 8}"#.as_slice(),
-            br#"{"value":"#.as_slice(),
+    #[tokio::test]
+    async fn shared_json_parser_enforces_media_type_and_serde_strictness() {
+        for (content_type, expected) in [
+            (None, Err(ErrorKind::UnsupportedMediaType)),
+            (Some("text/plain"), Err(ErrorKind::UnsupportedMediaType)),
+            (Some("application/json"), Ok(BodyFixture { value: 7 })),
+            (
+                Some("application/vnd.fluss+json; charset=utf-8"),
+                Ok(BodyFixture { value: 7 }),
+            ),
         ] {
-            assert!(
-                parse_json_body::<BodyFixture>(&headers, &Bytes::copy_from_slice(bad)).is_err()
-            );
+            let mut request = Request::builder();
+            if let Some(content_type) = content_type {
+                request = request.header(header::CONTENT_TYPE, content_type);
+            }
+            let request = request.body(Body::from(r#"{"value": 7}"#)).unwrap();
+            let result = parse_json_body::<BodyFixture>(request)
+                .await
+                .map_err(|error| error.kind());
+            assert_eq!(result, expected, "{content_type:?}");
         }
-        assert!(parse_json_body::<BodyFixture>(&headers, &Bytes::new()).is_err());
+        for body in [
+            r#"{"value": 7, "unknown": true}"#,
+            r#"{"value": 7, "value": 8}"#,
+            r#"{"value":"#,
+            "",
+        ] {
+            let request = Request::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let error = parse_json_body::<BodyFixture>(request).await.unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidArgument, "{body}");
+        }
+
+        let stream =
+            futures_util::stream::iter([Err::<Bytes, _>(std::io::Error::other("read failed"))]);
+        let error = parse_json_body::<BodyFixture>(Request::new(Body::from_stream(stream)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+        assert!(error.message().starts_with("unreadable request body:"));
     }
 
     #[tokio::test]
@@ -771,26 +773,38 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_body_yields_413_envelope() {
-        let app = apply_middleware(
-            Router::new().route("/echo", post(|| async { "ok" })),
-            &test_support::test_options(),
-        );
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/echo")
-                    .header(header::CONTENT_LENGTH, "1048576")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let state = test_support::test_state();
+        state.readiness.set_serving();
+        let app = build_router(state, &test_support::test_options());
+        for (method, path) in [
+            (Method::POST, "/v1/clusters/default/databases"),
+            (
+                Method::GET,
+                "/v1/clusters/default/databases/sales/tables/orders",
+            ),
+            (
+                Method::DELETE,
+                "/v1/clusters/default/databases/sales/tables/orders",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .header(header::CONTENT_LENGTH, "1048576")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        let json = body_json(response).await;
-        assert_eq!(json["error"]["code"], "limit_exceeded");
-        assert!(json["error"]["request_id"].as_str().is_some());
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{method}");
+            let json = body_json(response).await;
+            assert_eq!(json["error"]["code"], "limit_exceeded", "{method}");
+            assert!(json["error"]["request_id"].as_str().is_some(), "{method}");
+        }
     }
 
     #[tokio::test]
