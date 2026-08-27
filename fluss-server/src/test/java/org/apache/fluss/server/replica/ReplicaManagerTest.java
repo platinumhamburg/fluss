@@ -90,10 +90,10 @@ import org.apache.fluss.testutils.DataTestUtils;
 import org.apache.fluss.types.DataField;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.ByteArraySlice;
 import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.types.Tuple2;
 
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -178,11 +178,6 @@ class ReplicaManagerTest extends ReplicaTestBase {
 
     /** First PUT_KV version that understands the STORAGE_BACKPRESSURE_EXCEPTION error code. */
     private static final short PUT_KV_VERSION_WITH_STORAGE_BACKPRESSURE = 2;
-
-    @BeforeEach
-    void resetDiskUsageForTest() {
-        replicaManager.getDiskUsageMonitor().update(0.5);
-    }
 
     @Test
     void testProduceLog() throws Exception {
@@ -514,6 +509,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
 
     @Test
     void testAppendRejectedWhenDiskLocked() throws Exception {
+        enableDiskWriteProtectionForTest();
         TableBucket tb = new TableBucket(DATA1_TABLE_ID, 1);
         makeLogTableAsLeader(tb.getBucket());
 
@@ -549,6 +545,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
 
     @Test
     void testPutKvRejectedWhenDiskLocked() {
+        enableDiskWriteProtectionForTest();
         TableBucket tb = new TableBucket(DATA1_TABLE_ID_PK, 1);
         makeKvTableAsLeader(DATA1_TABLE_ID_PK, DATA1_TABLE_PATH_PK, tb.getBucket());
 
@@ -567,13 +564,11 @@ class ReplicaManagerTest extends ReplicaTestBase {
                                         PUT_KV_VERSION,
                                         (result) -> {}))
                 .isInstanceOf(DiskWriteLockedException.class);
-
-        // unlock for any subsequent tests on the shared replicaManager instance
-        replicaManager.getDiskUsageMonitor().update(0.10);
     }
 
     @Test
     void testNewKvLeaderRejectedWhenDiskLocked() throws Exception {
+        enableDiskWriteProtectionForTest();
         TableBucket kvTb = new TableBucket(DATA1_TABLE_ID_PK, 1);
         TableBucket logTb = new TableBucket(DATA1_TABLE_ID, 1);
 
@@ -626,8 +621,13 @@ class ReplicaManagerTest extends ReplicaTestBase {
 
         assertThat(future.get()).containsOnly(new NotifyLeaderAndIsrResultForBucket(logTb));
         assertThat(replicaManager.getReplicaOrException(logTb).isLeader()).isTrue();
+    }
 
-        replicaManager.getDiskUsageMonitor().update(0.10);
+    private void enableDiskWriteProtectionForTest() {
+        conf.set(ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO, 0.85);
+        conf.set(ConfigOptions.SERVER_DATA_DISK_WRITE_RECOVER_RATIO, 0.80);
+        localDiskManager.reconfigure(conf);
+        replicaManager.getDiskUsageMonitor().update(0.5);
     }
 
     @Test
@@ -1047,7 +1047,8 @@ class ReplicaManagerTest extends ReplicaTestBase {
         byte[] key100 = keyEncoder.encodeKey(row(new Object[] {100}));
         byte[] key200 = keyEncoder.encodeKey(row(new Object[] {200}));
 
-        List<byte[]> inserted = lookupWithInsert(tb, Arrays.asList(key100, key200)).lookupValues();
+        List<byte[]> inserted =
+                lookupValuesAsByteArrays(lookupWithInsert(tb, Arrays.asList(key100, key200)));
         assertThat(inserted).hasSize(2).allMatch(Objects::nonNull);
         verifyLookup(tb, key100, inserted.get(0));
         verifyLookup(tb, key200, inserted.get(1));
@@ -1064,7 +1065,8 @@ class ReplicaManagerTest extends ReplicaTestBase {
         assertLogRecordsEquals(DATA1_ROW_TYPE, records, expected, ChangeType.INSERT, schemaGetter);
 
         // Scenario 2: All keys exist - should return existing values without modification
-        List<byte[]> existing = lookupWithInsert(tb, Arrays.asList(key100, key200)).lookupValues();
+        List<byte[]> existing =
+                lookupValuesAsByteArrays(lookupWithInsert(tb, Arrays.asList(key100, key200)));
         assertThat(existing).containsExactlyElementsOf(inserted);
 
         // Verify that no new log records were created
@@ -1073,7 +1075,8 @@ class ReplicaManagerTest extends ReplicaTestBase {
 
         // Scenario 3: Mixed - key100 exists, key300 missing
         byte[] key300 = keyEncoder.encodeKey(row(new Object[] {300}));
-        List<byte[]> mixed = lookupWithInsert(tb, Arrays.asList(key100, key300)).lookupValues();
+        List<byte[]> mixed =
+                lookupValuesAsByteArrays(lookupWithInsert(tb, Arrays.asList(key100, key300)));
         assertThat(mixed.get(0)).isEqualTo(inserted.get(0)); // existing
         assertThat(mixed.get(1)).isNotNull(); // newly inserted
         verifyLookup(tb, key300, mixed.get(1));
@@ -1100,7 +1103,8 @@ class ReplicaManagerTest extends ReplicaTestBase {
         byte[] key1 = keyEncoder.encodeKey(row(new Object[] {100}));
         byte[] key2 = keyEncoder.encodeKey(row(new Object[] {200}));
 
-        List<byte[]> inserted = lookupWithInsert(tb, Arrays.asList(key1, key2)).lookupValues();
+        List<byte[]> inserted =
+                lookupValuesAsByteArrays(lookupWithInsert(tb, Arrays.asList(key1, key2)));
         assertThat(inserted).hasSize(2).allMatch(Objects::nonNull);
 
         // Decode values to verify auto-increment column values
@@ -1117,12 +1121,14 @@ class ReplicaManagerTest extends ReplicaTestBase {
         assertThat(row2.getLong(2)).isEqualTo(2L);
 
         // Lookup existing keys - should return same values without modification
-        List<byte[]> existing = lookupWithInsert(tb, Arrays.asList(key1, key2)).lookupValues();
+        List<byte[]> existing =
+                lookupValuesAsByteArrays(lookupWithInsert(tb, Arrays.asList(key1, key2)));
         assertThat(existing).containsExactlyElementsOf(inserted);
 
         // Mixed scenario - key1 exists, key3 missing
         byte[] key3 = keyEncoder.encodeKey(row(new Object[] {300}));
-        List<byte[]> mixed = lookupWithInsert(tb, Arrays.asList(key1, key3)).lookupValues();
+        List<byte[]> mixed =
+                lookupValuesAsByteArrays(lookupWithInsert(tb, Arrays.asList(key1, key3)));
         assertThat(mixed.get(0)).isEqualTo(inserted.get(0)); // existing unchanged
 
         InternalRow row3 = valueDecoder.decodeValue(mixed.get(1)).row;
@@ -1175,7 +1181,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
                             startLatch.await();
                             // Perform concurrent lookupWithInsert
                             LookupResultForBucket result = lookupWithInsert(tb, keys);
-                            threadResults[threadIndex] = result.lookupValues();
+                            threadResults[threadIndex] = lookupValuesAsByteArrays(result);
                         } catch (Exception e) {
                             throw new RuntimeException(e);
                         } finally {
@@ -1271,8 +1277,8 @@ class ReplicaManagerTest extends ReplicaTestBase {
         replicaManager.lookups(true, 20000, 1, requestMap, LOOKUP_KV_VERSION, future::complete);
         Map<TableBucket, LookupResultForBucket> inserted = future.get(5, TimeUnit.SECONDS);
 
-        byte[] value0 = inserted.get(tb0).lookupValues().get(0);
-        byte[] value1 = inserted.get(tb1).lookupValues().get(0);
+        byte[] value0 = inserted.get(tb0).lookupValues().get(0).toByteArray();
+        byte[] value1 = inserted.get(tb1).lookupValues().get(0).toByteArray();
 
         // Verify inserted values via lookup
         verifyLookup(tb0, key0, value0);
@@ -1457,7 +1463,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
     }
 
     @Test
-    void testTaggedLookupAndPrefixResultsCarryLayout() throws Exception {
+    void testTaggedLookupAndPrefixResultsUseRpcSlices() throws Exception {
         TablePath tablePath = TablePath.of("test_db", "ttl_raw_kv_table");
         long tableId = 150007L;
         registerTaggedTable(tablePath, tableId);
@@ -1488,8 +1494,9 @@ class ReplicaManagerTest extends ReplicaTestBase {
                 lookupFuture::complete);
         LookupResultForBucket lookupResult = lookupFuture.get().get(tableBucket);
         assertThat(lookupResult.failed()).isFalse();
-        assertThat(lookupResult.getKvValueLayout()).isSameAs(KvValueLayout.TAGGED);
-        assertThat(lookupResult.lookupValues().get(0)).hasSizeGreaterThan(Long.BYTES);
+        ByteArraySlice lookupValue = lookupResult.lookupValues().get(0);
+        assertThat(lookupValue.offset()).isEqualTo(Long.BYTES);
+        assertThat(lookupValue.length()).isEqualTo(lookupValue.array().length - Long.BYTES);
 
         CompletableFuture<Map<TableBucket, PrefixLookupResultForBucket>> prefixFuture =
                 new CompletableFuture<>();
@@ -1499,8 +1506,9 @@ class ReplicaManagerTest extends ReplicaTestBase {
                 prefixFuture::complete);
         PrefixLookupResultForBucket prefixResult = prefixFuture.get().get(tableBucket);
         assertThat(prefixResult.failed()).isFalse();
-        assertThat(prefixResult.getKvValueLayout()).isSameAs(KvValueLayout.TAGGED);
-        assertThat(prefixResult.prefixLookupValues().get(0).get(0)).hasSizeGreaterThan(Long.BYTES);
+        ByteArraySlice prefixValue = prefixResult.prefixLookupValues().get(0).get(0);
+        assertThat(prefixValue.offset()).isEqualTo(Long.BYTES);
+        assertThat(prefixValue.length()).isEqualTo(prefixValue.array().length - Long.BYTES);
     }
 
     @Test
@@ -2552,16 +2560,25 @@ class ReplicaManagerTest extends ReplicaTestBase {
         assertThat(prefixResult.size()).isEqualTo(1);
         PrefixLookupResultForBucket resultForBucket = prefixResult.get(tb);
         assertThat(resultForBucket).isNotNull();
-        List<List<byte[]>> prefixLookupValues = resultForBucket.prefixLookupValues();
+        List<List<ByteArraySlice>> prefixLookupValues = resultForBucket.prefixLookupValues();
         assertThat(prefixLookupValues.size()).isEqualTo(expectedValues.size());
         for (int i = 0; i < expectedValues.size(); i++) {
-            List<byte[]> prefixValueList = prefixLookupValues.get(i);
+            List<ByteArraySlice> prefixValueList = prefixLookupValues.get(i);
             List<byte[]> expectedValueList = expectedValues.get(i);
             assertThat(prefixValueList.size()).isEqualTo(expectedValueList.size());
             for (int j = 0; j < expectedValueList.size(); j++) {
-                assertThat(prefixValueList.get(j)).isEqualTo(expectedValueList.get(j));
+                assertThat(prefixValueList.get(j).toByteArray())
+                        .isEqualTo(expectedValueList.get(j));
             }
         }
+    }
+
+    private static List<byte[]> lookupValuesAsByteArrays(LookupResultForBucket result) {
+        List<byte[]> values = new ArrayList<>(result.lookupValues().size());
+        for (ByteArraySlice value : result.lookupValues()) {
+            values.add(value == null ? null : value.toByteArray());
+        }
+        return values;
     }
 
     private void registerTaggedTable(TablePath tablePath, long tableId) throws Exception {

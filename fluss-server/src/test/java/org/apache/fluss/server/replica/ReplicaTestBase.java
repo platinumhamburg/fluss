@@ -193,6 +193,8 @@ public class ReplicaTestBase {
     public void setup(TestInfo testInfo) throws Exception {
         conf = getServerConf();
         conf.set(ConfigOptions.TABLET_SERVER_ID, TABLET_SERVER_ID);
+        // Keep unrelated tests independent of the host machine's actual disk usage.
+        conf.set(ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO, 1.0);
         if (testInfo != null && testInfo.getTags().contains(ServerTestTags.JBOD_MULTI_DIR_TAG)) {
             conf.set(
                     ConfigOptions.DATA_DIRS,

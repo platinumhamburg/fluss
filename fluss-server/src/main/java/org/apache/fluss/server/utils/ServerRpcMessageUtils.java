@@ -54,7 +54,6 @@ import org.apache.fluss.record.LogRecords;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.remote.RemoteLogFetchInfo;
 import org.apache.fluss.remote.RemoteLogSegment;
-import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.entity.LimitScanResultForBucket;
 import org.apache.fluss.rpc.entity.ListOffsetsResultForBucket;
@@ -206,6 +205,7 @@ import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
+import org.apache.fluss.utils.ByteArraySlice;
 import org.apache.fluss.utils.json.DataTypeJsonSerde;
 import org.apache.fluss.utils.json.JsonSerdeUtils;
 import org.apache.fluss.utils.json.TableBucketOffsets;
@@ -1356,16 +1356,11 @@ public class ServerRpcMessageUtils {
                 lookupRespForBucket.setError(
                         bucketResult.getErrorCode(), bucketResult.getErrorMessage());
             } else {
-                List<byte[]> values = bucketResult.lookupValues();
-                for (int i = 0; i < values.size(); i++) {
-                    byte[] value = values.get(i);
+                List<ByteArraySlice> values = bucketResult.lookupValues();
+                for (ByteArraySlice value : values) {
                     PbValue pbValue = lookupRespForBucket.addValue();
                     if (value != null) {
-                        KvValueLayout kvValueLayout = bucketResult.getKvValueLayout(i);
-                        pbValue.setValues(
-                                value,
-                                kvValueLayout.valueBodyOffset(),
-                                kvValueLayout.valueBodyLength(value.length));
+                        pbValue.setValues(value.array(), value.offset(), value.length());
                     }
                 }
             }
@@ -1397,14 +1392,10 @@ public class ServerRpcMessageUtils {
                 respForBucket.setError(bucketResult.getErrorCode(), bucketResult.getErrorMessage());
             } else {
                 List<PbValueList> keyResultList = new ArrayList<>();
-                int valueBodyOffset = bucketResult.getKvValueLayout().valueBodyOffset();
-                for (List<byte[]> res : bucketResult.prefixLookupValues()) {
+                for (List<ByteArraySlice> res : bucketResult.prefixLookupValues()) {
                     PbValueList pbValueList = new PbValueList();
-                    for (byte[] bytes : res) {
-                        pbValueList.addValue(
-                                bytes,
-                                valueBodyOffset,
-                                bucketResult.getKvValueLayout().valueBodyLength(bytes.length));
+                    for (ByteArraySlice value : res) {
+                        pbValueList.addValue(value.array(), value.offset(), value.length());
                     }
                     keyResultList.add(pbValueList);
                 }

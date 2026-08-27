@@ -28,6 +28,7 @@ import static org.apache.fluss.config.ConfigOptions.BOOTSTRAP_SERVERS;
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_FORMAT;
 import static org.apache.fluss.config.ConfigOptions.TABLE_KV_FORMAT_VERSION;
 import static org.apache.fluss.config.ConfigOptions.TABLE_KV_STANDBY_REPLICA_ENABLED;
+import static org.apache.fluss.config.ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION;
 import static org.apache.fluss.config.ConfigOptions.TABLE_REPLICATION_FACTOR;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -143,6 +144,7 @@ public class CatalogTableTestUtils {
         // Remove datalake format (auto-added when datalake is enabled in Fluss cluster)
         actualOptions.remove(TABLE_DATALAKE_FORMAT.key());
         actualOptions.remove(TABLE_KV_FORMAT_VERSION.key());
+        actualOptions.remove(TABLE_KV_VALUE_LAYOUT_VERSION.key());
         // Remove standby replica (auto-added in Fluss cluster)
         actualOptions.remove(TABLE_KV_STANDBY_REPLICA_ENABLED.key());
         assertThat(actualOptions).isEqualTo(expectedOptions);

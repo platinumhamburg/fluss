@@ -1258,6 +1258,7 @@ abstract class FlinkCatalogITCase {
         actualOptions.remove(ConfigOptions.BOOTSTRAP_SERVERS.key());
         actualOptions.remove(ConfigOptions.TABLE_REPLICATION_FACTOR.key());
         actualOptions.remove(ConfigOptions.TABLE_KV_FORMAT_VERSION.key());
+        actualOptions.remove(ConfigOptions.TABLE_KV_VALUE_LAYOUT_VERSION.key());
         actualOptions.remove(ConfigOptions.TABLE_KV_STANDBY_REPLICA_ENABLED.key());
         assertThat(actualOptions).isEqualTo(expectedOptions);
     }

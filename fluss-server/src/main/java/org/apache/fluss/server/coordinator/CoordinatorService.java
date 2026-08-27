@@ -469,9 +469,9 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         tablePath.validate();
         authorizeDatabase(OperationType.CREATE, tablePath.getDatabaseName());
 
-        TableDescriptor requestedDescriptor;
+        TableDescriptor tableDescriptor;
         try {
-            requestedDescriptor = TableDescriptor.fromJsonBytes(request.getTableJson());
+            tableDescriptor = TableDescriptor.fromJsonBytes(request.getTableJson());
         } catch (Exception e) {
             if (e instanceof UncheckedIOException) {
                 throw new InvalidTableException(
@@ -486,17 +486,14 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 lakeCatalogDynamicLoader.getLakeCatalogContainer();
 
         // Check table creation permissions based on table type
-        validateTableCreationPermission(requestedDescriptor, tablePath);
+        validateTableCreationPermission(tableDescriptor, tablePath);
 
         // apply system defaults if the config is not set
-        TableDescriptor resolvedDescriptor =
-                applySystemDefaults(requestedDescriptor, lakeCatalogContainer);
+        tableDescriptor = applySystemDefaults(tableDescriptor, lakeCatalogContainer);
 
         // validate table descriptor before creating table in lake or fluss metadata,
         // to avoid orphaned lake tables when validation fails
-        metadataManager.validateTableDescriptor(resolvedDescriptor);
-
-        TableDescriptor tableDescriptor = resolvedDescriptor;
+        metadataManager.validateTableDescriptor(tableDescriptor);
 
         // the distribution and bucket count must be set now
         //noinspection OptionalGetWithoutIsPresent

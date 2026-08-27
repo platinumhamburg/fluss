@@ -214,7 +214,11 @@ class KvRecoverFromRemoteLogITCase {
         byte[] encodedKey = BytesUtils.toArray(allRecords.get(allRecords.size() - 1).getKey());
         assertThat(leaderReplica.getKvTablet()).isNotNull();
         byte[] leaderValue =
-                leaderReplica.getKvTablet().multiGet(Collections.singletonList(encodedKey)).get(0);
+                leaderReplica
+                        .getKvTablet()
+                        .getRocksDBKv()
+                        .multiGet(Collections.singletonList(encodedKey))
+                        .get(0);
         long originalTag = KvValueLayout.TAGGED.readValueTag(MemorySegment.wrap(leaderValue));
         assertThat(originalTag)
                 .isEqualTo(EVENT_TIME.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli());
@@ -322,6 +326,7 @@ class KvRecoverFromRemoteLogITCase {
         byte[] recovered =
                 followerReplica
                         .getKvTablet()
+                        .getRocksDBKv()
                         .multiGet(Collections.singletonList(encodedKey))
                         .get(0);
         assertThat(KvValueLayout.TAGGED.readValueTag(MemorySegment.wrap(recovered)))

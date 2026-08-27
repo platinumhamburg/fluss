@@ -77,6 +77,7 @@ import org.apache.fluss.testutils.common.ManuallyTriggeredScheduledExecutorServi
 import org.apache.fluss.types.DataField;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.ByteArraySlice;
 import org.apache.fluss.utils.types.Tuple2;
 
 import com.github.benmanes.caffeine.cache.Scheduler;
@@ -380,8 +381,8 @@ class HistoricalPartitionManagerTest extends ReplicaTestBase {
                     new ValueDecoder(
                                     schemaGetter(tableInfo),
                                     tableInfo.getTableConfig().getKvFormat(),
-                                    lookupResult.getKvValueLayout(0))
-                            .decodeValue(lookupResult.lookupValues().get(0));
+                                    KvValueLayout.PLAIN)
+                            .decodeValue(lookupResult.lookupValues().get(0).toByteArray());
             assertThat(lookedUpValue.row.getString(3)).isEqualTo(BinaryString.fromString("v2"));
 
             // Keep a tombstone locally so a later lookup cannot resurrect the value from lake.
@@ -416,7 +417,7 @@ class HistoricalPartitionManagerTest extends ReplicaTestBase {
             LookupResultForBucket deletedLookup =
                     deletedLookupResponse.get(10, TimeUnit.SECONDS).get(0);
             assertThat(deletedLookup.failed()).isFalse();
-            assertThat(deletedLookup.lookupValues()).containsExactly((byte[]) null);
+            assertThat(deletedLookup.lookupValues()).containsExactly((ByteArraySlice) null);
 
             // Historical replicas must reject the normal KV write path.
             assertThatThrownBy(
