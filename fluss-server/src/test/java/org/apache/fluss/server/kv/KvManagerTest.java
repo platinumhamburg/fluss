@@ -44,6 +44,7 @@ import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.ByteArraySlice;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.FlussScheduler;
 
@@ -229,9 +230,9 @@ final class KvManagerTest {
         }
 
         // check kv1
-        assertThat(kv1.multiGet(kv1Keys)).containsExactlyElementsOf(kv1Values);
+        assertThat(toByteArrays(kv1.multiGet(kv1Keys))).containsExactlyElementsOf(kv1Values);
         // check kv2
-        assertThat(kv2.multiGet(kv2Keys)).containsExactlyElementsOf(kv2Values);
+        assertThat(toByteArrays(kv2.multiGet(kv2Keys))).containsExactlyElementsOf(kv2Values);
     }
 
     @ParameterizedTest
@@ -253,7 +254,7 @@ final class KvManagerTest {
         kvManager.startup();
 
         KvTablet reopened = getOrCreateKv(tablePath1, partitionName, tableBucket1);
-        assertThat(reopened.multiGet(Collections.singletonList(key)))
+        assertThat(toByteArrays(reopened.multiGet(Collections.singletonList(key))))
                 .containsExactly((byte[]) null);
     }
 
@@ -313,7 +314,7 @@ final class KvManagerTest {
         }
 
         // check kv1
-        assertThat(kv1.multiGet(kvKeys)).containsExactlyElementsOf(kvValues);
+        assertThat(toByteArrays(kv1.multiGet(kvKeys))).containsExactlyElementsOf(kvValues);
     }
 
     @ParameterizedTest
@@ -351,7 +352,8 @@ final class KvManagerTest {
 
         kv1 = getOrCreateKv(tablePath1, partitionName, tableBucket1);
         assertThat(kv1.getKvTabletDir()).exists();
-        assertThat(kv1.multiGet(Collections.singletonList(key))).containsExactly((byte[]) null);
+        assertThat(toByteArrays(kv1.multiGet(Collections.singletonList(key))))
+                .containsExactly((byte[]) null);
         assertThat(kvManager.getKv(tableBucket1)).isPresent();
     }
 
@@ -542,7 +544,15 @@ final class KvManagerTest {
 
     private void verifyMultiGet(KvTablet kvTablet, byte[] key, byte[] expectedValue)
             throws IOException {
-        List<byte[]> gotValues = kvTablet.multiGet(Collections.singletonList(key));
+        List<byte[]> gotValues = toByteArrays(kvTablet.multiGet(Collections.singletonList(key)));
         assertThat(gotValues).containsExactly(expectedValue);
+    }
+
+    private static List<byte[]> toByteArrays(List<ByteArraySlice> slices) {
+        List<byte[]> values = new ArrayList<>(slices.size());
+        for (ByteArraySlice slice : slices) {
+            values.add(slice == null ? null : slice.toByteArray());
+        }
+        return values;
     }
 }

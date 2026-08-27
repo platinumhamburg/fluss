@@ -22,6 +22,7 @@ import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.record.BinaryValue;
 import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.row.BinaryRow;
+import org.apache.fluss.utils.ByteArraySlice;
 
 import org.junit.jupiter.api.Test;
 
@@ -57,6 +58,14 @@ class KvValueLayoutTest {
         assertThat(KvValueLayout.TAGGED.readValueTag(MemorySegment.wrap(value))).isEqualTo(123L);
         assertThat(KvValueLayout.TAGGED.readSchemaId(MemorySegment.wrap(value)))
                 .isEqualTo(DEFAULT_SCHEMA_ID);
+
+        ByteArraySlice rpcValue = KvValueLayout.TAGGED.toValueBodySlice(value);
+        assertThat(rpcValue.array()).isSameAs(value);
+        assertThat(rpcValue.offset()).isEqualTo(Long.BYTES);
+        assertThat(rpcValue.length()).isEqualTo(value.length - Long.BYTES);
+        assertThat(rpcValue.toByteArray())
+                .containsExactly(ValueEncoder.encodeValue(DEFAULT_SCHEMA_ID, row));
+        assertThat(KvValueLayout.TAGGED.toValueBodySlice(null)).isNull();
     }
 
     @Test

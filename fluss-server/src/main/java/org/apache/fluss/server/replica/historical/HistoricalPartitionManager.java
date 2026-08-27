@@ -41,6 +41,7 @@ import org.apache.fluss.server.kv.historical.HistoricalValueLookup;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.storage.LocalDiskManager;
+import org.apache.fluss.utils.ByteArraySlice;
 import org.apache.fluss.utils.ByteArrayWrapper;
 import org.apache.fluss.utils.concurrent.Scheduler;
 
@@ -333,23 +334,19 @@ public final class HistoricalPartitionManager implements AutoCloseable {
             }
 
             Iterator<byte[]> lakeValueIterator = lakeValues.iterator();
-            List<byte[]> values = new ArrayList<>(localResults.size());
-            List<KvValueLayout> valueLayouts = new ArrayList<>(localResults.size());
+            List<ByteArraySlice> values = new ArrayList<>(localResults.size());
             KvValueLayout localValueLayout =
                     KvValueLayout.fromTableConfig(tableInfo.getTableConfig());
             for (KvStateLookupResult localResult : localResults) {
                 // Consume one lake value for each NOT_FOUND result; local values and tombstones
                 // keep their original positions without advancing the lake iterator.
                 if (localResult.status() == Status.NOT_FOUND) {
-                    values.add(lakeValueIterator.next());
-                    valueLayouts.add(KvValueLayout.PLAIN);
+                    values.add(KvValueLayout.PLAIN.toValueBodySlice(lakeValueIterator.next()));
                 } else {
-                    values.add(localResult.value());
-                    valueLayouts.add(localValueLayout);
+                    values.add(localValueLayout.toValueBodySlice(localResult.value()));
                 }
             }
-            return new LookupResultForBucket(
-                    tableBucket, values, valueLayouts, originalPartitionName);
+            return new LookupResultForBucket(tableBucket, values, originalPartitionName);
         } catch (Exception e) {
             return new LookupResultForBucket(
                     tableBucket, originalPartitionName, ApiError.fromThrowable(e));

@@ -51,8 +51,9 @@ class ServerRpcMessageUtilsTest {
         LookupResultForBucket result =
                 new LookupResultForBucket(
                         new TableBucket(1L, 0),
-                        Arrays.asList(plainValue, taggedValue),
-                        Arrays.asList(KvValueLayout.PLAIN, KvValueLayout.TAGGED),
+                        Arrays.asList(
+                                KvValueLayout.PLAIN.toValueBodySlice(plainValue),
+                                KvValueLayout.TAGGED.toValueBodySlice(taggedValue)),
                         "dt=2025-01-01");
 
         LookupResponse response =

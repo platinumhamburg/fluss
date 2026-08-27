@@ -34,10 +34,10 @@ import static org.apache.fluss.server.RpcServiceBase.validateKvSnapshotMetadataV
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests KV snapshot metadata API compatibility. */
-class RpcServiceBaseKvSnapshotVersionTest {
+class RpcServiceBaseTest {
 
     @Test
-    void testTaggedSnapshotRequiresVersionOne() {
+    void testValidateKvSnapshotMetadataVersion() {
         TableInfo taggedTableInfo = tableInfo(KvValueLayout.TAGGED);
         TableInfo plainTableInfo = tableInfo(KvValueLayout.PLAIN);
 

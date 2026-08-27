@@ -79,7 +79,9 @@ import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.RootAllocator;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.types.StringType;
+import org.apache.fluss.utils.ByteArraySlice;
 import org.apache.fluss.utils.CloseableIterator;
+import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.clock.ManualClock;
 import org.apache.fluss.utils.clock.SystemClock;
@@ -158,21 +160,18 @@ class KvTabletTest {
 
     @AfterEach
     void afterEach() throws Exception {
-        try {
-            if (kvTablet != null) {
-                kvTablet.close();
-            }
-        } finally {
-            try {
-                if (logTablet != null) {
-                    logTablet.close();
-                }
-            } finally {
-                if (executor != null) {
-                    executor.shutdown();
-                }
-            }
-        }
+        IOUtils.closeAll(
+                () -> {
+                    if (kvTablet != null) {
+                        kvTablet.close();
+                    }
+                },
+                () -> {
+                    if (logTablet != null) {
+                        logTablet.close();
+                    }
+                },
+                executor::shutdown);
     }
 
     private void initLogTabletAndKvTablet(Schema schema, Map<String, String> tableConfig)
@@ -376,15 +375,41 @@ class KvTabletTest {
                         kvRecordBatchFactory.ofRecords(Collections.singletonList(record)), null);
         flushAndWait(kvTablet, Long.MAX_VALUE);
 
-        byte[] value = kvTablet.multiGet(Collections.singletonList("k1".getBytes())).get(0);
-        BinaryValue decoded =
-                new ValueDecoder(schemaGetter, KvFormat.COMPACTED, KvValueLayout.TAGGED)
-                        .decodeValue(value);
+        byte[] value = readRawValue("k1");
+        BinaryValue decoded = decodeTaggedValue(value);
 
         assertThat(readTaggedValueTag(value)).isEqualTo(writeTimestampMs);
         assertThat(appendInfo.maxTimestamp()).isEqualTo(walTimestampFloorMs);
         assertThat(decoded.row.getInt(0)).isEqualTo(1);
         assertThat(decoded.row.getString(1).toString()).isEqualTo("a");
+    }
+
+    @Test
+    void testReadApisReturnValueBodySlices() throws Exception {
+        initLogTabletAndKvTablet(
+                DATA1_SCHEMA_PK, kvTtlProcessTimeConfig(), new ManualClock(123456789L));
+
+        byte[] key = "slice-key".getBytes();
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord(key, new Object[] {1, "value"})),
+                null);
+
+        ByteArraySlice bufferedValue =
+                kvTablet.multiGetFromBufferOrKv(Collections.singletonList(key)).get(0);
+
+        flushAndWait(kvTablet, Long.MAX_VALUE);
+        ByteArraySlice lookupValue = kvTablet.multiGet(Collections.singletonList(key)).get(0);
+        ByteArraySlice prefixLookupValue = kvTablet.prefixLookup(key).get(0);
+        ByteArraySlice limitScanValue = kvTablet.limitScan(1).get(0);
+        byte[] expectedValue =
+                ValueEncoder.encodeValue(
+                        schemaId, compactedRow(baseRowType, new Object[] {1, "value"}));
+
+        assertValueBodySlice(bufferedValue, expectedValue);
+        assertValueBodySlice(lookupValue, expectedValue);
+        assertValueBodySlice(prefixLookupValue, expectedValue);
+        assertValueBodySlice(limitScanValue, expectedValue);
     }
 
     @Test
@@ -402,7 +427,7 @@ class KvTabletTest {
                 kvRecordBatchFactory.ofRecords(Collections.singletonList(record)), null);
         flushAndWait(kvTablet, Long.MAX_VALUE);
 
-        byte[] value = readValue("k1");
+        byte[] value = readRawValue("k1");
         BinaryValue decoded = decodeTaggedValue(value);
 
         assertThat(readTaggedValueTag(value)).isEqualTo(1234L);
@@ -427,7 +452,7 @@ class KvTabletTest {
                 kvRecordBatchFactory.ofRecords(Collections.singletonList(record)), null);
         flushAndWait(kvTablet, Long.MAX_VALUE);
 
-        byte[] value = readValue("k1");
+        byte[] value = readRawValue("k1");
         BinaryValue decoded = decodeTaggedValue(value);
 
         assertThat(readTaggedValueTag(value))
@@ -469,7 +494,7 @@ class KvTabletTest {
                 new int[] {0, 1});
         flushAndWait(kvTablet, Long.MAX_VALUE);
 
-        byte[] value = readValue(key);
+        byte[] value = readRawValue(key);
         BinaryValue updatedValue = decodeTaggedValue(value);
         assertThat(readTaggedValueTag(value)).isEqualTo(eventTimestampMs);
         assertThat(updatedValue.row.getLong(1)).isEqualTo(eventTimestampMs);
@@ -505,7 +530,7 @@ class KvTabletTest {
                 new int[] {0, 2});
         flushAndWait(kvTablet, Long.MAX_VALUE);
 
-        byte[] value = readValue(key);
+        byte[] value = readRawValue(key);
         BinaryValue updatedValue = decodeTaggedValue(value);
         assertThat(readTaggedValueTag(value)).isEqualTo(eventTimestampMs);
         assertThat(updatedValue.row.getLong(1)).isEqualTo(eventTimestampMs);
@@ -548,7 +573,7 @@ class KvTabletTest {
 
         kvTablet.getRocksDBKv().getDb().compactRange();
 
-        List<byte[]> lookupValues =
+        List<ByteArraySlice> lookupValues =
                 kvTablet.multiGet(Arrays.asList(expiredKey.getBytes(), freshKey.getBytes()));
         assertThat(lookupValues.get(0)).isNull();
         assertThat(lookupValues.get(1)).isNotNull();
@@ -2134,7 +2159,7 @@ class KvTabletTest {
                 ValueEncoder.encodeValue(
                         schemaId, compactedRow(baseRowType, new Object[] {1, "new"}));
         assertThat(kvTablet.getFlushedLogOffset()).isEqualTo(secondFlushOffset);
-        assertThat(kvTablet.multiGet(Collections.singletonList(key)))
+        assertThat(kvTablet.multiGet(Collections.singletonList(key)).get(0).toByteArray())
                 .containsExactly(expectedValue);
         assertThat(kvTablet.getKvPreWriteBuffer().pendingFlushBytes()).isEqualTo(0);
         assertThat(kvTablet.getFlushState()).isEqualTo(KvTablet.FlushState.IDLE);
@@ -2314,7 +2339,7 @@ class KvTabletTest {
         for (int i = 0; i < 100; i++) {
             keysToRead.add(String.valueOf(i).getBytes());
         }
-        List<byte[]> readValues = kvTablet.multiGet(keysToRead);
+        List<ByteArraySlice> readValues = kvTablet.multiGet(keysToRead);
         assertThat(readValues).hasSize(100);
 
         // After reads: get latency must be tracked
@@ -2506,8 +2531,14 @@ class KvTabletTest {
         kvTablet.close();
     }
 
-    private byte[] readValue(String key) throws Exception {
-        return kvTablet.multiGet(Collections.singletonList(key.getBytes())).get(0);
+    private byte[] readRawValue(String key) throws Exception {
+        return kvTablet.getRocksDBKv().multiGet(Collections.singletonList(key.getBytes())).get(0);
+    }
+
+    private static void assertValueBodySlice(ByteArraySlice slice, byte[] expectedValue) {
+        assertThat(slice.offset()).isEqualTo(Long.BYTES);
+        assertThat(slice.length()).isEqualTo(slice.array().length - Long.BYTES);
+        assertThat(slice.toByteArray()).containsExactly(expectedValue);
     }
 
     private BinaryValue decodeTaggedValue(byte[] value) {

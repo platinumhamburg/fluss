@@ -109,6 +109,7 @@ import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.ZkData;
 import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.ByteArraySlice;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
@@ -1561,7 +1562,7 @@ public final class Replica {
         return followerReplica;
     }
 
-    public List<byte[]> lookups(List<byte[]> keys) {
+    public List<ByteArraySlice> lookups(List<byte[]> keys) {
         if (!isKvTable()) {
             throw new NonPrimaryKeyTableException(
                     "the primary key table not exists for " + tableBucket);
@@ -1596,7 +1597,7 @@ public final class Replica {
      * lookup-with-insert-if-not-exists after an {@code acks = 1} insert, where the asynchronous
      * flush may not have materialized the insert into RocksDB yet).
      */
-    public List<byte[]> lookupsFromBufferOrKv(List<byte[]> keys) {
+    public List<ByteArraySlice> lookupsFromBufferOrKv(List<byte[]> keys) {
         if (!isKvTable()) {
             throw new NonPrimaryKeyTableException(
                     "the primary key table not exists for " + tableBucket);
@@ -1625,7 +1626,7 @@ public final class Replica {
                 });
     }
 
-    public List<byte[]> prefixLookup(byte[] prefixKey) {
+    public List<ByteArraySlice> prefixLookup(byte[] prefixKey) {
         if (!isKvTable()) {
             throw new NonPrimaryKeyTableException(
                     "Try to do prefix lookup on a non primary key table: " + getTablePath());
@@ -1674,14 +1675,10 @@ public final class Replica {
                         checkNotNull(
                                 kvTablet,
                                 "KvTablet for the replica to limit scan shouldn't be null.");
-                        List<byte[]> values = kvTablet.limitScan(limit);
+                        List<ByteArraySlice> values = kvTablet.limitScan(limit);
                         DefaultValueRecordBatch.Builder builder = DefaultValueRecordBatch.builder();
-                        int valueBodyOffset = kvTablet.getKvValueLayout().valueBodyOffset();
-                        for (byte[] value : values) {
-                            builder.append(
-                                    value,
-                                    valueBodyOffset,
-                                    kvTablet.getKvValueLayout().valueBodyLength(value.length));
+                        for (ByteArraySlice value : values) {
+                            builder.append(value.array(), value.offset(), value.length());
                         }
                         return builder.build();
                     } catch (IOException e) {

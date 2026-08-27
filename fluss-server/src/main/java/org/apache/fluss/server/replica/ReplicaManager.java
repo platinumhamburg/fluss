@@ -55,7 +55,6 @@ import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.ProjectionPushdownCache;
 import org.apache.fluss.remote.RemoteLogFetchInfo;
 import org.apache.fluss.remote.RemoteLogSegment;
-import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.entity.LimitScanResultForBucket;
@@ -123,6 +122,7 @@ import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
+import org.apache.fluss.utils.ByteArraySlice;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.clock.Clock;
@@ -887,7 +887,7 @@ public class ReplicaManager implements ServerReconfigurable {
             List<Integer> missingIndexes = new ArrayList<>();
             List<byte[]> missingKeys = new ArrayList<>();
             List<byte[]> requestedKeys = entry.getValue();
-            List<byte[]> lookupValues = lookupResult.lookupValues();
+            List<ByteArraySlice> lookupValues = lookupResult.lookupValues();
 
             for (int i = 0; i < requestedKeys.size(); i++) {
                 if (lookupValues.get(i) == null) {
@@ -914,13 +914,14 @@ public class ReplicaManager implements ServerReconfigurable {
                 ApiKeys.LOOKUP.highestSupportedVersion,
                 multiLookupResponseCallBack -> {
                     LookupResultForBucket result = multiLookupResponseCallBack.get(tableBucket);
-                    List<byte[]> values = result.lookupValues();
+                    List<ByteArraySlice> values = result.lookupValues();
                     checkState(
                             values.size() == 1,
                             "The result value for single lookup should be with size 1, "
                                     + "but the result size is {}",
                             values.size());
-                    responseCallback.accept(values.get(0));
+                    ByteArraySlice value = values.get(0);
+                    responseCallback.accept(value == null ? null : value.toByteArray());
                 });
     }
 
@@ -1018,12 +1019,7 @@ public class ReplicaManager implements ServerReconfigurable {
                 tableMetrics = replica.tableMetrics();
                 tableMetrics.totalLookupRequests().inc();
                 lookupResultForBucketMap.put(
-                        tb,
-                        new LookupResultForBucket(
-                                tb,
-                                replica.lookups(entry.getValue()),
-                                KvValueLayout.fromTableConfig(
-                                        replica.getTableInfo().getTableConfig())));
+                        tb, new LookupResultForBucket(tb, replica.lookups(entry.getValue())));
             } catch (Exception e) {
                 if (isUnexpectedException(e)) {
                     LOG.error("Error lookup from local kv on replica {}", tb, e);
@@ -1119,8 +1115,9 @@ public class ReplicaManager implements ServerReconfigurable {
             // Read through the pre-write buffer: with acks != -1 the response (and thus this
             // re-lookup) can run before the asynchronous flush has materialized the insert into
             // RocksDB, but the inserted entries are already visible in the pre-write buffer.
-            List<byte[]> results =
-                    getReplicaOrException(tb).lookupsFromBufferOrKv(missingKeysContext.missingKeys);
+            Replica replica = getReplicaOrException(tb);
+            List<ByteArraySlice> results =
+                    replica.lookupsFromBufferOrKv(missingKeysContext.missingKeys);
             LookupResultForBucket lookupResult = lookupResultForBucketMap.get(tb);
             for (int i = 0; i < missingKeysContext.missingIndexes.size(); i++) {
                 lookupResult
@@ -1145,23 +1142,17 @@ public class ReplicaManager implements ServerReconfigurable {
         Map<TableBucket, PrefixLookupResultForBucket> result = new HashMap<>();
         for (Map.Entry<TableBucket, List<byte[]>> entry : entriesPerBucket.entrySet()) {
             TableBucket tb = entry.getKey();
-            List<List<byte[]>> resultForBucket = new ArrayList<>();
+            List<List<ByteArraySlice>> resultForBucket = new ArrayList<>();
             try {
                 Replica replica = getReplicaOrException(tb);
                 validateClientVersionForPkTable(apiVersion, replica.getTableInfo());
                 tableMetrics = replica.tableMetrics();
                 tableMetrics.totalPrefixLookupRequests().inc();
                 for (byte[] prefixKey : entry.getValue()) {
-                    List<byte[]> resultForPerKey = replica.prefixLookup(prefixKey);
+                    List<ByteArraySlice> resultForPerKey = replica.prefixLookup(prefixKey);
                     resultForBucket.add(resultForPerKey);
                 }
-                result.put(
-                        tb,
-                        new PrefixLookupResultForBucket(
-                                tb,
-                                resultForBucket,
-                                KvValueLayout.fromTableConfig(
-                                        replica.getTableInfo().getTableConfig())));
+                result.put(tb, new PrefixLookupResultForBucket(tb, resultForBucket));
             } catch (Exception e) {
                 if (isUnexpectedException(e)) {
                     LOG.error("Error processing prefix lookup operation on replica {}", tb, e);

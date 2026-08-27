@@ -61,6 +61,7 @@ import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.server.utils.ResourceGuard;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.memory.BufferAllocator;
+import org.apache.fluss.utils.ByteArraySlice;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.clock.Clock;
@@ -1068,12 +1069,12 @@ public final class KvTablet {
         return runnable -> inWriteLock(kvLock, runnable::run);
     }
 
-    public List<byte[]> multiGet(List<byte[]> keys) throws IOException {
+    public List<ByteArraySlice> multiGet(List<byte[]> keys) throws IOException {
         return inReadLock(
                 kvLock,
                 () -> {
                     rocksDBKv.checkIfRocksDBClosed();
-                    return rocksDBKv.multiGet(keys);
+                    return toValueBodySlices(rocksDBKv.multiGet(keys));
                 });
     }
 
@@ -1085,7 +1086,7 @@ public final class KvTablet {
      * the re-lookup of lookup-with-insert-if-not-exists. External lookups must keep using {@link
      * #multiGet} so that clients only observe flushed data.
      */
-    public List<byte[]> multiGetFromBufferOrKv(List<byte[]> keys) throws IOException {
+    public List<ByteArraySlice> multiGetFromBufferOrKv(List<byte[]> keys) throws IOException {
         checkState(
                 !historicalPartition,
                 "multiGetFromBufferOrKv is not supported for historical KV tablet %s",
@@ -1094,12 +1095,11 @@ public final class KvTablet {
                 kvLock,
                 () -> {
                     rocksDBKv.checkIfRocksDBClosed();
-                    List<byte[]> values = new ArrayList<>(keys.size());
+                    List<ByteArraySlice> values = new ArrayList<>(keys.size());
                     for (byte[] key : keys) {
-                        values.add(
-                                kvStateAccessor
-                                        .lookup(kvStateAccessor.encodeKey(key, null))
-                                        .value());
+                        KvPreWriteBuffer.Key lookupKey = kvStateAccessor.encodeKey(key, null);
+                        byte[] rawValue = kvStateAccessor.lookup(lookupKey).value();
+                        values.add(kvValueLayout.toValueBodySlice(rawValue));
                     }
                     return values;
                 });
@@ -1125,22 +1125,30 @@ public final class KvTablet {
                 });
     }
 
-    public List<byte[]> prefixLookup(byte[] prefixKey) throws IOException {
+    public List<ByteArraySlice> prefixLookup(byte[] prefixKey) throws IOException {
         return inReadLock(
                 kvLock,
                 () -> {
                     rocksDBKv.checkIfRocksDBClosed();
-                    return rocksDBKv.prefixLookup(prefixKey);
+                    return toValueBodySlices(rocksDBKv.prefixLookup(prefixKey));
                 });
     }
 
-    public List<byte[]> limitScan(int limit) throws IOException {
+    public List<ByteArraySlice> limitScan(int limit) throws IOException {
         return inReadLock(
                 kvLock,
                 () -> {
                     rocksDBKv.checkIfRocksDBClosed();
-                    return rocksDBKv.limitScan(limit);
+                    return toValueBodySlices(rocksDBKv.limitScan(limit));
                 });
+    }
+
+    private List<ByteArraySlice> toValueBodySlices(List<byte[]> values) {
+        List<ByteArraySlice> valueBodySlices = new ArrayList<>(values.size());
+        for (byte[] value : values) {
+            valueBodySlices.add(kvValueLayout.toValueBodySlice(value));
+        }
+        return valueBodySlices;
     }
 
     /**

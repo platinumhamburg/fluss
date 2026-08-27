@@ -20,7 +20,10 @@ package org.apache.fluss.row.encode;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.memory.MemorySegment;
+import org.apache.fluss.utils.ByteArraySlice;
 import org.apache.fluss.utils.UnsafeUtils;
+
+import javax.annotation.Nullable;
 
 import static org.apache.fluss.utils.Preconditions.checkState;
 
@@ -94,6 +97,14 @@ public final class KvValueLayout {
     /** Returns the RPC value body length for a raw KV value length. */
     public int valueBodyLength(int valueLength) {
         return valueLength - valueBodyOffset;
+    }
+
+    /** Returns the RPC value body as a zero-copy slice of a raw KV value. */
+    public @Nullable ByteArraySlice toValueBodySlice(@Nullable byte[] value) {
+        if (value == null) {
+            return null;
+        }
+        return ByteArraySlice.wrap(value, valueBodyOffset(), valueBodyLength(value.length));
     }
 
     /** Returns the byte offset of schema id in a raw KV value. */
