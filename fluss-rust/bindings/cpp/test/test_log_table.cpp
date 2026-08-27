@@ -645,6 +645,14 @@ TEST_F(LogTableTest, LimitScanErrors) {
         fluss::LogScanner s2;
         EXPECT_FALSE(table.NewScan().Limit(5).CreateRecordBatchLogScanner(s2).Ok());
     }
+    {
+        fluss::BatchScanner s;
+        EXPECT_FALSE(table.NewScan()
+                         .Filter(fluss::Col("c1").GreaterThan(0))
+                         .Limit(1)
+                         .CreateBucketBatchScanner(fluss::TableBucket{table_id, 0}, s)
+                         .Ok());
+    }
     ASSERT_OK(adm.DropTable(table_path, false));
 
     // A non-ARROW (INDEXED) log table rejects a limit scan.
@@ -988,6 +996,184 @@ TEST_F(LogTableTest, TestPollBatches) {
         EXPECT_EQ(proj_batches[0]->GetArrowRecordBatch()->num_columns(), 1)
             << "Projected batch should have 1 column (id), not 2";
     }
+
+    ASSERT_OK(adm.DropTable(table_path, false));
+}
+
+TEST_F(LogTableTest, FilterPushdownWithProjection) {
+    auto& adm = admin();
+    auto& conn = connection();
+
+    fluss::TablePath table_path("fluss", "test_filter_pushdown_cpp");
+    auto schema = fluss::Schema::NewBuilder()
+                      .AddColumn("id", DataType::Int())
+                      .AddColumn("name", DataType::String())
+                      .Build();
+    auto table_descriptor = fluss::TableDescriptor::NewBuilder()
+                                .SetSchema(schema)
+                                .SetBucketCount(1)
+                                .SetBucketKeys({"id"})
+                                .SetProperty("table.replication.factor", "1")
+                                .SetProperty("table.statistics.columns", "id,name")
+                                .Build();
+    fluss_test::CreateTable(adm, table_path, table_descriptor);
+
+    fluss::Table table;
+    ASSERT_OK(conn.GetTable(table_path, table));
+    fluss::AppendWriter writer;
+    ASSERT_OK(table.NewAppend().CreateWriter(writer));
+
+    auto make_batch = [](std::vector<int32_t> ids, std::vector<std::string> names) {
+        arrow::Int32Builder id_builder;
+        id_builder.AppendValues(ids).ok();
+        arrow::StringBuilder name_builder;
+        name_builder.AppendValues(names).ok();
+        return arrow::RecordBatch::Make(
+            arrow::schema(
+                {arrow::field("id", arrow::int32()), arrow::field("name", arrow::utf8())}),
+            static_cast<int64_t>(ids.size()),
+            {id_builder.Finish().ValueOrDie(), name_builder.Finish().ValueOrDie()});
+    };
+
+    ASSERT_OK(writer.AppendArrowBatch(make_batch({1, 2}, {"low-1", "low-2"})));
+    ASSERT_OK(writer.Flush());
+    ASSERT_OK(writer.AppendArrowBatch(make_batch({6, 7}, {"high-6", "high-7"})));
+    ASSERT_OK(writer.Flush());
+
+    fluss::RecordBatchLogScanner scanner;
+    ASSERT_OK(
+        table.NewScan()
+            .Filter(fluss::Col("id").GreaterThan(5).And(fluss::Col("name").StartsWith("high")))
+            .ProjectByName({"name"})
+            .CreateRecordBatchLogScanner(scanner));
+    ASSERT_OK(scanner.Subscribe(0, fluss::EARLIEST_OFFSET));
+
+    auto extract_names = [](const fluss::ArrowRecordBatches& batches) {
+        std::vector<std::string> names;
+        for (const auto& batch : batches) {
+            auto array = std::static_pointer_cast<arrow::StringArray>(
+                batch->GetArrowRecordBatch()->column(0));
+            for (int64_t i = 0; i < array->length(); ++i) {
+                names.push_back(array->GetString(i));
+            }
+        }
+        return names;
+    };
+
+    std::vector<std::string> names;
+    fluss_test::PollRecordBatches(scanner, 2, extract_names, names);
+    EXPECT_EQ(names, (std::vector<std::string>{"high-6", "high-7"}));
+
+    fluss::RecordBatchLogScanner invalid_scanner;
+    auto invalid_result = table.NewScan()
+                              .Filter(fluss::Col("missing").Equal(1))
+                              .CreateRecordBatchLogScanner(invalid_scanner);
+    EXPECT_FALSE(invalid_result.Ok());
+    EXPECT_NE(invalid_result.error_message.find("missing"), std::string::npos);
+
+    ASSERT_OK(adm.DropTable(table_path, false));
+}
+
+TEST_F(LogTableTest, FilterPushdownLiteralTypes) {
+    auto& adm = admin();
+    auto& conn = connection();
+
+    fluss::TablePath table_path("fluss", "test_filter_pushdown_literals_cpp");
+    auto schema = fluss::Schema::NewBuilder()
+                      .AddColumn("id", DataType::Int())
+                      .AddColumn("amount", DataType::Decimal(10, 2))
+                      .AddColumn("event_time", DataType::Timestamp(9))
+                      .AddColumn("event_time_ltz", DataType::TimestampLtz(9))
+                      .Build();
+    auto table_descriptor =
+        fluss::TableDescriptor::NewBuilder()
+            .SetSchema(schema)
+            .SetBucketCount(1)
+            .SetBucketKeys({"id"})
+            .SetProperty("table.replication.factor", "1")
+            .SetProperty("table.statistics.columns", "id,amount,event_time,event_time_ltz")
+            .Build();
+    fluss_test::CreateTable(adm, table_path, table_descriptor);
+
+    fluss::Table table;
+    ASSERT_OK(conn.GetTable(table_path, table));
+
+    const auto boundary = fluss::Timestamp::FromMillisNanos(1769163227123, 456000);
+    const auto before_boundary = fluss::Timestamp::FromMillisNanos(1769163227000, 123000);
+    const auto after_boundary = fluss::Timestamp::FromMillisNanos(1769163228000, 789000);
+
+    fluss::AppendWriter writer;
+    ASSERT_OK(table.NewAppend().CreateWriter(writer));
+    {
+        fluss::GenericRow row(4);
+        row.SetInt32(0, 1);
+        row.SetDecimal(1, "10.00");
+        row.SetTimestampNtz(2, before_boundary);
+        row.SetTimestampLtz(3, after_boundary);
+        ASSERT_OK(writer.Append(row));
+        ASSERT_OK(writer.Flush());
+    }
+    {
+        fluss::GenericRow row(4);
+        row.SetInt32(0, 2);
+        row.SetDecimal(1, "12.34");
+        row.SetTimestampNtz(2, after_boundary);
+        row.SetTimestampLtz(3, before_boundary);
+        ASSERT_OK(writer.Append(row));
+        ASSERT_OK(writer.Flush());
+    }
+
+    auto extract_ids = [](const fluss::ArrowRecordBatches& batches) {
+        std::vector<int32_t> ids;
+        for (const auto& batch : batches) {
+            auto array = std::static_pointer_cast<arrow::Int32Array>(
+                batch->GetArrowRecordBatch()->column(0));
+            for (int64_t i = 0; i < array->length(); ++i) {
+                ids.push_back(array->Value(i));
+            }
+        }
+        return ids;
+    };
+
+    auto expect_only_second_row = [&](fluss::Predicate predicate) {
+        fluss::RecordBatchLogScanner scanner;
+        ASSERT_OK(table.NewScan()
+                      .Filter(std::move(predicate))
+                      .ProjectByName({"id"})
+                      .CreateRecordBatchLogScanner(scanner));
+        ASSERT_OK(scanner.Subscribe(0, fluss::EARLIEST_OFFSET));
+
+        std::vector<int32_t> ids;
+        fluss_test::PollRecordBatches(scanner, 1, extract_ids, ids);
+        EXPECT_EQ(ids, (std::vector<int32_t>{2}));
+    };
+
+    expect_only_second_row(fluss::Col("amount").Equal(fluss::PredicateLiteral::Decimal("12.34")));
+    expect_only_second_row(
+        fluss::Col("event_time").GreaterOrEqual(fluss::PredicateLiteral::TimestampNtz(boundary)));
+    expect_only_second_row(
+        fluss::Col("event_time_ltz").LessOrEqual(fluss::PredicateLiteral::TimestampLtz(boundary)));
+    expect_only_second_row(fluss::Col("id").Equal(2L).Or(fluss::Col("id").Equal(2u)));
+
+    fluss::RecordBatchLogScanner decimal_scanner;
+    auto decimal_result =
+        table.NewScan()
+            .Filter(fluss::Col("amount").Equal(fluss::PredicateLiteral::Decimal("12.345")))
+            .CreateRecordBatchLogScanner(decimal_scanner);
+    EXPECT_FALSE(decimal_result.Ok());
+    EXPECT_NE(decimal_result.error_message.find("cannot be represented exactly"),
+              std::string::npos);
+
+    fluss::RecordBatchLogScanner timestamp_scanner;
+    auto timestamp_result =
+        table.NewScan()
+            .Filter(
+                fluss::Col("event_time_ltz").Equal(fluss::PredicateLiteral::TimestampNtz(boundary)))
+            .CreateRecordBatchLogScanner(timestamp_scanner);
+    EXPECT_FALSE(timestamp_result.Ok());
+    EXPECT_NE(timestamp_result.error_message.find("does not match"), std::string::npos);
+
+    EXPECT_THROW(fluss::Col("id").Equal(std::numeric_limits<uint64_t>::max()), std::out_of_range);
 
     ASSERT_OK(adm.DropTable(table_path, false));
 }

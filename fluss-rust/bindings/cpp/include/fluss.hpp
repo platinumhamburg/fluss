@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -59,6 +60,8 @@ struct PrefixLookupResultInner;
 struct ArrayWriterInner;
 struct MapWriterInner;
 struct ValueInner;
+enum class FfiPredicateLiteralType : int32_t;
+enum class FfiPredicateLeafFunction : int32_t;
 }  // namespace ffi
 
 /// Named constants for Fluss API error codes.
@@ -261,6 +264,116 @@ struct Timestamp {
         return {ms, nano_of_ms};
     }
 };
+
+/// Scalar literal used by a log-scan predicate.
+///
+/// Integer literals are coerced to the scanned column's integer type by the
+/// Rust client, with range checks. Decimal and timestamp literals use the
+/// explicit factories below to preserve their Fluss logical type.
+class PredicateLiteral {
+   public:
+    PredicateLiteral(bool value);
+    PredicateLiteral(int32_t value);
+    PredicateLiteral(int64_t value);
+    template <typename T, std::enable_if_t<std::is_integral_v<std::decay_t<T>> &&
+                                               !std::is_same_v<std::decay_t<T>, bool> &&
+                                               !std::is_same_v<std::decay_t<T>, int32_t> &&
+                                               !std::is_same_v<std::decay_t<T>, int64_t>,
+                                           int> = 0>
+    PredicateLiteral(T value) : PredicateLiteral(ToInt64(value)) {}
+    PredicateLiteral(float value);
+    PredicateLiteral(double value);
+    PredicateLiteral(const char* value);
+    PredicateLiteral(std::string value);
+    PredicateLiteral(std::vector<uint8_t> value);
+    PredicateLiteral(Date value);
+    PredicateLiteral(Time value);
+
+    static PredicateLiteral Null();
+    static PredicateLiteral Decimal(std::string value);
+    static PredicateLiteral TimestampNtz(Timestamp value);
+    static PredicateLiteral TimestampLtz(Timestamp value);
+
+   private:
+    explicit PredicateLiteral(ffi::FfiPredicateLiteralType literal_type);
+
+    template <typename T>
+    static int64_t ToInt64(T value) {
+        using ValueType = std::decay_t<T>;
+        static_assert(sizeof(ValueType) <= sizeof(int64_t), "Integer literal is wider than INT64");
+        if constexpr (std::is_unsigned_v<ValueType>) {
+            if (value >
+                static_cast<std::make_unsigned_t<int64_t>>(std::numeric_limits<int64_t>::max())) {
+                throw std::out_of_range("Unsigned predicate literal does not fit INT64");
+            }
+        }
+        return static_cast<int64_t>(value);
+    }
+
+    ffi::FfiPredicateLiteralType literal_type_;
+    bool boolean_value_{false};
+    int64_t integer_value_{0};
+    double floating_value_{0};
+    std::string string_value_;
+    std::vector<uint8_t> bytes_value_;
+    Timestamp timestamp_value_;
+
+    friend class Predicate;
+    friend class TableScan;
+};
+
+/// Filter expression for server-side Arrow log RecordBatch pruning.
+///
+/// Filter pushdown is conservative: a returned RecordBatch may still
+/// contain non-matching rows, so callers must evaluate the predicate again.
+class Predicate {
+   public:
+    Predicate(const Predicate&) = default;
+    Predicate& operator=(const Predicate&) = default;
+    Predicate(Predicate&&) noexcept = default;
+    Predicate& operator=(Predicate&&) noexcept = default;
+
+    Predicate And(Predicate other) const;
+    Predicate Or(Predicate other) const;
+
+   private:
+    struct Node;
+
+    explicit Predicate(std::shared_ptr<const Node> root);
+
+    std::shared_ptr<const Node> root_;
+
+    friend class ColumnRef;
+    friend class TableScan;
+};
+
+/// Column reference used to build a Predicate.
+class ColumnRef {
+   public:
+    explicit ColumnRef(std::string name) : name_(std::move(name)) {}
+
+    Predicate Equal(PredicateLiteral value) const;
+    Predicate NotEqual(PredicateLiteral value) const;
+    Predicate LessThan(PredicateLiteral value) const;
+    Predicate LessOrEqual(PredicateLiteral value) const;
+    Predicate GreaterThan(PredicateLiteral value) const;
+    Predicate GreaterOrEqual(PredicateLiteral value) const;
+    Predicate IsNull() const;
+    Predicate IsNotNull() const;
+    Predicate StartsWith(std::string prefix) const;
+    Predicate Contains(std::string infix) const;
+    Predicate EndsWith(std::string suffix) const;
+    Predicate In(std::vector<PredicateLiteral> values) const;
+    Predicate NotIn(std::vector<PredicateLiteral> values) const;
+
+   private:
+    Predicate Leaf(ffi::FfiPredicateLeafFunction function,
+                   std::vector<PredicateLiteral> literals) const;
+
+    std::string name_;
+};
+
+inline ColumnRef Col(std::string name) { return ColumnRef(std::move(name)); }
 
 enum class ChangeType {
     AppendOnly = 0,
@@ -1664,6 +1777,12 @@ class TableScan {
     TableScan& ProjectByIndex(std::vector<size_t> column_indices);
     TableScan& ProjectByName(std::vector<std::string> column_names);
 
+    /// Pushes a predicate down for conservative server-side RecordBatch pruning.
+    ///
+    /// Only Arrow log scans support this. Returned batches may contain
+    /// non-matching rows and must be filtered again by the caller.
+    TableScan& Filter(Predicate predicate);
+
     TableScan& Limit(int32_t row_number);
 
     /// Creates a record-mode log scanner, polled for individual `ScanRecord`s.
@@ -1713,6 +1832,7 @@ class TableScan {
     ffi::Table* table_{nullptr};
     std::vector<size_t> projection_;
     std::vector<std::string> name_projection_;
+    std::optional<Predicate> predicate_;
     std::optional<int32_t> limit_;
 };
 

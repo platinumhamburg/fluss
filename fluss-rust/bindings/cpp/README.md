@@ -33,6 +33,36 @@ bazel build //...
 `ci.sh` defaults to optimized builds via `-c opt` (override with `BAZEL_BUILD_FLAGS` if needed).
 See [ci.sh](ci.sh) for the CI build sequence.
 
+## Log filter pushdown
+
+`TableScan::Filter()` pushes a predicate to Arrow log scans for server-side
+RecordBatch pruning:
+
+```cpp
+fluss::RecordBatchLogScanner scanner;
+auto predicate =
+    fluss::Col("amount")
+        .GreaterOrEqual(100)
+        .And(fluss::Col("region").In({"CN", "SG"}));
+
+auto result = table.NewScan()
+                  .Filter(std::move(predicate))
+                  .ProjectByName({"order_id", "amount"})
+                  .CreateRecordBatchLogScanner(scanner);
+```
+
+Supported expressions include comparisons, `IS NULL` / `IS NOT NULL`, string
+prefix/infix/suffix matching, `IN` / `NOT IN`, and `AND` / `OR`. Scalar
+literals include booleans, integers, floating-point values, strings, bytes,
+decimals, dates, times, and timestamps.
+
+Pushdown is conservative: Fluss skips only whole RecordBatches whose statistics
+prove that they cannot match. Returned batches may still contain non-matching
+rows, so callers must evaluate the predicate again. Configure
+`table.statistics.columns` for the referenced columns; batches without usable
+statistics are retained. Filter pushdown requires the Arrow log format and does
+not apply to `CreateBucketBatchScanner()`.
+
 ## Examples and Documentation
 
 - [examples/example.cpp](examples/example.cpp) demonstrates log-table writes, continuous scans,

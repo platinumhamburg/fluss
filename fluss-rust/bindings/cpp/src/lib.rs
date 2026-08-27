@@ -110,6 +110,77 @@ mod ffi {
         child_count: u32,
     }
 
+    #[repr(i32)]
+    enum FfiPredicateNodeType {
+        Leaf = 0,
+        Compound = 1,
+    }
+
+    #[repr(i32)]
+    enum FfiPredicateLeafFunction {
+        Equal = 0,
+        NotEqual = 1,
+        LessThan = 2,
+        LessOrEqual = 3,
+        GreaterThan = 4,
+        GreaterOrEqual = 5,
+        IsNull = 6,
+        IsNotNull = 7,
+        StartsWith = 8,
+        Contains = 9,
+        EndsWith = 10,
+        In = 11,
+        NotIn = 12,
+    }
+
+    #[repr(i32)]
+    enum FfiPredicateCompoundFunction {
+        And = 0,
+        Or = 1,
+    }
+
+    #[repr(i32)]
+    enum FfiPredicateLiteralType {
+        Null = 0,
+        Boolean = 1,
+        Int32 = 2,
+        Int64 = 3,
+        Float32 = 4,
+        Float64 = 5,
+        String = 6,
+        Bytes = 7,
+        Decimal = 8,
+        Date = 9,
+        Time = 10,
+        TimestampNtz = 11,
+        TimestampLtz = 12,
+    }
+
+    // One scalar literal in a predicate leaf. `literal_type` is private to the
+    // C++ binding and decoded into fluss::predicate::Literal before the scan is
+    // created.
+    struct FfiPredicateLiteral {
+        literal_type: FfiPredicateLiteralType,
+        boolean_value: bool,
+        integer_value: i64,
+        floating_value: f64,
+        string_value: String,
+        bytes_value: Vec<u8>,
+        timestamp_millis: i64,
+        timestamp_nanos: i32,
+    }
+
+    // Predicate tree serialized in preorder. A leaf has child_count == 0 and
+    // carries field/literals; a compound node is followed by child_count nodes.
+    struct FfiPredicateNode {
+        node_type: FfiPredicateNodeType,
+        leaf_function: FfiPredicateLeafFunction,
+        compound_function: FfiPredicateCompoundFunction,
+        field: String,
+        literals: Vec<FfiPredicateLiteral>,
+        child_count: u32,
+    }
+
     struct FfiColumn {
         name: String,
         comment: String,
@@ -426,7 +497,12 @@ mod ffi {
         // Table
         unsafe fn delete_table(table: *mut Table);
         fn new_append_writer(self: &Table) -> FfiPtrResult;
-        fn create_scanner(self: &Table, column_indices: Vec<usize>, batch: bool) -> FfiPtrResult;
+        fn create_scanner(
+            self: &Table,
+            column_indices: Vec<usize>,
+            predicate_nodes: Vec<FfiPredicateNode>,
+            batch: bool,
+        ) -> FfiPtrResult;
         fn create_bucket_batch_scanner(
             self: &Table,
             column_indices: Vec<usize>,
@@ -1577,6 +1653,224 @@ impl Admin {
     }
 }
 
+fn predicate_from_ffi_nodes(
+    nodes: &[ffi::FfiPredicateNode],
+    row_type: &fcore::metadata::RowType,
+) -> Result<Option<fcore::predicate::Predicate>, String> {
+    if nodes.is_empty() {
+        return Ok(None);
+    }
+
+    let mut next = 0;
+    let predicate = predicate_from_ffi_node(nodes, &mut next, row_type)?;
+    if next != nodes.len() {
+        return Err(format!(
+            "Predicate contains {} trailing node(s)",
+            nodes.len() - next
+        ));
+    }
+    Ok(Some(predicate))
+}
+
+fn predicate_from_ffi_node(
+    nodes: &[ffi::FfiPredicateNode],
+    next: &mut usize,
+    row_type: &fcore::metadata::RowType,
+) -> Result<fcore::predicate::Predicate, String> {
+    let node_index = *next;
+    let node = nodes
+        .get(node_index)
+        .ok_or_else(|| "Predicate tree ended before all children were decoded".to_string())?;
+    *next += 1;
+
+    match node.node_type {
+        ffi::FfiPredicateNodeType::Leaf => {
+            if node.child_count != 0 {
+                return Err(format!(
+                    "Predicate leaf at node {node_index} has {} child nodes",
+                    node.child_count
+                ));
+            }
+            if node.field.is_empty() {
+                return Err(format!(
+                    "Predicate leaf at node {node_index} has an empty field name"
+                ));
+            }
+
+            let field = row_type
+                .fields()
+                .iter()
+                .find(|field| field.name() == node.field)
+                .ok_or_else(|| {
+                    format!(
+                        "Filter column '{}' does not exist in the table schema",
+                        node.field
+                    )
+                })?;
+            let function = match node.leaf_function {
+                ffi::FfiPredicateLeafFunction::Equal => fcore::predicate::LeafFunction::Equal,
+                ffi::FfiPredicateLeafFunction::NotEqual => fcore::predicate::LeafFunction::NotEqual,
+                ffi::FfiPredicateLeafFunction::LessThan => fcore::predicate::LeafFunction::LessThan,
+                ffi::FfiPredicateLeafFunction::LessOrEqual => {
+                    fcore::predicate::LeafFunction::LessOrEqual
+                }
+                ffi::FfiPredicateLeafFunction::GreaterThan => {
+                    fcore::predicate::LeafFunction::GreaterThan
+                }
+                ffi::FfiPredicateLeafFunction::GreaterOrEqual => {
+                    fcore::predicate::LeafFunction::GreaterOrEqual
+                }
+                ffi::FfiPredicateLeafFunction::IsNull => fcore::predicate::LeafFunction::IsNull,
+                ffi::FfiPredicateLeafFunction::IsNotNull => {
+                    fcore::predicate::LeafFunction::IsNotNull
+                }
+                ffi::FfiPredicateLeafFunction::StartsWith => {
+                    fcore::predicate::LeafFunction::StartsWith
+                }
+                ffi::FfiPredicateLeafFunction::Contains => fcore::predicate::LeafFunction::Contains,
+                ffi::FfiPredicateLeafFunction::EndsWith => fcore::predicate::LeafFunction::EndsWith,
+                ffi::FfiPredicateLeafFunction::In => fcore::predicate::LeafFunction::In,
+                ffi::FfiPredicateLeafFunction::NotIn => fcore::predicate::LeafFunction::NotIn,
+                other => {
+                    return Err(format!(
+                        "Predicate leaf at node {node_index} has unknown function {}",
+                        other.repr
+                    ));
+                }
+            };
+            let literals = node
+                .literals
+                .iter()
+                .map(|literal| predicate_literal_from_ffi(literal, field))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(fcore::predicate::Predicate::Leaf {
+                field: node.field.to_string(),
+                function,
+                literals,
+            })
+        }
+        ffi::FfiPredicateNodeType::Compound => {
+            if !node.field.is_empty() || !node.literals.is_empty() {
+                return Err(format!(
+                    "Predicate compound node {node_index} unexpectedly carries leaf data"
+                ));
+            }
+            let function = match node.compound_function {
+                ffi::FfiPredicateCompoundFunction::And => fcore::predicate::CompoundFunction::And,
+                ffi::FfiPredicateCompoundFunction::Or => fcore::predicate::CompoundFunction::Or,
+                other => {
+                    return Err(format!(
+                        "Predicate compound node {node_index} has unknown function {}",
+                        other.repr
+                    ));
+                }
+            };
+            let mut children = Vec::with_capacity(node.child_count as usize);
+            for _ in 0..node.child_count {
+                children.push(predicate_from_ffi_node(nodes, next, row_type)?);
+            }
+            Ok(fcore::predicate::Predicate::Compound { function, children })
+        }
+        other => Err(format!(
+            "Predicate node {node_index} has unknown node type {}",
+            other.repr
+        )),
+    }
+}
+
+fn predicate_literal_from_ffi(
+    literal: &ffi::FfiPredicateLiteral,
+    field: &fcore::metadata::DataField,
+) -> Result<fcore::predicate::Literal, String> {
+    use fcore::predicate::Literal;
+
+    match literal.literal_type {
+        ffi::FfiPredicateLiteralType::Null => Ok(Literal::Null),
+        ffi::FfiPredicateLiteralType::Boolean => Ok(Literal::Bool(literal.boolean_value)),
+        ffi::FfiPredicateLiteralType::Int32 => {
+            let value = i32::try_from(literal.integer_value).map_err(|_| {
+                format!(
+                    "Filter literal {} does not fit INT32",
+                    literal.integer_value
+                )
+            })?;
+            Ok(Literal::Int32(value))
+        }
+        ffi::FfiPredicateLiteralType::Int64 => Ok(Literal::Int64(literal.integer_value)),
+        ffi::FfiPredicateLiteralType::Float32 => {
+            Ok(Literal::Float32(literal.floating_value as f32))
+        }
+        ffi::FfiPredicateLiteralType::Float64 => Ok(Literal::Float64(literal.floating_value)),
+        ffi::FfiPredicateLiteralType::String => {
+            Ok(Literal::String(literal.string_value.to_string()))
+        }
+        ffi::FfiPredicateLiteralType::Bytes => Ok(Literal::Bytes(literal.bytes_value.clone())),
+        ffi::FfiPredicateLiteralType::Decimal => {
+            let decimal_type = match field.data_type() {
+                fcore::metadata::DataType::Decimal(decimal_type) => decimal_type,
+                other => {
+                    return Err(format!(
+                        "Decimal predicate literal cannot be used with column '{}' of type {other}",
+                        field.name()
+                    ));
+                }
+            };
+            let value = bigdecimal::BigDecimal::from_str(&literal.string_value)
+                .map_err(|e| format!("Invalid decimal predicate literal: {e}"))?;
+            let decimal = fcore::row::Decimal::from_big_decimal(
+                value.clone(),
+                decimal_type.precision(),
+                decimal_type.scale(),
+            )
+            .map_err(|e| e.to_string())?;
+            if decimal.to_big_decimal() != value {
+                return Err(format!(
+                    "Decimal predicate literal '{}' cannot be represented exactly by column '{}'",
+                    literal.string_value,
+                    field.name()
+                ));
+            }
+            Ok(Literal::Decimal(decimal))
+        }
+        ffi::FfiPredicateLiteralType::Date => {
+            let days = i32::try_from(literal.integer_value).map_err(|_| {
+                format!(
+                    "Date predicate literal {} does not fit INT32",
+                    literal.integer_value
+                )
+            })?;
+            Ok(Literal::Date(days))
+        }
+        ffi::FfiPredicateLiteralType::Time => {
+            let millis = i32::try_from(literal.integer_value).map_err(|_| {
+                format!(
+                    "Time predicate literal {} does not fit INT32",
+                    literal.integer_value
+                )
+            })?;
+            Ok(Literal::Time(millis))
+        }
+        ffi::FfiPredicateLiteralType::TimestampNtz => {
+            let timestamp = fcore::row::TimestampNtz::from_millis_nanos(
+                literal.timestamp_millis,
+                literal.timestamp_nanos,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(Literal::TimestampNtz(timestamp))
+        }
+        ffi::FfiPredicateLiteralType::TimestampLtz => {
+            let timestamp = fcore::row::TimestampLtz::from_millis_nanos(
+                literal.timestamp_millis,
+                literal.timestamp_nanos,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(Literal::TimestampLtz(timestamp))
+        }
+        other => Err(format!("Unknown predicate literal type {}", other.repr)),
+    }
+}
+
 // Table implementation
 unsafe fn delete_table(table: *mut Table) {
     if !table.is_null() {
@@ -1633,10 +1927,24 @@ impl Table {
         ok_ptr(ptr as usize)
     }
 
-    fn create_scanner(&self, column_indices: Vec<usize>, batch: bool) -> ffi::FfiPtrResult {
+    fn create_scanner(
+        &self,
+        column_indices: Vec<usize>,
+        predicate_nodes: Vec<ffi::FfiPredicateNode>,
+        batch: bool,
+    ) -> ffi::FfiPtrResult {
         RUNTIME.block_on(async {
             let fluss_table = self.fluss_table();
             let scan = fluss_table.new_scan();
+            let scan =
+                match predicate_from_ffi_nodes(&predicate_nodes, self.table_info.get_row_type()) {
+                    Ok(Some(predicate)) => match scan.filter(predicate) {
+                        Ok(scan) => scan,
+                        Err(e) => return err_ptr_from_core(&e),
+                    },
+                    Ok(None) => scan,
+                    Err(e) => return client_err_ptr(e),
+                };
 
             let (projected_columns, scan) = if column_indices.is_empty() {
                 (self.table_info.get_schema().columns().to_vec(), scan)
