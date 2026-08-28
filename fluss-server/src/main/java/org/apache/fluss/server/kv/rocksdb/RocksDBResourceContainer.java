@@ -29,6 +29,7 @@ import org.apache.fluss.utils.IOUtils;
 import org.fluss.rocksdb.BlockBasedTableConfig;
 import org.fluss.rocksdb.BloomFilter;
 import org.fluss.rocksdb.Cache;
+import org.fluss.rocksdb.ChecksumType;
 import org.fluss.rocksdb.ColumnFamilyOptions;
 import org.fluss.rocksdb.CompactionStyle;
 import org.fluss.rocksdb.CompressionType;
@@ -71,6 +72,8 @@ public class RocksDBResourceContainer implements AutoCloseable {
 
     // the filename length limit is 255 on most operating systems
     private static final int INSTANCE_PATH_LENGTH_LIMIT = 255 - "_LOG".length();
+
+    private static final int FROCKSDB_COMPATIBLE_FORMAT_VERSION = 5;
 
     @Nullable private final File instanceRocksDBPath;
 
@@ -299,6 +302,11 @@ public class RocksDBResourceContainer implements AutoCloseable {
                 blockBasedTableConfig = (BlockBasedTableConfig) tableFormatConfig;
             }
         }
+
+        // Keep snapshots readable by FRocksDB 6.20.3.
+        blockBasedTableConfig
+                .setFormatVersion(FROCKSDB_COMPATIBLE_FORMAT_VERSION)
+                .setChecksumType(ChecksumType.kCRC32c);
 
         blockBasedTableConfig.setBlockSize(
                 internalGetOption(ConfigOptions.KV_BLOCK_SIZE).getBytes());
