@@ -39,15 +39,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Test for {@link org.apache.fluss.server.kv.rocksdb.RocksDBKvBuilder} . */
 class RocksDBKvBuilderTest {
 
-    /**
-     * This test checks that the RocksDB native code loader still responds to resetting the init
-     * flag.
-     */
-    @Test
-    void testResetInitFlag() throws Exception {
-        RocksDBKvBuilder.resetRocksDBLoadedFlag();
-    }
-
     @Test
     void testTempLibFolderDeletedOnFail(@TempDir Path tempDir) {
         RocksDBKvBuilder.resetRocksDbInitialized();
