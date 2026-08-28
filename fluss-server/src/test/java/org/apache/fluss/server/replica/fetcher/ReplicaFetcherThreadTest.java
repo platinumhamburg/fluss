@@ -24,8 +24,12 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.remote.RemoteLogFetchInfo;
+import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.rpc.RpcClient;
+import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.entity.ProduceLogResultForBucket;
+import org.apache.fluss.rpc.messages.FetchLogResponse;
 import org.apache.fluss.rpc.metrics.TestingClientMetricGroup;
 import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
@@ -36,11 +40,15 @@ import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.scan.ScannerManager;
 import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
 import org.apache.fluss.server.log.LogManager;
+import org.apache.fluss.server.log.LogSegment;
+import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.log.remote.LogSegmentFiles;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaManager;
+import org.apache.fluss.server.replica.fetcher.LeaderEndpoint.FetchData;
 import org.apache.fluss.server.storage.LocalDiskManager;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
@@ -49,6 +57,7 @@ import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.shaded.netty4.io.netty.buffer.ByteBuf;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
+import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.clock.ManualClock;
 import org.apache.fluss.utils.concurrent.FlussScheduler;
@@ -63,15 +72,18 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 import static org.apache.fluss.record.TestData.DATA1;
@@ -200,6 +212,193 @@ public class ReplicaFetcherThreadTest {
                 () ->
                         assertThat(followerRM.getReplicaOrException(tb).getLocalLogEndOffset())
                                 .isEqualTo(20L));
+    }
+
+    @Test
+    void testMissingRemoteWriterSnapshotRemovesFollowerFetchState() throws Exception {
+        RemoteLogSegment remoteLogSegment =
+                RemoteLogSegment.Builder.builder()
+                        .physicalTablePath(PhysicalTablePath.of(DATA1_TABLE_PATH))
+                        .tableBucket(tb)
+                        .remoteLogSegmentId(UUID.randomUUID())
+                        .remoteLogStartOffset(0L)
+                        .remoteLogEndOffset(10L)
+                        .maxTimestamp(manualClock.milliseconds())
+                        .segmentSizeInBytes(1)
+                        .build();
+        RemoteLogFetchInfo remoteLogFetchInfo =
+                new RemoteLogFetchInfo(
+                        "missing-remote-log", null, Collections.singletonList(remoteLogSegment), 0);
+        ServerNode follower =
+                new ServerNode(
+                        followerServerId, "localhost", 10001, ServerType.TABLET_SERVER, "rack2");
+        TestingLeaderEndpoint endpoint =
+                new TestingLeaderEndpoint(new Configuration(), leaderRM, follower) {
+                    @Override
+                    public CompletableFuture<FetchData> fetchLog(FetchLogContext fetchLogContext) {
+                        return CompletableFuture.completedFuture(
+                                new FetchData(
+                                        new FetchLogResponse(),
+                                        Collections.singletonMap(
+                                                tb,
+                                                new FetchLogResultForBucket(
+                                                        tb, remoteLogFetchInfo, 10L))));
+                    }
+                };
+        followerFetcher =
+                new ReplicaFetcherThread("test-fetcher-thread", followerRM, endpoint, 1000);
+        followerFetcher.addBuckets(
+                Collections.singletonMap(
+                        tb,
+                        new InitialFetchStatus(DATA1_TABLE_ID, DATA1_TABLE_PATH, leader.id(), 0L)));
+        Replica followerReplica = followerRM.getReplicaOrException(tb);
+        long originalLogEndOffset = followerReplica.getLocalLogEndOffset();
+        long originalHighWatermark = followerReplica.getLogHighWatermark();
+        long originalRecoveryPoint = followerReplica.getLogTablet().getRecoveryPoint();
+
+        followerFetcher.doWork();
+
+        assertThat(followerFetcher.getBucketCount())
+                .as("a failed writer snapshot restore must not advance follower fetch state")
+                .isZero();
+        assertThat(followerReplica.getLocalLogEndOffset()).isEqualTo(originalLogEndOffset);
+        assertThat(followerReplica.getLogHighWatermark()).isEqualTo(originalHighWatermark);
+        assertThat(followerReplica.getLogTablet().getRecoveryPoint())
+                .isEqualTo(originalRecoveryPoint);
+    }
+
+    @Test
+    void testRetainsOldWriterSnapshotUntilLocalTruncateSucceeds() throws Exception {
+        long oldWriterId = 100L;
+        long localOnlyWriterId = 101L;
+        long localStartOffset = 10L;
+        long localEndOffset = 20L;
+        long remoteEndOffset = 30L;
+        Replica followerReplica = followerRM.getReplicaOrException(tb);
+        LogTablet followerLog = followerReplica.getLogTablet();
+
+        followerReplica.appendRecordsToFollower(
+                genMemoryLogRecordsWithWriterId(DATA1, oldWriterId, 0, 0L));
+        followerLog.roll(Optional.of(localStartOffset));
+        followerReplica.appendRecordsToFollower(
+                genMemoryLogRecordsWithWriterId(DATA1, localOnlyWriterId, 0, localStartOffset));
+        followerLog.updateHighWatermark(localEndOffset);
+        Configuration tableProperties = new Configuration();
+        tableProperties.set(ConfigOptions.TABLE_LOG_FORMAT, followerLog.getLogFormat());
+        tableProperties.set(ConfigOptions.TABLE_TIERED_LOG_LOCAL_SEGMENTS, 1);
+        followerLog.applyTableConfig(new org.apache.fluss.config.TableConfig(tableProperties));
+        followerLog.updateRemoteLogEndOffset(localStartOffset);
+        followerLog.updateMinRetainOffset(localStartOffset);
+
+        assertThat(followerLog.localLogStartOffset()).isEqualTo(localStartOffset);
+        assertThat(followerLog.localLogEndOffset()).isEqualTo(localEndOffset);
+        assertThat(followerLog.writerStateManager().lastEntry(oldWriterId)).isPresent();
+        assertThat(followerLog.writerStateManager().fetchSnapshot(localStartOffset)).isPresent();
+
+        LogTablet leaderLog = leaderRM.getReplicaOrException(tb).getLogTablet();
+        long remoteWriterId = 102L;
+        for (int sequence = 0; sequence < 3; sequence++) {
+            leaderLog.appendAsLeader(
+                    genMemoryLogRecordsWithWriterId(DATA1, remoteWriterId, sequence, 0L));
+        }
+        leaderLog.roll(Optional.of(remoteEndOffset));
+        File remoteWriterSnapshot =
+                leaderLog.writerStateManager().fetchSnapshot(remoteEndOffset).get();
+        LogSegment remoteSourceSegment = leaderLog.getSegments().get(0);
+        RemoteLogSegment remoteLogSegment =
+                RemoteLogSegment.Builder.builder()
+                        .physicalTablePath(PhysicalTablePath.of(DATA1_TABLE_PATH))
+                        .tableBucket(tb)
+                        .remoteLogSegmentId(UUID.randomUUID())
+                        .remoteLogStartOffset(0L)
+                        .remoteLogEndOffset(remoteEndOffset)
+                        .maxTimestamp(manualClock.milliseconds())
+                        .segmentSizeInBytes(remoteSourceSegment.getSizeInBytes())
+                        .build();
+        followerRM
+                .getRemoteLogManager()
+                .getRemoteLogStorage()
+                .copyLogSegmentFiles(
+                        remoteLogSegment,
+                        new LogSegmentFiles(
+                                remoteSourceSegment.getFileLogRecords().file().toPath(),
+                                remoteSourceSegment.offsetIndex().file().toPath(),
+                                remoteSourceSegment.timeIndex().file().toPath(),
+                                remoteWriterSnapshot.toPath()));
+
+        RemoteLogFetchInfo remoteLogFetchInfo =
+                new RemoteLogFetchInfo(
+                        "remote-log", null, Collections.singletonList(remoteLogSegment), 0);
+        ServerNode follower =
+                new ServerNode(
+                        followerServerId, "localhost", 10001, ServerType.TABLET_SERVER, "rack2");
+        TestingLeaderEndpoint endpoint =
+                new TestingLeaderEndpoint(new Configuration(), leaderRM, follower) {
+                    @Override
+                    public CompletableFuture<FetchData> fetchLog(FetchLogContext fetchLogContext) {
+                        return CompletableFuture.completedFuture(
+                                new FetchData(
+                                        new FetchLogResponse(),
+                                        Collections.singletonMap(
+                                                tb,
+                                                new FetchLogResultForBucket(
+                                                        tb, remoteLogFetchInfo, remoteEndOffset))));
+                    }
+                };
+        followerFetcher =
+                new ReplicaFetcherThread("test-fetcher-thread", followerRM, endpoint, 1000);
+        followerFetcher.addBuckets(
+                Collections.singletonMap(
+                        tb,
+                        new InitialFetchStatus(
+                                DATA1_TABLE_ID, DATA1_TABLE_PATH, leader.id(), localEndOffset)));
+
+        File blockedLocalLogFile = FlussPaths.logFile(followerLog.getLogDir(), remoteEndOffset);
+        Files.createDirectory(blockedLocalLogFile.toPath());
+        try {
+            followerFetcher.doWork();
+            assertThat(followerLog.localLogStartOffset()).isEqualTo(localStartOffset);
+            assertThat(followerLog.localLogEndOffset()).isEqualTo(localEndOffset);
+            assertThat(followerLog.writerStateManager().fetchSnapshot(remoteEndOffset)).isPresent();
+        } finally {
+            Files.deleteIfExists(blockedLocalLogFile.toPath());
+        }
+
+        File followerDataDir = followerLog.getDataDir();
+        File followerLogDir = followerLog.getLogDir();
+        long recoveryPoint = followerLog.getRecoveryPoint();
+        followerLog.close();
+        Scheduler restartScheduler = new FlussScheduler(1);
+        restartScheduler.startup();
+        LogTablet recoveredLog = null;
+        try {
+            Configuration restartConf = new Configuration();
+            restartConf.set(ConfigOptions.WRITER_ID_EXPIRATION_TIME, Duration.ofHours(12));
+            recoveredLog =
+                    LogTablet.create(
+                            followerDataDir,
+                            PhysicalTablePath.of(DATA1_TABLE_PATH),
+                            followerLogDir,
+                            restartConf,
+                            new AtomicBoolean(false),
+                            TestingMetricGroups.TABLET_SERVER_METRICS,
+                            recoveryPoint,
+                            restartScheduler,
+                            followerLog.getLogFormat(),
+                            followerLog.getTieredLogLocalSegments(),
+                            true,
+                            manualClock,
+                            false);
+
+            assertThat(recoveredLog.writerStateManager().lastEntry(oldWriterId))
+                    .as("the writer before local start must remain recoverable after restart")
+                    .isPresent();
+        } finally {
+            if (recoveredLog != null) {
+                recoveredLog.close();
+            }
+            restartScheduler.shutdown();
+        }
     }
 
     @Test
@@ -514,6 +713,7 @@ public class ReplicaFetcherThreadTest {
         Configuration conf = new Configuration();
         conf.set(ConfigOptions.TABLET_SERVER_ID, serverId);
         conf.setString(ConfigOptions.DATA_DIR, tempDir.getAbsolutePath() + "/server-" + serverId);
+        conf.set(ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO, 1.0);
         return LocalDiskManager.create(conf);
     }
 
@@ -522,6 +722,8 @@ public class ReplicaFetcherThreadTest {
         Configuration conf = new Configuration();
         conf.set(ConfigOptions.TABLET_SERVER_ID, serverId);
         conf.setString(ConfigOptions.DATA_DIR, tempDir.getAbsolutePath() + "/server-" + serverId);
+        conf.setString(
+                ConfigOptions.REMOTE_DATA_DIR, new File(tempDir, "remote-data").toURI().toString());
         conf.set(ConfigOptions.WRITER_ID_EXPIRATION_TIME, Duration.ofHours(12));
         Scheduler scheduler = new FlussScheduler(2);
         scheduler.startup();

@@ -33,6 +33,7 @@ import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.metrics.group.TableMetricGroup;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.utils.clock.Clock;
+import org.apache.fluss.utils.types.Tuple2;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -130,6 +131,7 @@ public class LogTieringTask implements Runnable {
         }
 
         try {
+            Tuple2<String, Integer> sourceMetadata = replica.freezeActiveSourceMetadata();
             LogTablet logTablet = replica.getLogTablet();
             TableMetricGroup metricGroup = replica.tableMetrics();
             maybeUpdateCopiedOffset(logTablet);
@@ -167,7 +169,8 @@ public class LogTieringTask implements Runnable {
                     deleteRemoteLogSegmentFiles(copiedSegments, metricGroup);
                     throw mergeError;
                 }
-                boolean success = tryToCommitRemoteLogManifest(remoteLog, newManifest);
+                boolean success =
+                        tryToCommitRemoteLogManifest(remoteLog, newManifest, sourceMetadata);
 
                 if (success) {
                     List<RemoteLogSegment> segmentsToDelete =
@@ -337,19 +340,10 @@ public class LogTieringTask implements Runnable {
         return endOffset;
     }
 
-    /**
-     * Try to commit remote log manifest. Including three steps.
-     *
-     * <pre>
-     *     1. apply the build snapshot method (may be copy to/delete from remote)
-     *     2. upload the remote log manifest file to remote storage.
-     *     3. sending the CommitRemoteLogManifestRequest to coordinator server to try to commit this snapshot.
-     *        - If commit success, we will apply the commit success action (e.g., delete expired remote segments), and return true.
-     *        - If commit failed, we will apply rollback action (i.e., delete the new added remote segments), and return false.
-     * </pre>
-     */
     private boolean tryToCommitRemoteLogManifest(
-            RemoteLogTablet remoteLogTablet, RemoteLogManifest newRemoteLogManifest) {
+            RemoteLogTablet remoteLogTablet,
+            RemoteLogManifest newRemoteLogManifest,
+            Tuple2<String, Integer> sourceMetadata) {
         FsPath remoteLogManifestPath;
         try {
             // 1. upload the remote log manifest file to remote storage.
@@ -383,7 +377,9 @@ public class LogTieringTask implements Runnable {
                                         //  and this should be moved into Replica under read lock of
                                         //  leaderIsrUpdateLock, see FLUSS-56282058
                                         replica.getCoordinatorEpoch(),
-                                        replica.getBucketEpoch()));
+                                        replica.getBucketEpoch(),
+                                        sourceMetadata == null ? null : sourceMetadata.f0,
+                                        sourceMetadata == null ? null : sourceMetadata.f1));
                 if (!success) {
                     // the commit failed, it means the commit snapshot is invalid or register zk
                     // failed, we will revert this commit and delete the remote log manifest

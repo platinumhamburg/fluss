@@ -18,6 +18,8 @@
 package org.apache.fluss.flink.sink;
 
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.flink.FlinkConnectorOptions;
+import org.apache.fluss.flink.sink.bulkload.BulkLoadSinkTopology;
 import org.apache.fluss.flink.sink.serializer.RowDataSerializationSchema;
 import org.apache.fluss.flink.sink.shuffle.DistributionMode;
 import org.apache.fluss.flink.sink.writer.FlinkSinkWriter;
@@ -31,6 +33,8 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.GenericRow;
 
 import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.configuration.BatchExecutionOptions;
+import org.apache.flink.runtime.util.EnvironmentInformation;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSink;
 import org.apache.flink.table.api.ValidationException;
@@ -52,10 +56,13 @@ import org.apache.flink.types.RowKind;
 
 import javax.annotation.Nullable;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -72,6 +79,8 @@ public class FlinkTableSink
                 SupportsRowLevelDelete,
                 SupportsRowLevelUpdate {
 
+    private static final String BULK_LOAD_SUPPORTED_FLINK_VERSION = "2.2";
+
     private final TablePath tablePath;
     private final Configuration flussConfig;
     private final RowType tableRowType;
@@ -86,9 +95,18 @@ public class FlinkTableSink
     private final DistributionMode distributionMode;
     private final @Nullable DataLakeFormat lakeFormat;
     @Nullable private final String producerId;
+    private final boolean bulkLoadEnabled;
+    @Nullable private final Duration bulkLoadBuildTimeout;
+    private final Duration bulkLoadAwaitTimeout;
+    private final boolean hasAutoIncrementColumn;
 
     private boolean appliedUpdates = false;
     @Nullable private GenericRow deleteRow;
+    /**
+     * The static partition spec captured by {@link #applyStaticPartition}; only consumed by the
+     * BulkLoad path, the regular path keeps ignoring it.
+     */
+    @Nullable private Map<String, String> staticPartition;
 
     public FlinkTableSink(
             TablePath tablePath,
@@ -104,7 +122,11 @@ public class FlinkTableSink
             int numBucket,
             List<String> bucketKeys,
             DistributionMode distributionMode,
-            @Nullable String producerId) {
+            @Nullable String producerId,
+            boolean bulkLoadEnabled,
+            @Nullable Duration bulkLoadBuildTimeout,
+            Duration bulkLoadAwaitTimeout,
+            boolean hasAutoIncrementColumn) {
         this.tablePath = tablePath;
         this.flussConfig = flussConfig;
         this.tableRowType = tableRowType;
@@ -119,6 +141,10 @@ public class FlinkTableSink
         this.distributionMode = distributionMode;
         this.lakeFormat = lakeFormat;
         this.producerId = producerId;
+        this.bulkLoadEnabled = bulkLoadEnabled;
+        this.bulkLoadBuildTimeout = bulkLoadBuildTimeout;
+        this.bulkLoadAwaitTimeout = bulkLoadAwaitTimeout;
+        this.hasAutoIncrementColumn = hasAutoIncrementColumn;
     }
 
     @Override
@@ -140,6 +166,53 @@ public class FlinkTableSink
 
     @Override
     public SinkRuntimeProvider getSinkRuntimeProvider(Context context) {
+        if (bulkLoadEnabled) {
+            // The BulkLoad path only supports full-column batch INSERT INTO statements;
+            // reject the unsupported statement shapes right at the fork, before the provider
+            // is constructed. Batch UPDATE statements reach the sink via applyRowLevelUpdate.
+            if (appliedUpdates) {
+                throw bulkLoadRejection(
+                        "only supports full-column batch INSERT INTO statements; "
+                                + "UPDATE statements are not supported.");
+            }
+            Optional<int[][]> targetColumns = context.getTargetColumns();
+            // when no columns specified in insert into, the length of target columns is 0,
+            // which is a full-column insert rather than a partial-column one, see FLINK-36000
+            if (targetColumns.isPresent()
+                    && targetColumns.get().length != 0
+                    && targetColumns.get().length != tableRowType.getFieldCount()) {
+                throw bulkLoadRejection(
+                        String.format(
+                                "only supports full-column batch INSERT INTO statements; "
+                                        + "partial-column INSERT statements (the statement "
+                                        + "targets %d of the %d table columns) are not supported.",
+                                targetColumns.get().length, tableRowType.getFieldCount()));
+            }
+            // The BulkLoad path replaces the regular sink entirely. The eligibility check runs
+            // inside consumeDataStream, which is invoked during job translation: the statement
+            // still fails fast at compile time, and the execution environment configuration
+            // needed for the speculative execution check is available there.
+            return new DataStreamSinkProvider() {
+                @Override
+                public DataStreamSink<?> consumeDataStream(
+                        ProviderContext providerContext, DataStream<RowData> dataStream) {
+                    validateBulkLoadEligibility(dataStream);
+                    return BulkLoadSinkTopology.apply(
+                            dataStream,
+                            tablePath,
+                            flussConfig,
+                            tableRowType,
+                            partitionKeys,
+                            bucketKeys,
+                            numBucket,
+                            lakeFormat,
+                            staticPartition,
+                            bulkLoadBuildTimeout,
+                            bulkLoadAwaitTimeout);
+                }
+            };
+        }
+
         int[] targetColumnIndexes = null;
         // skip applying partial-updates for UPDATE command as the Context#targetColumns
         // is not correct, see FLINK-36736
@@ -235,6 +308,71 @@ public class FlinkTableSink
         return new FlinkSink<>(flinkSinkWriterBuilder, tablePath);
     }
 
+    /**
+     * Builds the {@link ValidationException} rejecting an unsupported BulkLoad statement, in the
+     * same message style as the other BulkLoad rejections.
+     */
+    private static ValidationException bulkLoadRejection(String reason) {
+        return new ValidationException(
+                String.format(
+                        "The option '%s' is enabled, but the BulkLoad sink %s",
+                        FlinkConnectorOptions.SINK_BULK_LOAD_ENABLED.key(), reason));
+    }
+
+    private void validateBulkLoadEligibility(DataStream<RowData> dataStream) {
+        if (streaming) {
+            throw bulkLoadRejection(
+                    "requires batch execution mode; the current job runs in streaming mode.");
+        }
+        if (primaryKeyIndexes.length == 0) {
+            throw bulkLoadRejection("only supports primary key tables; the target table has none.");
+        }
+        if (mergeEngineType != null) {
+            throw bulkLoadRejection(
+                    String.format(
+                            "only supports primary key tables with the default merge engine; "
+                                    + "the target table uses the '%s' merge engine.",
+                            mergeEngineType));
+        }
+        if (hasAutoIncrementColumn) {
+            throw bulkLoadRejection("does not support tables with an auto-increment column.");
+        }
+        Map<String, String> partitionSpec =
+                staticPartition == null ? Collections.emptyMap() : staticPartition;
+        List<String> missingPartitionKeys = new ArrayList<>();
+        for (String partitionKey : partitionKeys) {
+            if (!partitionSpec.containsKey(partitionKey)) {
+                missingPartitionKeys.add(partitionKey);
+            }
+        }
+        if (!missingPartitionKeys.isEmpty()) {
+            throw bulkLoadRejection(
+                    String.format(
+                            "requires a complete static partition spec for partitioned tables, "
+                                    + "but the values of partition keys %s are missing from the "
+                                    + "static partition spec.",
+                            missingPartitionKeys));
+        }
+        String flinkVersion = EnvironmentInformation.getVersion();
+        String[] versionTokens = flinkVersion.split("[.\\-]");
+        if (versionTokens.length < 2
+                || !BULK_LOAD_SUPPORTED_FLINK_VERSION.equals(
+                        versionTokens[0] + "." + versionTokens[1])) {
+            throw bulkLoadRejection(
+                    String.format(
+                            "requires Flink version %s, but the current Flink version is %s.",
+                            BULK_LOAD_SUPPORTED_FLINK_VERSION, flinkVersion));
+        }
+        if (dataStream
+                .getExecutionEnvironment()
+                .getConfiguration()
+                .get(BatchExecutionOptions.SPECULATIVE_ENABLED)) {
+            throw bulkLoadRejection(
+                    "does not support speculative execution. Please disable "
+                            + "'execution.batch.speculative.enabled' when using BulkLoad.");
+        }
+    }
+
     private List<String> columns(int[] columnIndexes) {
         List<String> columns = new ArrayList<>();
         for (int columnIndex : columnIndexes) {
@@ -260,9 +398,14 @@ public class FlinkTableSink
                         numBucket,
                         bucketKeys,
                         distributionMode,
-                        producerId);
+                        producerId,
+                        bulkLoadEnabled,
+                        bulkLoadBuildTimeout,
+                        bulkLoadAwaitTimeout,
+                        hasAutoIncrementColumn);
         sink.appliedUpdates = appliedUpdates;
         sink.deleteRow = deleteRow;
+        sink.staticPartition = staticPartition;
         return sink;
     }
 
@@ -273,7 +416,8 @@ public class FlinkTableSink
 
     @Override
     public void applyStaticPartition(Map<String, String> partition) {
-        // do nothing
+        // Only consumed by the BulkLoad path; the regular path keeps ignoring it.
+        this.staticPartition = new LinkedHashMap<>(partition);
     }
 
     @Override

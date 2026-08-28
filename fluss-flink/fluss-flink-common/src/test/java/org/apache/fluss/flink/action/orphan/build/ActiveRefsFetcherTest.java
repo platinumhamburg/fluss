@@ -19,6 +19,7 @@ package org.apache.fluss.flink.action.orphan.build;
 
 import org.apache.fluss.client.metadata.ActiveKvSnapshots;
 import org.apache.fluss.client.metadata.RemoteLogManifestInfo;
+import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.utils.FlussPaths;
@@ -292,6 +293,25 @@ class ActiveRefsFetcherTest {
                 .isEqualTo(1);
     }
 
+    @Test
+    void unsupportedVersionIsFatalWithoutRetry() {
+        AtomicInteger calls = new AtomicInteger();
+        StubAdmin admin = new StubAdmin(calls);
+        admin.failLogWith(new UnsupportedVersionException("incomplete log refs"));
+
+        ActiveRefsFetcher fetcher =
+                new ActiveRefsFetcher(admin, new StubManifestReader(), /* maxRetries= */ 3);
+        assertThatThrownBy(() -> fetcher.fetchLogActiveRefsByBucket(7L, null))
+                .isInstanceOf(UnsupportedVersionException.class);
+        assertThat(calls).hasValue(1);
+
+        calls.set(0);
+        admin.failKvWith(new UnsupportedVersionException("incomplete snapshot refs"));
+        assertThatThrownBy(() -> fetcher.fetchKvActiveSnapDirs(7L, null))
+                .isInstanceOf(UnsupportedVersionException.class);
+        assertThat(calls).hasValue(1);
+    }
+
     // -------------------------------------------------------------------------
     // Test fixtures
     // -------------------------------------------------------------------------
@@ -320,6 +340,8 @@ class ActiveRefsFetcherTest {
         private final Deque<List<RemoteLogManifestInfo>> responses = new ArrayDeque<>();
         private final Deque<ActiveKvSnapshots> kvResponses = new ArrayDeque<>();
         private final AtomicInteger callCounter;
+        @Nullable private Throwable logFailure;
+        @Nullable private Throwable kvFailure;
         private final AtomicReference<Long> lastLogPartitionId =
                 new AtomicReference<>(Long.MIN_VALUE);
         private final AtomicReference<Long> lastKvPartitionId =
@@ -370,11 +392,24 @@ class ActiveRefsFetcherTest {
             kvResponses.add(new ActiveKvSnapshots(7L, null, snapshotIdsByBucket));
         }
 
+        void failLogWith(Throwable failure) {
+            logFailure = failure;
+        }
+
+        void failKvWith(Throwable failure) {
+            kvFailure = failure;
+        }
+
         @Override
         public CompletableFuture<List<RemoteLogManifestInfo>> listRemoteLogManifests(
                 long tableId, @Nullable Long partitionId) {
             callCounter.incrementAndGet();
             lastLogPartitionId.set(partitionId);
+            if (logFailure != null) {
+                CompletableFuture<List<RemoteLogManifestInfo>> failed = new CompletableFuture<>();
+                failed.completeExceptionally(logFailure);
+                return failed;
+            }
             List<RemoteLogManifestInfo> next = responses.poll();
             if (next == null) {
                 CompletableFuture<List<RemoteLogManifestInfo>> failed = new CompletableFuture<>();
@@ -390,6 +425,11 @@ class ActiveRefsFetcherTest {
                 long tableId, @Nullable Long partitionId) {
             callCounter.incrementAndGet();
             lastKvPartitionId.set(partitionId);
+            if (kvFailure != null) {
+                CompletableFuture<ActiveKvSnapshots> failed = new CompletableFuture<>();
+                failed.completeExceptionally(kvFailure);
+                return failed;
+            }
             ActiveKvSnapshots next = kvResponses.poll();
             if (next == null) {
                 CompletableFuture<ActiveKvSnapshots> failed = new CompletableFuture<>();

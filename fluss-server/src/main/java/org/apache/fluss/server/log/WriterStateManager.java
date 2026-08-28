@@ -182,6 +182,23 @@ public class WriterStateManager {
         snapshots = loadSnapshots();
     }
 
+    /** Removes every writer snapshot except the already validated snapshot at the new boundary. */
+    public void retainSnapshotAt(long offset) throws IOException {
+        if (!snapshots.containsKey(offset)) {
+            throw new IOException("Writer snapshot is missing at offset " + offset + '.');
+        }
+        for (SnapshotFile snapshot : new ArrayList<>(snapshots.values())) {
+            if (snapshot.offset != offset) {
+                removeAndDeleteSnapshot(snapshot.offset);
+            }
+        }
+    }
+
+    /** Validates that the supplied file is a readable standard writer-state snapshot. */
+    public static void validateSnapshot(File snapshotFile) {
+        readSnapshot(snapshotFile);
+    }
+
     public void truncateFullyAndReloadSnapshots() throws IOException {
         LOG.info("Reloading the writer state snapshots");
         truncateFullyAndStartAt(0L);

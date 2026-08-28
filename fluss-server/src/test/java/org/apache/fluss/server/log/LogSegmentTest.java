@@ -95,6 +95,15 @@ final class LogSegmentTest extends LogTestBase {
                                         memoryRecords))
                 .isInstanceOf(LogSegmentOffsetOverflowException.class)
                 .hasMessageContaining("Detected offset overflow at offset");
+
+        segment.getFileLogRecords()
+                .append(
+                        genMemoryLogRecordsWithBaseOffset(
+                                largestOffset,
+                                Collections.singletonList(new Object[] {1, "hello"})));
+        assertThatThrownBy(segment::recover)
+                .isInstanceOf(LogSegmentOffsetOverflowException.class)
+                .hasMessageContaining("Detected offset overflow at offset");
     }
 
     @Test

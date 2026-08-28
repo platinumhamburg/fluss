@@ -409,6 +409,8 @@ message CommitKvSnapshotRequest {
   required bytes completed_snapshot = 1;
   required int32 coordinator_epoch = 2;
   required int32 bucket_leader_epoch = 3;
+  optional string metadata_path = 4;
+  optional int32 metadata_version = 5;
 }
 
 message CommitKvSnapshotResponse {
@@ -521,6 +523,7 @@ message ListRemoteLogManifestsRequest {
 
 message ListRemoteLogManifestsResponse {
   repeated PbRemoteLogManifestEntry manifests = 1;
+  optional bool active_references_complete = 2;
 }
 
 message PbRemoteLogManifestEntry {
@@ -541,6 +544,7 @@ message ListKvSnapshotsResponse {
   optional int64 partition_id = 2;
   // Active snapshots = retained_N ∪ still-in-use; multiple entries per bucket allowed.
   repeated PbKvSnapshot active_snapshots = 3;
+  optional bool active_references_complete = 4;
 }
 
 // create partition request and response
@@ -572,6 +576,8 @@ message CommitRemoteLogManifestRequest {
   required int32 coordinator_epoch = 7;
   required int32 bucket_leader_epoch = 8;
   optional int64 highest_copied_end_offset = 9;
+  optional string metadata_path = 10;
+  optional int32 metadata_version = 11;
 }
 
 message CommitRemoteLogManifestResponse {
@@ -816,6 +822,68 @@ message GetClusterHealthResponse {
   required int32 status = 5; // PbClusterHealthStatus: GREEN=0, YELLOW=1, RED=2, UNKNOWN=3
 }
 
+message BeginBulkLoadRequest {
+  required PbPhysicalTablePath target = 1;
+  optional int64 build_timeout_ms = 2;
+  required string caller_token = 3;
+}
+
+message PbBulkLoadHandle {
+  required PbPhysicalTablePath target = 1;
+  required int64 table_id = 2;
+  optional int64 partition_id = 3;
+  required string bulk_load_id = 4;
+}
+
+message BeginBulkLoadResponse {
+  required bool created = 1;
+  required PbBulkLoadStatus status = 2;
+  optional PbBulkLoadTargetInfo target_info = 3;
+}
+
+message CommitBulkLoadRequest {
+  required PbBulkLoadHandle handle = 1;
+  optional int64 manifest_length = 2;
+  optional string manifest_sha256 = 3;
+  optional string manifest_path = 4;
+}
+
+message CommitBulkLoadResponse {
+  required PbBulkLoadStatus status = 1;
+}
+
+message AbortBulkLoadRequest {
+  required PbBulkLoadHandle handle = 1;
+}
+
+message AbortBulkLoadResponse {
+  required PbBulkLoadStatus status = 1;
+}
+
+message GetBulkLoadStatusRequest {
+  required PbBulkLoadHandle handle = 1;
+}
+
+message GetBulkLoadStatusResponse {
+  required PbBulkLoadStatus status = 1;
+}
+
+message PbBulkLoadStatus {
+  required PbBulkLoadHandle handle = 1;
+  required int32 state = 2;
+  optional int32 abort_reason = 3;
+  optional string abort_message = 4;
+}
+
+message PbBulkLoadTargetInfo {
+  required PbBulkLoadHandle handle = 1;
+  required int32 schema_id = 2;
+  required bytes table_json = 3;
+  required int64 created_time = 4;
+  required int64 modified_time = 5;
+  optional string remote_data_dir = 6;
+  repeated int64 snapshot_ids = 8;
+}
 
 // --------------- Inner classes ----------------
 message PbApiVersion {
@@ -861,6 +929,11 @@ message PbTableMetadata {
   required int64 modified_time = 7;
   optional string remote_data_dir = 8;
 
+  optional string metadata_path = 9;
+  optional int32 metadata_version = 10;
+  optional int32 data_state = 11;
+  optional string bulk_load_id = 12;
+
   // TODO add a new filed 'deleted_table' to indicate this table is deleted in UpdateMetadataRequest.
   // trace by: https://github.com/apache/fluss/issues/981
 }
@@ -871,6 +944,10 @@ message PbPartitionMetadata {
   required string partition_name = 2;
   required int64 partition_id = 3;
   repeated PbBucketMetadata bucket_metadata = 4;
+  optional string metadata_path = 5;
+  optional int32 metadata_version = 6;
+  optional int32 data_state = 7;
+  optional string bulk_load_id = 8;
 }
 
 message PbBucketMetadata {
@@ -1055,6 +1132,10 @@ message PbNotifyLeaderAndIsrReqForBucket {
   repeated int32 isr = 6 [packed = true];
   required int32 bucket_epoch = 7;
   repeated int32 standby_replicas = 8 [packed = true];
+  optional string metadata_path = 9;
+  optional int32 metadata_version = 10;
+  optional int32 data_state = 11;
+  optional string bulk_load_id = 12;
 }
 
 message PbNotifyLeaderAndIsrRespForBucket {

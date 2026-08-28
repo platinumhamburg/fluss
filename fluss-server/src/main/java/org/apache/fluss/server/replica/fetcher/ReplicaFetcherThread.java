@@ -33,6 +33,7 @@ import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogTablet;
+import org.apache.fluss.server.log.WriterStateManager;
 import org.apache.fluss.server.log.remote.RemoteLogManager;
 import org.apache.fluss.server.log.remote.RemoteLogStorage.IndexType;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
@@ -54,6 +55,7 @@ import javax.annotation.concurrent.GuardedBy;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.Collections;
@@ -601,7 +603,7 @@ final class ReplicaFetcherThread extends ShutdownableThread {
     }
 
     private long processFetchResultFromRemoteStorage(
-            TableBucket tb, FetchLogResultForBucket replicaData) {
+            TableBucket tb, FetchLogResultForBucket replicaData) throws Exception {
         RemoteLogFetchInfo rlFetchInfo = replicaData.remoteLogFetchInfo();
         checkNotNull(rlFetchInfo, "RemoteLogFetchInfo is null");
         Replica replica = replicaManager.getReplicaOrException(tb);
@@ -619,54 +621,48 @@ final class ReplicaFetcherThread extends ShutdownableThread {
         // until remoteLogSegment.endOffset().
         long nextFetchOffset = remoteLogSegmentWithMaxStartOffset.remoteLogEndOffset();
 
+        LogTablet log = replica.getLogTablet();
+        File stagedSnapshotFile =
+                Files.createTempFile(log.getLogDir().toPath(), ".remote-writer-snapshot-", ".tmp")
+                        .toFile();
+        File snapshotFile = FlussPaths.writerSnapshotFile(log.getLogDir(), nextFetchOffset);
         try {
-            // Truncate the existing local log before restoring the writer id snapshots.
-            replica.truncateFullyAndStartAt(nextFetchOffset);
+            // Fetch and validate into a non-snapshot staging file before changing the durable
+            // local boundary. Missing or corrupt remote state therefore leaves LEO, HW, and the
+            // recovery checkpoint untouched.
+            downloadWriterIdSnapshotFile(
+                    stagedSnapshotFile, remoteLogSegmentWithMaxStartOffset, rlm);
+            WriterStateManager.validateSnapshot(stagedSnapshotFile);
 
-            // TODO maybe need increase log start offset.
-
-            LogTablet log = replica.getLogTablet();
-            // 1. Perform a truncate before calling buildWriterIdSnapshotFile() to ensure that all
-            // historical data is completely cleaned up.
-            log.writerStateManager().truncateFullyAndStartAt(0L);
-
-            // 2. download writer id snapshots from remote storage.
-            File snapshotFile = FlussPaths.writerSnapshotFile(log.getLogDir(), nextFetchOffset);
-            buildWriterIdSnapshotFile(snapshotFile, remoteLogSegmentWithMaxStartOffset, rlm);
-
-            // 3. Perform a reloadSnapshots after buildWriterIdSnapshotFile() to load the latest
-            // downloaded writerId snapshot file into the writerStateManager.
-            // Note: This must occur  after the file is downloaded, so we cannot call
-            // truncateFullyAndReloadSnapshots() here to avoid  deleting the newly downloaded
-            // writerId snapshot file.
+            FileUtils.atomicMoveWithFallback(
+                    stagedSnapshotFile.toPath(), snapshotFile.toPath(), false);
             log.writerStateManager().reloadSnapshots();
             log.loadWriterSnapshot(nextFetchOffset);
-            LOG.info(
-                    "Build the writer snapshots from remote storage for {} with active "
-                            + "writer size: {} and remoteLogEndOffset: {}",
-                    tb,
-                    log.writerStateManager().activeWriters().size(),
-                    nextFetchOffset);
-        } catch (Exception e) {
-            LOG.error(
-                    "Failed to truncate and restore writer snapshot for {} while log hash been moved to remote",
-                    tb,
-                    e);
+            // Only advance the local boundary after every fallible snapshot installation step has
+            // completed. A failed move, reload, or load therefore leaves LEO/HW/recovery point at
+            // their previous durable values and the fetch can be retried.
+            replica.truncateLocalFullyAndStartAt(nextFetchOffset);
+            log.writerStateManager().retainSnapshotAt(nextFetchOffset);
+        } finally {
+            Files.deleteIfExists(stagedSnapshotFile.toPath());
         }
+        LOG.info(
+                "Build the writer snapshots from remote storage for {} with active "
+                        + "writer size: {} and remoteLogEndOffset: {}",
+                tb,
+                log.writerStateManager().activeWriters().size(),
+                nextFetchOffset);
         return nextFetchOffset;
     }
 
-    private void buildWriterIdSnapshotFile(
-            File snapshotFile, RemoteLogSegment remoteLogSegment, RemoteLogManager rlm)
+    private void downloadWriterIdSnapshotFile(
+            File destination, RemoteLogSegment remoteLogSegment, RemoteLogManager rlm)
             throws RemoteStorageException, IOException {
-        File tmpSnapshotFile = new File(snapshotFile.getAbsolutePath() + ".tmp");
-        // Copy it to snapshot file in atomic manner.
-        Files.copy(
+        try (InputStream remoteSnapshot =
                 rlm.getRemoteLogStorage()
-                        .fetchIndex(remoteLogSegment, IndexType.WRITER_ID_SNAPSHOT),
-                tmpSnapshotFile.toPath(),
-                StandardCopyOption.REPLACE_EXISTING);
-        FileUtils.atomicMoveWithFallback(tmpSnapshotFile.toPath(), snapshotFile.toPath(), false);
+                        .fetchIndex(remoteLogSegment, IndexType.WRITER_ID_SNAPSHOT)) {
+            Files.copy(remoteSnapshot, destination.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        }
     }
 
     private void truncate(TableBucket tableBucket, long offset) {

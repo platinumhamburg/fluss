@@ -17,6 +17,8 @@
 
 package org.apache.fluss.server.kv.snapshot;
 
+import javax.annotation.Nullable;
+
 /** An interface for reporting a {@link CompletedSnapshot}. */
 public interface CompletedKvSnapshotCommitter {
 
@@ -30,4 +32,19 @@ public interface CompletedKvSnapshotCommitter {
      */
     void commitKvSnapshot(CompletedSnapshot snapshot, int coordinatorEpoch, int bucketLeaderEpoch)
             throws Exception;
+
+    /** Commits a snapshot with the exact source metadata frozen when snapshotting started. */
+    default void commitKvSnapshot(
+            CompletedSnapshot snapshot,
+            int coordinatorEpoch,
+            int bucketLeaderEpoch,
+            @Nullable String sourceMetadataPath,
+            @Nullable Integer sourceMetadataVersion)
+            throws Exception {
+        if (sourceMetadataPath != null || sourceMetadataVersion != null) {
+            throw new UnsupportedOperationException(
+                    "Metadata-fenced snapshot commits are not supported by this committer.");
+        }
+        commitKvSnapshot(snapshot, coordinatorEpoch, bucketLeaderEpoch);
+    }
 }

@@ -23,9 +23,6 @@ import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
-import org.apache.fluss.exception.DisconnectException;
-import org.apache.fluss.exception.NetworkException;
-import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.flink.action.orphan.OrphanCleanUtils;
 import org.apache.fluss.flink.action.orphan.RpcErrorClassifier;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
@@ -43,7 +40,6 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
-import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FlussPaths;
 
 import org.apache.flink.streaming.api.functions.ProcessFunction;
@@ -114,13 +110,6 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
 
         try (Connection connection = ConnectionFactory.createConnection(flussConfig);
                 Admin admin = connection.getAdmin()) {
-            // Fail fast on incompatible servers: the action jar may be deployed against an
-            // older cluster that does not implement ListRemoteLogManifests / ListKvSnapshots.
-            // Without this guard, every per-target fetch would degrade to skip_log_target /
-            // skip_kv_target audit events and the job would exit "successfully" with
-            // deleted=0, masking the incompatibility.
-            verifyServerSupportsRequiredApis(admin);
-
             AuditLogger audit = new AuditLogger();
             audit.logCutoff(config.olderThanMillis());
 
@@ -155,76 +144,6 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             normalized.add(normalizeRoot(root));
         }
         return new ArrayList<String>(normalized);
-    }
-
-    /**
-     * Probes the two RPCs this action depends on and throws if the connected server does not
-     * implement them. A sentinel {@code tableId} of {@link Long#MAX_VALUE} is used so that on a
-     * compatible server the call simply fails with a benign error (typically table-not-found),
-     * whereas an incompatible server raises {@link UnsupportedVersionException} during ApiVersions
-     * negotiation. Any non-{@code UnsupportedVersionException} outcome is treated as proof that the
-     * RPC is recognized.
-     */
-    private static void verifyServerSupportsRequiredApis(Admin admin) {
-        long sentinelTableId = Long.MAX_VALUE;
-        probeApi(
-                "ListRemoteLogManifests",
-                () -> admin.listRemoteLogManifests(sentinelTableId, null).get());
-        probeApi("ListKvSnapshots", () -> admin.listKvSnapshots(sentinelTableId, null).get());
-    }
-
-    private static void probeApi(String apiName, ThrowingProbe probe) {
-        try {
-            probe.run();
-        } catch (Throwable t) {
-            if (isUnsupportedVersion(t)) {
-                throw new UnsupportedOperationException(
-                        "Orphan files cleanup requires the Fluss server to support the "
-                                + apiName
-                                + " RPC, which the connected cluster does not. Upgrade the"
-                                + " cluster to a version that exposes this RPC, or run an"
-                                + " older orphan-files-cleanup action that targets this server.",
-                        t);
-            }
-            if (isConnectionFailure(t)) {
-                throw new IllegalStateException(
-                        "Failed to connect to Fluss cluster while probing "
-                                + apiName
-                                + " RPC. The bootstrap server may be unreachable.",
-                        t);
-            }
-            // Any other failure means the RPC is recognized; the call merely failed because of
-            // the sentinel target id. Compatibility is satisfied.
-        }
-    }
-
-    private static boolean isConnectionFailure(Throwable t) {
-        Throwable cause = ExceptionUtils.stripExecutionException(t);
-        while (cause != null) {
-            if (cause instanceof NetworkException
-                    || cause instanceof DisconnectException
-                    || cause instanceof IOException) {
-                return true;
-            }
-            cause = cause.getCause();
-        }
-        return false;
-    }
-
-    private static boolean isUnsupportedVersion(Throwable t) {
-        Throwable cause = t;
-        while (cause != null) {
-            if (cause instanceof UnsupportedVersionException) {
-                return true;
-            }
-            cause = cause.getCause();
-        }
-        return false;
-    }
-
-    @FunctionalInterface
-    private interface ThrowingProbe {
-        void run() throws Exception;
     }
 
     // -------------------------------------------------------------------------
@@ -354,7 +273,7 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                         : Collections.<PartitionInfo>singletonList(null);
         for (PartitionInfo partitionInfo : partitionTargets) {
             emitBucketTasksForTarget(
-                    liveTable,
+                    liveTable.tableInfo,
                     partitionInfo,
                     fetcher,
                     audit,
@@ -365,48 +284,62 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
     }
 
     private void emitBucketTasksForTarget(
-            LiveTableScope liveTable,
+            TableInfo tableInfo,
             @Nullable PartitionInfo partitionInfo,
             ActiveRefsFetcher fetcher,
             AuditLogger audit,
             @Nullable String clusterRemoteDataDir,
             List<String> clusterRoots,
             Collector<CleanTask> out) {
+        long tableId = tableInfo.getTableId();
+        TablePath tablePath = tableInfo.getTablePath();
         Long partitionId = partitionInfo == null ? null : partitionInfo.getPartitionId();
 
-        String remoteDataDir =
-                resolveRemoteDataDir(liveTable.tableInfo, partitionInfo, clusterRemoteDataDir);
+        String remoteDataDir = resolveRemoteDataDir(tableInfo, partitionInfo, clusterRemoteDataDir);
 
         // Scope guard: skip this target if its metadata-resolved root is not part of the
         // cluster's configured remote data directories.
         if (!clusterRoots.contains(normalizeRoot(remoteDataDir))) {
-            audit.logSkipBucketOutOfScope(liveTable.tableId, partitionId, remoteDataDir);
+            audit.logSkipBucketOutOfScope(tableId, partitionId, remoteDataDir);
             return;
         }
 
         LogActiveRefsFetchResult logResult =
-                fetcher.fetchLogActiveRefsByBucket(liveTable.tableId, partitionId);
+                fetcher.fetchLogActiveRefsByBucket(tableId, partitionId);
         if (!logResult.listOk()) {
-            audit.logSkipLogTarget(liveTable.tableId, partitionId, logResult.listFailureReason());
+            audit.logSkipLogTarget(tableId, partitionId, logResult.listFailureReason());
+            return;
+        }
+        boolean manifestReadFailed = false;
+        for (TableBucket tableBucket : enumerateBuckets(tableInfo, partitionInfo)) {
+            int bucketId = tableBucket.getBucket();
+            if (logResult.statusFor(bucketId)
+                    == LogActiveRefsFetchResult.ManifestReadStatus.READ_FAILED) {
+                audit.logBucketAborted(
+                        OrphanCleanUtils.bucketScopeKey(tableId, partitionId, bucketId),
+                        logResult.readFailureReason(bucketId));
+                manifestReadFailed = true;
+            }
+        }
+        if (manifestReadFailed) {
+            return;
         }
 
         Map<Integer, Set<String>> kvActiveByBucket = Collections.emptyMap();
-        boolean kvTargetOk = false;
-        if (liveTable.tableInfo.hasPrimaryKey()) {
-            KvActiveRefsFetchResult kvResult =
-                    fetcher.fetchKvActiveSnapDirs(liveTable.tableId, partitionId);
+        if (tableInfo.hasPrimaryKey()) {
+            KvActiveRefsFetchResult kvResult = fetcher.fetchKvActiveSnapDirs(tableId, partitionId);
             if (kvResult.listOk()) {
                 kvActiveByBucket = kvResult.activeSnapDirsByBucket();
-                kvTargetOk = true;
             } else {
-                audit.logSkipKvTarget(liveTable.tableId, partitionId, kvResult.listFailureReason());
+                audit.logSkipKvTarget(tableId, partitionId, kvResult.listFailureReason());
+                return;
             }
         }
 
         FsPath remoteLogDir = remoteSubDir(remoteDataDir, FlussPaths.REMOTE_LOG_DIR_NAME);
         FsPath remoteKvDir = remoteSubDir(remoteDataDir, FlussPaths.REMOTE_KV_DIR_NAME);
 
-        for (TableBucket tableBucket : enumerateBuckets(liveTable.tableInfo, partitionInfo)) {
+        for (TableBucket tableBucket : enumerateBuckets(tableInfo, partitionInfo)) {
             int bucketId = tableBucket.getBucket();
 
             String logTabletDir = null;
@@ -414,47 +347,29 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             Set<String> logSegmentRelativePaths = Collections.emptySet();
             Set<String> logActiveManifestPaths = Collections.emptySet();
 
-            if (logResult.listOk()) {
-                switch (logResult.statusFor(bucketId)) {
-                    case RESOLVED:
-                        logTabletDir =
-                                FlussPaths.remoteLogTabletDir(
-                                                remoteLogDir,
-                                                physicalPath(liveTable.tablePath, partitionInfo),
-                                                tableBucket)
-                                        .toString();
-                        logSegmentRelativePaths =
-                                logResult.activeRefsOf(bucketId).logSegmentRelativePaths();
-                        logActiveManifestPaths =
-                                logResult.activeRefsOf(bucketId).logActiveManifestPaths();
-                        break;
-                    case READ_FAILED:
-                        audit.logBucketAborted(
-                                OrphanCleanUtils.bucketScopeKey(
-                                        liveTable.tableId, partitionId, bucketId),
-                                logResult.readFailureReason(bucketId));
-                        break;
-                    case NOT_LISTED:
-                        audit.logSkipLogBucket(
-                                liveTable.tableId, partitionId, bucketId, "no_remote_manifest");
-                        break;
-                    default:
-                        break;
-                }
+            logTabletDir =
+                    FlussPaths.remoteLogTabletDir(
+                                    remoteLogDir,
+                                    physicalPath(tablePath, partitionInfo),
+                                    tableBucket)
+                            .toString();
+            if (logResult.statusFor(bucketId)
+                    == LogActiveRefsFetchResult.ManifestReadStatus.RESOLVED) {
+                logSegmentRelativePaths =
+                        logResult.activeRefsOf(bucketId).logSegmentRelativePaths();
+                logActiveManifestPaths = logResult.activeRefsOf(bucketId).logActiveManifestPaths();
             }
 
             String kvTabletDir = null;
             Set<String> kvActiveSnaps = Collections.emptySet();
-            if (kvTargetOk && kvActiveByBucket.containsKey(bucketId)) {
+            if (tableInfo.hasPrimaryKey()) {
                 kvTabletDir =
                         FlussPaths.remoteKvTabletDir(
                                         remoteKvDir,
-                                        physicalPath(liveTable.tablePath, partitionInfo),
+                                        physicalPath(tablePath, partitionInfo),
                                         tableBucket)
                                 .toString();
-                kvActiveSnaps = kvActiveByBucket.get(bucketId);
-            } else if (kvTargetOk) {
-                audit.logSkipKvBucket(liveTable.tableId, partitionId, bucketId, "empty_active_set");
+                kvActiveSnaps = kvActiveByBucket.getOrDefault(bucketId, Collections.emptySet());
             }
 
             if (logTabletDir == null && kvTabletDir == null) {

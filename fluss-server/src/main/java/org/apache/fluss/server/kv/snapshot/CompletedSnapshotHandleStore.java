@@ -19,6 +19,8 @@ package org.apache.fluss.server.kv.snapshot;
 
 import org.apache.fluss.metadata.TableBucket;
 
+import javax.annotation.Nullable;
+
 import java.util.List;
 import java.util.Optional;
 
@@ -41,6 +43,23 @@ public interface CompletedSnapshotHandleStore {
             long snapshotId,
             CompletedSnapshotHandle completedSnapshotHandle)
             throws Exception;
+
+    /**
+     * Persists a v1 ordinary snapshot commit with coordinator and target-metadata fences in the
+     * same coordination-system transaction.
+     */
+    default void add(
+            TableBucket tableBucket,
+            long snapshotId,
+            CompletedSnapshotHandle completedSnapshotHandle,
+            @Nullable String sourceMetadataPath,
+            @Nullable Integer sourceMetadataVersion,
+            int coordinatorZkVersion,
+            int leaderAndIsrZkVersion)
+            throws Exception {
+        throw new UnsupportedOperationException(
+                "Atomic metadata-fenced snapshot commits are not supported by this store.");
+    }
 
     /**
      * Remove the snapshot handle for the given snapshot id of the given table bucket.

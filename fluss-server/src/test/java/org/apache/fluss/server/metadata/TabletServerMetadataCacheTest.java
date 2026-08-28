@@ -253,6 +253,173 @@ public class TabletServerMetadataCacheTest {
     }
 
     @Test
+    void testResidualDeletionMarkerClearsStaleTableMetadata() {
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        coordinatorServer,
+                        aliveTableServers,
+                        tableMetadataList,
+                        partitionMetadataList));
+        assertThat(serverMetadataCache.getTablePath(DATA1_TABLE_ID)).isPresent();
+
+        // The residual deletion marker keeps the real table id with the deleted table path.
+        // Build a fresh path instance (as a deserialized request would) so reference equality
+        // with the DELETED_TABLE_PATH constant cannot mask the comparison.
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        coordinatorServer,
+                        aliveTableServers,
+                        Collections.singletonList(
+                                new TableMetadata(
+                                        TableInfo.of(
+                                                TablePath.of(
+                                                        TableMetadata.DELETED_TABLE_PATH
+                                                                .getDatabaseName(),
+                                                        TableMetadata.DELETED_TABLE_PATH
+                                                                .getTableName()),
+                                                DATA1_TABLE_ID,
+                                                1,
+                                                DATA1_TABLE_DESCRIPTOR,
+                                                DEFAULT_REMOTE_DATA_DIR,
+                                                System.currentTimeMillis(),
+                                                System.currentTimeMillis()),
+                                        Collections.emptyList())),
+                        Collections.emptyList()));
+
+        assertThat(serverMetadataCache.getTablePath(DATA1_TABLE_ID)).isEmpty();
+    }
+
+    @Test
+    void testTableDeletionMarkerAlsoClearsCachedPartitions() {
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        coordinatorServer,
+                        aliveTableServers,
+                        tableMetadataList,
+                        partitionMetadataList));
+        assertThat(serverMetadataCache.getPhysicalTablePath(partitionId1)).isPresent();
+        assertThat(serverMetadataCache.getPhysicalTablePath(partitionId2)).isPresent();
+        assertThat(serverMetadataCache.contains(new TableBucket(partitionTableId, partitionId1, 0)))
+                .isTrue();
+        assertThat(serverMetadataCache.contains(new TableBucket(partitionTableId, partitionId2, 0)))
+                .isTrue();
+
+        // Dropping a partitioned table emits the table deletion marker together with the
+        // deletion marker of one partition; the markers of the remaining partitions only
+        // arrive in later updates, when the table mapping is already gone.
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        coordinatorServer,
+                        aliveTableServers,
+                        Collections.singletonList(
+                                new TableMetadata(
+                                        TableInfo.of(
+                                                partitionedTablePath,
+                                                DELETED_TABLE_ID,
+                                                1,
+                                                DATA1_PARTITIONED_TABLE_DESCRIPTOR,
+                                                DEFAULT_REMOTE_DATA_DIR,
+                                                System.currentTimeMillis(),
+                                                System.currentTimeMillis()),
+                                        Collections.emptyList())),
+                        Collections.singletonList(
+                                new PartitionMetadata(
+                                        partitionTableId,
+                                        partitionName1,
+                                        DELETED_PARTITION_ID,
+                                        Collections.emptyList()))));
+
+        assertThat(serverMetadataCache.getTablePath(partitionTableId)).isEmpty();
+        assertThat(serverMetadataCache.getPhysicalTablePath(partitionId1)).isEmpty();
+        assertThat(serverMetadataCache.getPhysicalTablePath(partitionId2)).isEmpty();
+        assertThat(serverMetadataCache.contains(new TableBucket(partitionTableId, partitionId1, 0)))
+                .isFalse();
+        assertThat(serverMetadataCache.contains(new TableBucket(partitionTableId, partitionId2, 0)))
+                .isFalse();
+        assertThat(
+                        serverMetadataCache.getPartitionMetadata(
+                                PhysicalTablePath.of(partitionedTablePath, partitionName1)))
+                .isEmpty();
+        assertThat(
+                        serverMetadataCache.getPartitionMetadata(
+                                PhysicalTablePath.of(partitionedTablePath, partitionName2)))
+                .isEmpty();
+
+        // A partition deletion marker arriving after the table mapping is gone cannot
+        // resolve its physical path and must remain a harmless no-op.
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        coordinatorServer,
+                        aliveTableServers,
+                        Collections.emptyList(),
+                        Collections.singletonList(
+                                new PartitionMetadata(
+                                        partitionTableId,
+                                        partitionName2,
+                                        DELETED_PARTITION_ID,
+                                        Collections.emptyList()))));
+        assertThat(serverMetadataCache.getPhysicalTablePath(partitionId2)).isEmpty();
+    }
+
+    @Test
+    void testResidualTableDeletionMarkerAlsoClearsCachedPartitions() {
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        coordinatorServer,
+                        aliveTableServers,
+                        tableMetadataList,
+                        partitionMetadataList));
+        assertThat(serverMetadataCache.getPhysicalTablePath(partitionId1)).isPresent();
+        assertThat(serverMetadataCache.getPhysicalTablePath(partitionId2)).isPresent();
+
+        // Same as above, but with the residual deletion-marker form that keeps the real
+        // table id under the deleted table path. Build a fresh path instance (as a
+        // deserialized request would) so reference equality with the DELETED_TABLE_PATH
+        // constant cannot mask the comparison.
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        coordinatorServer,
+                        aliveTableServers,
+                        Collections.singletonList(
+                                new TableMetadata(
+                                        TableInfo.of(
+                                                TablePath.of(
+                                                        TableMetadata.DELETED_TABLE_PATH
+                                                                .getDatabaseName(),
+                                                        TableMetadata.DELETED_TABLE_PATH
+                                                                .getTableName()),
+                                                partitionTableId,
+                                                1,
+                                                DATA1_PARTITIONED_TABLE_DESCRIPTOR,
+                                                DEFAULT_REMOTE_DATA_DIR,
+                                                System.currentTimeMillis(),
+                                                System.currentTimeMillis()),
+                                        Collections.emptyList())),
+                        Collections.singletonList(
+                                new PartitionMetadata(
+                                        partitionTableId,
+                                        partitionName1,
+                                        DELETED_PARTITION_ID,
+                                        Collections.emptyList()))));
+
+        assertThat(serverMetadataCache.getTablePath(partitionTableId)).isEmpty();
+        assertThat(serverMetadataCache.getPhysicalTablePath(partitionId1)).isEmpty();
+        assertThat(serverMetadataCache.getPhysicalTablePath(partitionId2)).isEmpty();
+        assertThat(serverMetadataCache.contains(new TableBucket(partitionTableId, partitionId1, 0)))
+                .isFalse();
+        assertThat(serverMetadataCache.contains(new TableBucket(partitionTableId, partitionId2, 0)))
+                .isFalse();
+        assertThat(
+                        serverMetadataCache.getPartitionMetadata(
+                                PhysicalTablePath.of(partitionedTablePath, partitionName1)))
+                .isEmpty();
+        assertThat(
+                        serverMetadataCache.getPartitionMetadata(
+                                PhysicalTablePath.of(partitionedTablePath, partitionName2)))
+                .isEmpty();
+    }
+
+    @Test
     void testContainsTableBucket() {
         tableMetadataList =
                 Collections.singletonList(

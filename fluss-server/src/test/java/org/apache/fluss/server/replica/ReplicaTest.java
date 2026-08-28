@@ -19,6 +19,7 @@ package org.apache.fluss.server.replica;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.LogFormat;
@@ -40,6 +41,9 @@ import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.ProjectionPushdownCache;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
+import org.apache.fluss.server.entity.NotifyLeaderAndIsrResultForBucket;
+import org.apache.fluss.server.entity.StopReplicaData;
+import org.apache.fluss.server.entity.StopReplicaResultForBucket;
 import org.apache.fluss.server.kv.KvFlushScheduler;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.TestingHoldableKvFlushScheduler;
@@ -50,8 +54,13 @@ import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
 import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogReadInfo;
+import org.apache.fluss.server.log.remote.RemoteLogManager;
+import org.apache.fluss.server.log.remote.TestingRemoteLogStorage;
+import org.apache.fluss.server.metadata.ClusterMetadata;
+import org.apache.fluss.server.tablet.bulkload.BulkLoadTargetMetadata;
 import org.apache.fluss.server.testutils.KvTestUtils;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.server.zk.data.bulkload.BulkLoadDataState;
 import org.apache.fluss.testutils.DataTestUtils;
 import org.apache.fluss.testutils.common.ManuallyTriggeredScheduledExecutorService;
 import org.apache.fluss.types.RowType;
@@ -73,7 +82,9 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -87,6 +98,7 @@ import static org.apache.fluss.record.TestData.DATA1;
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA1_ROW_TYPE;
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
@@ -146,6 +158,212 @@ final class ReplicaTest extends ReplicaTestBase {
         makeKvReplicaAsLeader(kvReplica);
         assertThat(kvReplica.getLogTablet()).isNotNull();
         assertThat(kvReplica.getKvTablet()).isNotNull();
+    }
+
+    @Test
+    void testDeletedReplicaDoesNotRetainBulkLoadTargetIdentity() throws Exception {
+        TablePath tablePath = TablePath.of("test_db_1", "deleted_replica_identity");
+        long tableId =
+                registerTableInZkClient(
+                        tablePath,
+                        DATA1_SCHEMA,
+                        2998234L,
+                        Collections.emptyList(),
+                        Collections.emptyMap());
+        PhysicalTablePath physicalTablePath = PhysicalTablePath.of(tablePath);
+        TableBucket tableBucket = new TableBucket(tableId, 1);
+        BulkLoadTargetMetadata oldIdentity =
+                new BulkLoadTargetMetadata(
+                        "/registration", tableBucket, 10, BulkLoadDataState.ACTIVE, null);
+        CompletableFuture<List<NotifyLeaderAndIsrResultForBucket>> initialCreate =
+                new CompletableFuture<>();
+        replicaManager.becomeLeaderOrFollower(
+                INITIAL_COORDINATOR_EPOCH,
+                Collections.singletonList(
+                        new NotifyLeaderAndIsrData(
+                                physicalTablePath,
+                                tableBucket,
+                                Collections.singletonList(TABLET_SERVER_ID),
+                                new LeaderAndIsr(
+                                        TABLET_SERVER_ID,
+                                        INITIAL_LEADER_EPOCH,
+                                        Collections.singletonList(TABLET_SERVER_ID),
+                                        Collections.emptyList(),
+                                        INITIAL_COORDINATOR_EPOCH,
+                                        INITIAL_LEADER_EPOCH),
+                                oldIdentity)),
+                initialCreate::complete);
+        assertThat(initialCreate.get())
+                .containsOnly(new NotifyLeaderAndIsrResultForBucket(tableBucket));
+
+        CompletableFuture<List<StopReplicaResultForBucket>> deletion = new CompletableFuture<>();
+        replicaManager.stopReplicas(
+                INITIAL_COORDINATOR_EPOCH,
+                Collections.singletonList(
+                        new StopReplicaData(
+                                tableBucket,
+                                true,
+                                false,
+                                INITIAL_COORDINATOR_EPOCH,
+                                INITIAL_LEADER_EPOCH)),
+                deletion::complete);
+        assertThat(deletion.get()).containsOnly(new StopReplicaResultForBucket(tableBucket));
+        assertThat(replicaManager.getReplica(tableBucket))
+                .isInstanceOf(ReplicaManager.NoneReplica.class);
+
+        BulkLoadTargetMetadata freshIdentity =
+                new BulkLoadTargetMetadata(
+                        "/registration", tableBucket, 1, BulkLoadDataState.ACTIVE, null);
+        CompletableFuture<List<NotifyLeaderAndIsrResultForBucket>> recreation =
+                new CompletableFuture<>();
+        replicaManager.becomeLeaderOrFollower(
+                INITIAL_COORDINATOR_EPOCH,
+                Collections.singletonList(
+                        new NotifyLeaderAndIsrData(
+                                physicalTablePath,
+                                tableBucket,
+                                Collections.singletonList(TABLET_SERVER_ID),
+                                new LeaderAndIsr(
+                                        TABLET_SERVER_ID,
+                                        INITIAL_LEADER_EPOCH + 1,
+                                        Collections.singletonList(TABLET_SERVER_ID),
+                                        Collections.emptyList(),
+                                        INITIAL_COORDINATOR_EPOCH,
+                                        INITIAL_LEADER_EPOCH + 1),
+                                freshIdentity)),
+                recreation::complete);
+
+        assertThat(recreation.get())
+                .containsOnly(new NotifyLeaderAndIsrResultForBucket(tableBucket));
+        assertThat(replicaManager.getReplicaOrException(tableBucket).getBulkLoadTargetMetadata())
+                .isEqualTo(freshIdentity);
+    }
+
+    @Test
+    void testDeletedOrphanReplicaDoesNotRetainBulkLoadTargetIdentity() throws Exception {
+        TablePath tablePath = TablePath.of("test_db_1", "deleted_orphan_replica_identity");
+        long tableId =
+                registerTableInZkClient(
+                        tablePath,
+                        DATA1_SCHEMA,
+                        2998235L,
+                        Collections.emptyList(),
+                        Collections.emptyMap());
+        PhysicalTablePath physicalTablePath = PhysicalTablePath.of(tablePath);
+        TableBucket tableBucket = new TableBucket(tableId, 1);
+        BulkLoadTargetMetadata oldIdentity =
+                new BulkLoadTargetMetadata(
+                        "/registration", tableBucket, 10, BulkLoadDataState.ACTIVE, null);
+        replicaManager.maybeUpdateMetadataCache(
+                INITIAL_COORDINATOR_EPOCH,
+                new ClusterMetadata(null, Collections.emptySet()),
+                Collections.singletonList(oldIdentity));
+
+        File dataDir = localDiskManager.dataDirs().get(0);
+        File orphanLogDir =
+                logManager
+                        .getOrCreateLog(
+                                dataDir, physicalTablePath, tableBucket, LogFormat.ARROW, 1, false)
+                        .getLogDir();
+        assertThat(orphanLogDir).exists();
+        assertThat(replicaManager.getReplica(tableBucket))
+                .isInstanceOf(ReplicaManager.NoneReplica.class);
+
+        CompletableFuture<List<StopReplicaResultForBucket>> deletion = new CompletableFuture<>();
+        replicaManager.stopReplicas(
+                INITIAL_COORDINATOR_EPOCH,
+                Collections.singletonList(
+                        new StopReplicaData(
+                                tableBucket,
+                                true,
+                                false,
+                                INITIAL_COORDINATOR_EPOCH,
+                                INITIAL_LEADER_EPOCH)),
+                deletion::complete);
+        assertThat(deletion.get()).containsOnly(new StopReplicaResultForBucket(tableBucket));
+        assertThat(orphanLogDir).doesNotExist();
+
+        BulkLoadTargetMetadata freshIdentity =
+                new BulkLoadTargetMetadata(
+                        "/registration", tableBucket, 1, BulkLoadDataState.ACTIVE, null);
+        CompletableFuture<List<NotifyLeaderAndIsrResultForBucket>> recreation =
+                new CompletableFuture<>();
+        replicaManager.becomeLeaderOrFollower(
+                INITIAL_COORDINATOR_EPOCH,
+                Collections.singletonList(
+                        new NotifyLeaderAndIsrData(
+                                physicalTablePath,
+                                tableBucket,
+                                Collections.singletonList(TABLET_SERVER_ID),
+                                new LeaderAndIsr(
+                                        TABLET_SERVER_ID,
+                                        INITIAL_LEADER_EPOCH,
+                                        Collections.singletonList(TABLET_SERVER_ID),
+                                        Collections.emptyList(),
+                                        INITIAL_COORDINATOR_EPOCH,
+                                        INITIAL_LEADER_EPOCH),
+                                freshIdentity)),
+                recreation::complete);
+
+        assertThat(recreation.get())
+                .containsOnly(new NotifyLeaderAndIsrResultForBucket(tableBucket));
+        assertThat(replicaManager.getReplicaOrException(tableBucket).getBulkLoadTargetMetadata())
+                .isEqualTo(freshIdentity);
+    }
+
+    @Test
+    void testFailedLeaderRecoveryRevokesAccessAndSameEpochRetries() throws Exception {
+        AtomicBoolean snapshotUnknown = new AtomicBoolean();
+        RuntimeException exactFailure = new RuntimeException("snapshot store unavailable");
+        TestSnapshotContext snapshotContext =
+                new TestSnapshotContext(conf.getString(ConfigOptions.REMOTE_DATA_DIR)) {
+                    @Override
+                    public FunctionWithException<TableBucket, CompletedSnapshot, Exception>
+                            getLatestCompletedSnapshotProvider() {
+                        return ignored -> {
+                            if (snapshotUnknown.get()) {
+                                throw exactFailure;
+                            }
+                            return null;
+                        };
+                    }
+                };
+        Replica replica =
+                makeKvReplica(
+                        DATA1_PHYSICAL_TABLE_PATH_PK,
+                        new TableBucket(DATA1_TABLE_ID_PK, 1),
+                        snapshotContext);
+        makeKvReplicaAsLeader(replica, INITIAL_LEADER_EPOCH);
+        assertThat(replica.isLeader()).isTrue();
+        holdableKvFlushScheduler.holdFlushes();
+        replica.putRecordsToLeader(
+                genKvRecordBatch(Tuple2.of("k1", new Object[] {1, "uncommitted"})),
+                null,
+                MergeMode.DEFAULT,
+                0);
+
+        int retryEpoch = INITIAL_LEADER_EPOCH + 1;
+        snapshotUnknown.set(true);
+        assertThatThrownBy(() -> makeKvReplicaAsLeader(replica, retryEpoch))
+                .hasRootCause(exactFailure);
+        assertThat(replica.isLeader()).isFalse();
+        assertThat(replica.getLeaderEpoch()).isEqualTo(INITIAL_LEADER_EPOCH);
+        assertThat(replica.getKvTablet()).isNull();
+        assertThat(replica.getLogHighWatermark()).isLessThan(replica.getLocalLogEndOffset());
+
+        long highWatermarkBeforeStaleRequest = replica.getLogHighWatermark();
+        assertThatThrownBy(() -> makeKvReplicaAsLeader(replica, INITIAL_LEADER_EPOCH))
+                .isInstanceOf(NotLeaderOrFollowerException.class);
+        assertThat(replica.isLeader()).isFalse();
+        assertThat(replica.getLeaderEpoch()).isEqualTo(INITIAL_LEADER_EPOCH);
+        assertThat(replica.getKvTablet()).isNull();
+        assertThat(replica.getLogHighWatermark()).isEqualTo(highWatermarkBeforeStaleRequest);
+
+        snapshotUnknown.set(false);
+        makeKvReplicaAsLeader(replica, retryEpoch);
+        assertThat(replica.isLeader()).isTrue();
+        assertThat(replica.getLeaderEpoch()).isEqualTo(retryEpoch);
+        assertThat(replica.getKvTablet()).isNotNull();
     }
 
     @Test
@@ -639,6 +857,7 @@ final class ReplicaTest extends ReplicaTestBase {
         kvReplica = makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, tableBucket, testKvSnapshotContext);
         scheduledExecutorService = testKvSnapshotContext.scheduledExecutorService;
         kvSnapshotStore = testKvSnapshotContext.testKvSnapshotStore;
+        kvReplica.getLogTablet().updateHighWatermark(completedSnapshot1.getLogOffset());
         makeKvReplicaAsFollower(kvReplica, 1);
 
         // check the kv tablet should be null since it has become follower
@@ -705,6 +924,20 @@ final class ReplicaTest extends ReplicaTestBase {
     void testTransientMissingSnapshotExceptionKeepsHealthySnapshot(
             @TempDir File snapshotKvTabletDir) throws Exception {
         TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 1);
+        remoteLogManager.close();
+        conf.set(ConfigOptions.REMOTE_LOG_TASK_INTERVAL_DURATION, Duration.ofMinutes(1));
+        remoteLogStorage = new TestingRemoteLogStorage(conf, ioExecutor);
+        remoteLogTaskScheduler = new ManuallyTriggeredScheduledExecutorService();
+        remoteLogManager =
+                new RemoteLogManager(
+                        conf,
+                        zkClient,
+                        testCoordinatorGateway,
+                        localDiskManager,
+                        logManager,
+                        remoteLogStorage,
+                        remoteLogTaskScheduler,
+                        manualClock);
         TestSnapshotContext testKvSnapshotContext =
                 new TestSnapshotContext(snapshotKvTabletDir.getPath());
         ManuallyTriggeredScheduledExecutorService scheduledExecutorService =
@@ -732,6 +965,18 @@ final class ReplicaTest extends ReplicaTestBase {
                         .getFilePath();
         FsPath existingSnapshotFile = new FsPath(existingSnapshotFilePath);
         assertThat(existingSnapshotFile.getFileSystem().exists(existingSnapshotFile)).isTrue();
+
+        remoteLogManager.registerReplica(kvReplica);
+        remoteLogManager.startLogTiering(kvReplica);
+        kvReplica.getLogTablet().roll(Optional.empty());
+        putRecordsToLeader(kvReplica, genKvRecordBatch(Tuple2.of("k3", new Object[] {3, "c"})));
+        kvReplica.getLogTablet().roll(Optional.empty());
+        putRecordsToLeader(kvReplica, genKvRecordBatch(Tuple2.of("k4", new Object[] {4, "d"})));
+        kvReplica.getLogTablet().roll(Optional.empty());
+        kvReplica.getLogTablet().updateHighWatermark(kvReplica.getLocalLogEndOffset());
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        kvReplica.getLogTablet().updateMinRetainOffset(kvReplica.getLogHighWatermark());
+        assertThat(snapshot.getLogOffset()).isLessThan(kvReplica.getLocalLogStartOffset());
 
         makeKvReplicaAsFollower(kvReplica, 1);
 
@@ -780,7 +1025,10 @@ final class ReplicaTest extends ReplicaTestBase {
                         super.handleSnapshotBroken(snapshot);
                     }
                 };
+        conf.set(ConfigOptions.LOG_REPLICA_MIN_IN_SYNC_REPLICAS_NUMBER, 2);
         kvReplica = makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, tableBucket, testKvSnapshotContext);
+        assertThat(kvReplica.getLogHighWatermark()).isLessThan(snapshot.getLogOffset());
+        assertThat(snapshot.getLogOffset()).isLessThan(kvReplica.getLocalLogStartOffset());
         makeKvReplicaAsLeader(kvReplica, 2);
 
         assertThat(failNextDownload).isFalse();
@@ -904,6 +1152,7 @@ final class ReplicaTest extends ReplicaTestBase {
                     }
                 };
         kvReplica = makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, tableBucket, testKvSnapshotContext);
+        kvReplica.getLogTablet().updateHighWatermark(snapshot1.getLogOffset());
 
         // make it leader again - this should trigger the broken snapshot recovery logic
         // The system should detect that snapshot2 files are missing, clean up its metadata,

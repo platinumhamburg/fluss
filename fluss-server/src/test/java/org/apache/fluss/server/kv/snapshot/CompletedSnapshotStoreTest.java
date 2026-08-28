@@ -110,6 +110,107 @@ class CompletedSnapshotStoreTest {
     }
 
     @Test
+    void testAdoptAfterNodeConfirmedIsIdempotent() throws Exception {
+        AtomicInteger persistedHandles = new AtomicInteger();
+        TestCompletedSnapshotHandleStore handleStore =
+                builder.setAddFunction(
+                                ignored -> {
+                                    persistedHandles.incrementAndGet();
+                                    return null;
+                                })
+                        .build();
+        CompletedSnapshotStore store =
+                createCompletedSnapshotStore(2, handleStore, Collections.emptyList());
+        CompletedSnapshot snapshot = getSnapshot(17L);
+
+        store.adoptAfterNodeConfirmed(snapshot);
+        store.adoptAfterNodeConfirmed(snapshot);
+
+        assertThat(store.getAllSnapshots()).containsExactly(snapshot);
+        assertThat(persistedHandles).hasValue(0);
+    }
+
+    @Test
+    void testAdoptAfterNodeConfirmedRejectsConflictingIdentity() throws Exception {
+        CompletedSnapshotStore store =
+                createCompletedSnapshotStore(2, defaultHandleStore, Collections.emptyList());
+        CompletedSnapshot confirmed = getSnapshot(17L);
+        CompletedSnapshot conflicting =
+                new CompletedSnapshot(
+                        confirmed.getTableBucket(),
+                        confirmed.getSnapshotID(),
+                        new FsPath(tempDir.toString(), "conflicting_snapshot"),
+                        KvSnapshotHandle.restore(
+                                Collections.emptyList(), Collections.emptyList(), 0));
+
+        store.adoptAfterNodeConfirmed(confirmed);
+
+        assertThatThrownBy(() -> store.adoptAfterNodeConfirmed(conflicting))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Conflicting snapshot identity");
+        assertThat(store.getAllSnapshots()).containsExactly(confirmed);
+    }
+
+    @Test
+    void testSharedFilesAreRegisteredOnlyAfterNodeConfirmation() throws Exception {
+        SharedKvFileRegistry registry = new SharedKvFileRegistry();
+        CompletedSnapshot snapshot =
+                getSnapshotWithSharedFiles(
+                        17L,
+                        Collections.singletonList(
+                                KvFileHandleAndLocalPath.of(
+                                        new TestKvHandle("confirmed-shared.sst"),
+                                        "confirmed-shared.sst")));
+        CompletedSnapshotStore store =
+                new CompletedSnapshotStore(
+                        2,
+                        registry,
+                        Collections.emptyList(),
+                        defaultHandleStore,
+                        executorService,
+                        ignored -> false);
+
+        assertThat(registry.getFileSize()).isZero();
+
+        store.adoptAfterNodeConfirmed(snapshot);
+        store.adoptAfterNodeConfirmed(snapshot);
+
+        assertThat(registry.getFileSize()).isEqualTo(10L);
+        assertThat(store.getAllSnapshots()).containsExactly(snapshot);
+    }
+
+    @Test
+    void testFailedNodeCreationDoesNotRegisterSharedFiles() {
+        SharedKvFileRegistry registry = new SharedKvFileRegistry();
+        TestCompletedSnapshotHandleStore failingHandleStore =
+                builder.setAddFunction(
+                                ignored -> {
+                                    throw new FlussException("node creation failed");
+                                })
+                        .build();
+        CompletedSnapshotStore store =
+                new CompletedSnapshotStore(
+                        2,
+                        registry,
+                        Collections.emptyList(),
+                        failingHandleStore,
+                        executorService,
+                        ignored -> false);
+        CompletedSnapshot snapshot =
+                getSnapshotWithSharedFiles(
+                        18L,
+                        Collections.singletonList(
+                                KvFileHandleAndLocalPath.of(
+                                        new TestKvHandle("unconfirmed-shared.sst"),
+                                        "unconfirmed-shared.sst")));
+
+        assertThatThrownBy(() -> store.add(snapshot)).isInstanceOf(FlussException.class);
+
+        assertThat(registry.getFileSize()).isZero();
+        assertThat(store.getAllSnapshots()).isEmpty();
+    }
+
+    @Test
     void testAddSnapshotSuccessfullyShouldRemoveOldOnes() throws Exception {
         final int num = 1;
         final CompletableFuture<CompletedSnapshotHandle> addFuture = new CompletableFuture<>();

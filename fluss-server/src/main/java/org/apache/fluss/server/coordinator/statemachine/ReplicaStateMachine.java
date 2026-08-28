@@ -98,6 +98,11 @@ public class ReplicaStateMachine {
         LOG.info("Shutdown replica state machine.");
     }
 
+    /** Discards requests left by a state transition that failed before sending its batch. */
+    public void discardIncompleteBatch() {
+        coordinatorRequestBatch.discardIncompleteBatch();
+    }
+
     private Tuple2<Set<TableBucketReplica>, Set<TableBucketReplica>> initializeReplicaState() {
         Set<TableBucketReplica> onlineReplicas = new HashSet<>();
         Set<TableBucketReplica> offlineReplicas = new HashSet<>();
@@ -255,13 +260,13 @@ public class ReplicaStateMachine {
                 // first, send stop replica request to servers
                 validReplicas.forEach(
                         replica ->
-                                coordinatorRequestBatch.addStopReplicaRequestForTabletServers(
-                                        Collections.singleton(replica.getReplica()),
-                                        replica.getTableBucket(),
-                                        false,
-                                        false,
-                                        coordinatorContext.getBucketLeaderEpoch(
-                                                replica.getTableBucket())));
+                                coordinatorRequestBatch
+                                        .addLocalOnlyStopReplicaRequestForTabletServers(
+                                                Collections.singleton(replica.getReplica()),
+                                                replica.getTableBucket(),
+                                                false,
+                                                coordinatorContext.getBucketLeaderEpoch(
+                                                        replica.getTableBucket())));
 
                 // then, may remove the offline replica from isr
                 Map<TableBucketReplica, LeaderAndIsr> adjustedLeaderAndIsr =
@@ -316,11 +321,10 @@ public class ReplicaStateMachine {
                             int replicaServer = tableBucketReplica.getReplica();
                             // send stop replica request with deleteLocal = true and deleteRemote =
                             // false indicates the replica is migrated.
-                            coordinatorRequestBatch.addStopReplicaRequestForTabletServers(
+                            coordinatorRequestBatch.addLocalOnlyStopReplicaRequestForTabletServers(
                                     Collections.singleton(replicaServer),
                                     tableBucketReplica.getTableBucket(),
                                     true,
-                                    false,
                                     coordinatorContext.getBucketLeaderEpoch(
                                             tableBucketReplica.getTableBucket()));
                         });

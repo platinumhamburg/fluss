@@ -19,6 +19,7 @@ package org.apache.fluss.client;
 
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.admin.FlussAdmin;
+import org.apache.fluss.client.bulkload.BulkLoadClient;
 import org.apache.fluss.client.lookup.LookupClient;
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.client.table.FlussTable;
@@ -66,6 +67,7 @@ public final class FlussConnection implements Connection {
     private volatile RemoteFileDownloader remoteFileDownloader;
     private volatile SecurityTokenManager securityTokenManager;
     private volatile Admin admin;
+    private volatile BulkLoadClient bulkLoadClient;
 
     FlussConnection(Configuration conf) {
         this(conf, MetricRegistry.create(conf, null));
@@ -100,6 +102,18 @@ public final class FlussConnection implements Connection {
     @Override
     public Admin getAdmin() {
         return getOrCreateAdmin();
+    }
+
+    @Override
+    public BulkLoadClient getBulkLoadClient() {
+        if (bulkLoadClient == null) {
+            synchronized (this) {
+                if (bulkLoadClient == null) {
+                    bulkLoadClient = new BulkLoadClient(rpcClient, metadataUpdater);
+                }
+            }
+        }
+        return bulkLoadClient;
     }
 
     @Override

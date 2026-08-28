@@ -208,6 +208,13 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                     Map<Long, Map<Integer, BucketMetadata>> bucketMetadataMapForTables =
                             new HashMap<>(serverMetadataSnapshot.getBucketMetadataMapForTables());
 
+                    // Paths of the tables whose deletion markers are applied in this
+                    // update. Removing a table also invalidates every cached partition of
+                    // that table: partition entries are keyed by physical path, and their
+                    // own deletion markers may only arrive in later updates, when the table
+                    // mapping is already gone and the physical path can no longer be
+                    // resolved from the partition metadata alone.
+                    Set<TablePath> deletedTablePaths = new HashSet<>();
                     for (TableMetadata tableMetadata : clusterMetadata.getTableMetadataList()) {
                         TableInfo tableInfo = tableMetadata.getTableInfo();
                         TablePath tablePath = tableInfo.getTablePath();
@@ -224,10 +231,15 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                                 bucketMetadataMapForTables.remove(removedTableId);
                                 deletedTableIds.add(removedTableId);
                             }
-                        } else if (tablePath == DELETED_TABLE_PATH) {
+                            deletedTablePaths.add(tablePath);
+                        } else if (DELETED_TABLE_PATH.equals(tablePath)) {
                             serverMetadataSnapshot
                                     .getTablePath(tableId)
-                                    .ifPresent(tableIdByPath::remove);
+                                    .ifPresent(
+                                            removedPath -> {
+                                                tableIdByPath.remove(removedPath);
+                                                deletedTablePaths.add(removedPath);
+                                            });
                             bucketMetadataMapForTables.remove(tableId);
                             deletedTableIds.add(tableId);
                         } else {
@@ -255,6 +267,21 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                     Map<Long, Map<Integer, BucketMetadata>> bucketMetadataMapForPartitions =
                             new HashMap<>(
                                     serverMetadataSnapshot.getBucketMetadataMapForPartitions());
+
+                    for (TablePath deletedTablePath : deletedTablePaths) {
+                        partitionIdByPath
+                                .entrySet()
+                                .removeIf(
+                                        entry -> {
+                                            if (deletedTablePath.equals(
+                                                    entry.getKey().getTablePath())) {
+                                                bucketMetadataMapForPartitions.remove(
+                                                        entry.getValue());
+                                                return true;
+                                            }
+                                            return false;
+                                        });
+                    }
 
                     for (PartitionMetadata partitionMetadata :
                             clusterMetadata.getPartitionMetadataList()) {

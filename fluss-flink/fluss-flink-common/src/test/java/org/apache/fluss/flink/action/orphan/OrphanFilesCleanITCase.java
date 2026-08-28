@@ -17,14 +17,21 @@
 
 package org.apache.fluss.flink.action.orphan;
 
+import org.apache.fluss.bucketing.BucketingFunction;
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.Admin;
+import org.apache.fluss.client.bulkload.BulkLoadBucketWriter;
+import org.apache.fluss.client.bulkload.BulkLoadBuildContext;
+import org.apache.fluss.client.bulkload.BulkLoadClient;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
 import org.apache.fluss.flink.adapter.MultipleParameterToolAdapter;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.metadata.BulkLoadHandle;
+import org.apache.fluss.metadata.BulkLoadState;
+import org.apache.fluss.metadata.BulkLoadStatus;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.PartitionSpec;
@@ -34,6 +41,8 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketSnapshot;
@@ -74,7 +83,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.stream.Stream;
 
+import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** End-to-end tests for orphan files cleanup safety scenarios. */
@@ -162,6 +173,71 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
     }
 
     private static final Duration OLD_ENOUGH = Duration.ofDays(2);
+
+    @Test
+    void bulkLoadFilesRemainActiveUntilAbortCompletes() throws Exception {
+        String dbName = newDatabaseName("bulkload");
+        TablePath tablePath = createPrimaryKeyTable(dbName, "abort_cleanup", 3);
+        TableInfo tableInfo = admin.getTableInfo(tablePath).get();
+        FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableInfo.getTableId());
+
+        BulkLoadClient bulkLoadClient = connection.getBulkLoadClient();
+        BulkLoadBuildContext buildContext =
+                bulkLoadClient
+                        .begin(
+                                PhysicalTablePath.of(tablePath),
+                                java.util.UUID.randomUUID().toString(),
+                                null,
+                                Duration.ofMinutes(2))
+                        .getBuildContext();
+        BulkLoadHandle handle = buildContext.getHandle();
+        Path workDirectory = Files.createTempDirectory("fluss-bulkload-orphan-clean-");
+        KeyEncoder bucketKeyEncoder =
+                KeyEncoder.ofBucketKeyEncoder(
+                        tableInfo.getRowType(),
+                        tableInfo.getBucketKeys(),
+                        tableInfo.getTableConfig().getDataLakeFormat().orElse(null));
+        BucketingFunction bucketingFunction = BucketingFunction.of(null);
+        int nextId = 0;
+        for (int bucketId = 0; bucketId < tableInfo.getNumBuckets(); bucketId++) {
+            try (BulkLoadBucketWriter builder =
+                    new BulkLoadBucketWriter(buildContext, bucketId, workDirectory.toFile())) {
+                while (true) {
+                    InternalRow candidate =
+                            row(tableInfo.getRowType(), nextId++, "value-" + bucketId);
+                    int actualBucket =
+                            bucketingFunction.bucketing(
+                                    bucketKeyEncoder.encodeKey(candidate),
+                                    tableInfo.getNumBuckets());
+                    if (actualBucket == bucketId) {
+                        builder.add(candidate);
+                        break;
+                    }
+                }
+                builder.finish();
+            }
+        }
+        List<Path> standardFiles = new ArrayList<>();
+        for (int bucketId = 0; bucketId < tableInfo.getNumBuckets(); bucketId++) {
+            List<Path> bucketFiles = bulkLoadStandardFiles(buildContext, bucketId);
+            assertThat(bucketFiles)
+                    .anyMatch(path -> path.getFileName().toString().equals("_METADATA"));
+            standardFiles.addAll(bucketFiles);
+        }
+        assertThat(standardFiles).doesNotHaveDuplicates();
+
+        for (Path file : standardFiles) {
+            makeOld(file);
+        }
+
+        runCleanerForDatabase(false, dbName, "--allow-delete-manifest");
+        assertThat(standardFiles).allMatch(file -> Files.exists(file));
+
+        BulkLoadStatus aborted = bulkLoadClient.abort(handle);
+        assertThat(aborted.getState()).isEqualTo(BulkLoadState.ABORTED);
+        runCleanerForDatabase(false, dbName, "--allow-delete-manifest");
+        assertThat(standardFiles).noneMatch(file -> Files.exists(file));
+    }
 
     @Test
     @MultiVersionTest
@@ -281,9 +357,8 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
      * table. Returns the active segment's {@code .log} path so callers can assert it survives
      * cleanup.
      *
-     * <p>Without a manifest the bucket falls back to {@code ManifestReadStatus.NOT_LISTED} and the
-     * active-file cleanup skips the entire bucket (see §4.3.1 of the design doc) — which would
-     * prevent any orphan file under the bucket from being visited at all.
+     * <p>The manifest also establishes one active segment so tests can distinguish it from orphan
+     * files in the same bucket.
      */
     private Path seedActiveBucketManifest(TablePath tablePath) throws Exception {
         TableInfo tableInfo = admin.getTableInfo(tablePath).get();
@@ -576,7 +651,7 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
     }
 
     @Test
-    void kvUnitFailureDoesNotBlockLogCleanup() throws Exception {
+    void failedKvReferenceListingAbandonsWholePhysicalTarget() throws Exception {
         String dbName = newDatabaseName("crossflow");
         TablePath tablePath = createPrimaryKeyTable(dbName, "fail_kv_keep_log");
         TableInfo tableInfo = admin.getTableInfo(tablePath).get();
@@ -642,7 +717,8 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
                                         && m.contains(baselineOrphanKvSst.toString()));
         // Baseline: orphan log segment was DELETED and the active segment survived. Phase 1's
         // log deletion is asserted both via Files.exists and via the audit stream so the final
-        // phase-2 assertion can require TWO deletion events on the same path (one per phase).
+        // phase-2 assertion can require EXACTLY ONE deletion event on the same path (phase 2
+        // must not add another).
         assertThat(Files.exists(baselineOrphanLogSegment))
                 .as("phase 1 baseline: orphan log segment must be DELETED")
                 .isFalse();
@@ -663,7 +739,8 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
         // Re-plant orphan KV files under a DIFFERENT snap-77 dir so path-specific audit
         // assertions are unambiguous (phase-1 audits target snap-99, phase-2 audits
         // target snap-77). Re-plant the orphan log segment at its original path (phase 1
-        // deleted it) so we can verify log cleanup still proceeds when the KV unit fails.
+        // deleted it) so we can verify the whole physical target is abandoned — its log unit
+        // included — when KV active references cannot be listed consistently.
         // -----------------------------------------------------------------
         long faultInjectionOrphanSnapshotId = 77L;
         FsPath faultInjectionOrphanKvDir =
@@ -680,17 +757,17 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
         makeOld(faultInjectionOrphanKvSst);
 
         // Re-planted at the SAME path as baselineOrphanLogSegment (createOldSegmentFile uses a
-        // fixed UUID + filename), so the audit stream will contain TWO delete events targeting
-        // this path -- one from each phase. The final
-        // filteredOn(...).hasSizeGreaterThanOrEqualTo(2)
-        // assertion below verifies both.
+        // fixed UUID + filename). Under the fail-closed LIST_KV_SNAPSHOTS contract the audit
+        // stream keeps exactly ONE delete event for this path (phase 1's); the final
+        // filteredOn(...).hasSize(1) assertion below pins that phase 2 adds none.
         Path faultInjectionOrphanLogSegment =
                 createOldSegmentFile(tablePath, "99999999999999999999.log");
 
-        // Inject a non-numeric child znode under BucketSnapshotsZNode so server-side
-        // listBucketSnapshotIds throws NumberFormatException on Long.parseLong. Client-side
-        // fetchKvActiveSnapDirs propagates the exception and cleanActiveTableFiles catches it
-        // to emit skip_kv_target.
+        // Inject a non-numeric child znode under BucketSnapshotsZNode so the server-side
+        // snapshot-id listing hits NumberFormatException on Long.parseLong. The server fails
+        // closed: the bounded read-recheck retries keep failing and the RPC returns the
+        // retriable REQUEST_TIME_OUT error, so the cleaner emits skip_kv_target and abandons the
+        // whole physical target for this round (design doc section 14.1).
         ZooKeeperClient zk = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
         String invalidChildPath = BucketSnapshotsZNode.path(tableBucket) + "/not-a-long";
         zk.getCuratorClient().create().forPath(invalidChildPath, new byte[0]);
@@ -700,12 +777,16 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
             zk.getCuratorClient().delete().forPath(invalidChildPath);
         }
 
-        // KV target was skipped: skip_kv_target audit fires AND snap-77 orphan files preserved.
+        // KV reference listing failed: skip_kv_target audit fires AND snap-77 orphan files
+        // preserved.
         assertThat(auditMessages())
-                .as("phase 2: skip_kv_target audit must fire when LIST_KV_SNAPSHOTS RPC fails")
+                .as(
+                        "phase 2: skip_kv_target audit must fire when KV snapshot references "
+                                + "cannot be listed consistently")
                 .anyMatch(
                         m ->
                                 m.contains("action=skip_kv_target")
+                                        && m.contains("reason=RPC failure")
                                         && m.contains("table_id=" + tableInfo.getTableId()));
         assertThat(Files.exists(faultInjectionOrphanKvMetadata))
                 .as(
@@ -729,14 +810,19 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
                                         && m.contains("rule=kv-snapshot-file")
                                         && m.contains(faultInjectionOrphanKvSst.toString()));
 
-        // Log cleanup proceeded independently: orphan log segment DELETED, active preserved.
-        // The re-planted segment lives at the same path as baselineOrphanLogSegment, so the audit
-        // stream must contain >=2 deletion events for this path: one from phase 1, one from
-        // phase 2. anyMatch alone could be satisfied by phase 1's event in isolation, which is
-        // why we count instead.
+        // Fail-closed whole-target abandonment: a failed KV reference read abandons the
+        // ENTIRE physical target for the round, log unit included — a result-unknown BulkLoad
+        // commit may already have published remote log segments that a failed reference
+        // read cannot distinguish from orphans. The re-planted segment lives at the same path
+        // as baselineOrphanLogSegment, so the audit stream must contain exactly ONE deletion
+        // event for this path (phase 1's); anyMatch alone could be satisfied by phase 1's
+        // event in isolation, which is why we count instead.
         assertThat(Files.exists(faultInjectionOrphanLogSegment))
-                .as("phase 2: orphan log segment must be re-deleted (log cleanup is independent)")
-                .isFalse();
+                .as(
+                        "phase 2: orphan log segment must be PRESERVED (failed KV reference "
+                                + "listing abandons the whole physical target, design doc section"
+                                + " 14.1)")
+                .isTrue();
         assertThat(Files.exists(activeLogSegment))
                 .as("phase 2: active log segment must still survive cleanup")
                 .isTrue();
@@ -747,9 +833,9 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
                                         && m.contains("rule=log-segment")
                                         && m.contains(faultInjectionOrphanLogSegment.toString()))
                 .as(
-                        "orphan log segment must be deleted in both phase 1 (baseline) and "
-                                + "phase 2 (with KV fault) -- two events on the same path")
-                .hasSizeGreaterThanOrEqualTo(2);
+                        "orphan log segment must be deleted in phase 1 (baseline) only -- "
+                                + "phase 2 abandons the target before any deletion")
+                .hasSize(1);
     }
 
     @Test
@@ -842,6 +928,11 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
 
     private TablePath createPrimaryKeyTable(String databaseName, String tableName)
             throws Exception {
+        return createPrimaryKeyTable(databaseName, tableName, 1);
+    }
+
+    private TablePath createPrimaryKeyTable(String databaseName, String tableName, int bucketCount)
+            throws Exception {
         admin.createDatabase(databaseName, DatabaseDescriptor.EMPTY, true).get();
         TablePath tablePath = TablePath.of(databaseName, tableName);
         Schema schema =
@@ -851,7 +942,7 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
                         .primaryKey("id")
                         .build();
         TableDescriptor descriptor =
-                TableDescriptor.builder().schema(schema).distributedBy(1, "id").build();
+                TableDescriptor.builder().schema(schema).distributedBy(bucketCount, "id").build();
         admin.createTable(tablePath, descriptor, true).get();
         return tablePath;
     }
@@ -1128,6 +1219,29 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
 
     private static Path localPath(FsPath path) {
         return Paths.get(java.net.URI.create(path.toString()));
+    }
+
+    private static List<Path> bulkLoadStandardFiles(BulkLoadBuildContext context, int bucketId)
+            throws Exception {
+        List<Path> paths = new ArrayList<>();
+        BulkLoadHandle handle = context.getHandle();
+        TableBucket tableBucket =
+                new TableBucket(handle.getTableId(), handle.getPartitionId(), bucketId);
+        String remoteDataDir = context.getTableInfo().getRemoteDataDir();
+        addRegularFiles(
+                localPath(
+                        FlussPaths.remoteKvTabletDir(
+                                new FsPath(remoteDataDir, FlussPaths.REMOTE_KV_DIR_NAME),
+                                handle.getTarget(),
+                                tableBucket)),
+                paths);
+        return paths;
+    }
+
+    private static void addRegularFiles(Path root, List<Path> files) throws Exception {
+        try (Stream<Path> paths = Files.walk(root)) {
+            paths.filter(path -> Files.isRegularFile(path)).forEach(files::add);
+        }
     }
 
     private static String manifestJson(String segmentId, long startOffset, long endOffset) {

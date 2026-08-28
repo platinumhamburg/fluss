@@ -75,8 +75,6 @@ import org.apache.fluss.rpc.messages.PbTablePath;
 import org.apache.fluss.rpc.messages.TableExistsRequest;
 import org.apache.fluss.rpc.messages.TableExistsResponse;
 import org.apache.fluss.rpc.netty.server.Session;
-import org.apache.fluss.rpc.protocol.ApiKeys;
-import org.apache.fluss.rpc.protocol.ApiManager;
 import org.apache.fluss.security.acl.AclBinding;
 import org.apache.fluss.security.acl.AclBindingFilter;
 import org.apache.fluss.security.acl.OperationType;
@@ -95,6 +93,7 @@ import org.apache.fluss.server.utils.ServerRpcMessageUtils;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.PartitionRegistration;
+import org.apache.fluss.server.zk.data.ServerApiVersion;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
 
 import org.slf4j.Logger;
@@ -141,7 +140,7 @@ public abstract class RpcServiceBase extends RpcGatewayService implements AdminR
 
     private final FileSystem remoteFileSystem;
     private final ServerType provider;
-    private final ApiManager apiManager;
+    private final List<ServerApiVersion> apiVersions;
     protected final ZooKeeperClient zkClient;
     protected final MetadataManager metadataManager;
     protected final @Nullable Authorizer authorizer;
@@ -163,7 +162,7 @@ public abstract class RpcServiceBase extends RpcGatewayService implements AdminR
             ExecutorService ioExecutor) {
         this.remoteFileSystem = remoteFileSystem;
         this.provider = provider;
-        this.apiManager = new ApiManager(provider);
+        this.apiVersions = ServerApiVersionSupport.apiVersions(provider);
         this.zkClient = zkClient;
         this.metadataManager = metadataManager;
         this.authorizer = authorizer;
@@ -198,19 +197,23 @@ public abstract class RpcServiceBase extends RpcGatewayService implements AdminR
 
     @Override
     public CompletableFuture<ApiVersionsResponse> apiVersions(ApiVersionsRequest request) {
-        Set<ApiKeys> apiKeys = apiManager.enabledApis();
-        List<PbApiVersion> apiVersions = new ArrayList<>();
-        for (ApiKeys api : apiKeys) {
-            apiVersions.add(
+        List<PbApiVersion> pbApiVersions = new ArrayList<>();
+        for (ServerApiVersion apiVersion : apiVersions) {
+            pbApiVersions.add(
                     new PbApiVersion()
-                            .setApiKey(api.id)
-                            .setMinVersion(api.lowestSupportedVersion)
-                            .setMaxVersion(api.highestSupportedVersion));
+                            .setApiKey(apiVersion.getApiKey())
+                            .setMinVersion(apiVersion.getMinVersion())
+                            .setMaxVersion(apiVersion.getMaxVersion()));
         }
         ApiVersionsResponse response = new ApiVersionsResponse();
-        response.addAllApiVersions(apiVersions);
+        response.addAllApiVersions(pbApiVersions);
         response.setServerType(provider.toTypeId());
         return CompletableFuture.completedFuture(response);
+    }
+
+    /** Returns the immutable API ranges used by wire discovery and server registration. */
+    public List<ServerApiVersion> getApiVersions() {
+        return apiVersions;
     }
 
     @Override

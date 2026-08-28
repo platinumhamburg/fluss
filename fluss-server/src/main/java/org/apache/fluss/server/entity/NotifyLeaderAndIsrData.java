@@ -20,7 +20,10 @@ package org.apache.fluss.server.entity;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrRequest;
+import org.apache.fluss.server.tablet.bulkload.BulkLoadTargetMetadata;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
+
+import javax.annotation.Nullable;
 
 import java.util.List;
 
@@ -30,16 +33,27 @@ public final class NotifyLeaderAndIsrData {
     private final TableBucket tableBucket;
     private final List<Integer> replicas;
     private final LeaderAndIsr leaderAndIsr;
+    private final @Nullable BulkLoadTargetMetadata bulkLoadMetadata;
 
     public NotifyLeaderAndIsrData(
             PhysicalTablePath physicalTablePath,
             TableBucket tableBucket,
             List<Integer> replicas,
             LeaderAndIsr leaderAndIsr) {
+        this(physicalTablePath, tableBucket, replicas, leaderAndIsr, null);
+    }
+
+    public NotifyLeaderAndIsrData(
+            PhysicalTablePath physicalTablePath,
+            TableBucket tableBucket,
+            List<Integer> replicas,
+            LeaderAndIsr leaderAndIsr,
+            @Nullable BulkLoadTargetMetadata bulkLoadMetadata) {
         this.physicalTablePath = physicalTablePath;
         this.tableBucket = tableBucket;
         this.replicas = replicas;
         this.leaderAndIsr = leaderAndIsr;
+        this.bulkLoadMetadata = bulkLoadMetadata;
     }
 
     public PhysicalTablePath getPhysicalTablePath() {
@@ -84,6 +98,11 @@ public final class NotifyLeaderAndIsrData {
 
     public LeaderAndIsr getLeaderAndIsr() {
         return leaderAndIsr;
+    }
+
+    @Nullable
+    public BulkLoadTargetMetadata getBulkLoadMetadata() {
+        return bulkLoadMetadata;
     }
 
     public List<Integer> getStandbyReplicas() {

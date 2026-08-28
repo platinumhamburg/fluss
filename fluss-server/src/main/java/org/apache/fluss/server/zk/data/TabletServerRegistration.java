@@ -22,6 +22,8 @@ import org.apache.fluss.server.metadata.TabletServerResource;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
@@ -35,10 +37,17 @@ public class TabletServerRegistration {
     private final List<Endpoint> endpoints;
     private final long registerTimestamp;
     private final TabletServerResource resource;
+    private final List<ServerApiVersion> apiVersions;
 
+    /** Creates a tablet-server registration without resource or API capability information. */
     public TabletServerRegistration(
             @Nullable String rack, List<Endpoint> endpoints, long registerTimestamp) {
-        this(rack, endpoints, registerTimestamp, TabletServerResource.unknown());
+        this(
+                rack,
+                endpoints,
+                registerTimestamp,
+                TabletServerResource.unknown(),
+                Collections.emptyList());
     }
 
     public TabletServerRegistration(
@@ -46,10 +55,21 @@ public class TabletServerRegistration {
             List<Endpoint> endpoints,
             long registerTimestamp,
             TabletServerResource resource) {
+        this(rack, endpoints, registerTimestamp, resource, Collections.emptyList());
+    }
+
+    /** Creates a tablet-server registration with resource and API capability information. */
+    public TabletServerRegistration(
+            @Nullable String rack,
+            List<Endpoint> endpoints,
+            long registerTimestamp,
+            TabletServerResource resource,
+            List<ServerApiVersion> apiVersions) {
         this.rack = rack;
-        this.endpoints = endpoints;
+        this.endpoints = Collections.unmodifiableList(new ArrayList<>(endpoints));
         this.registerTimestamp = registerTimestamp;
         this.resource = resource;
+        this.apiVersions = ServerApiVersion.copyAndValidate(apiVersions);
     }
 
     public List<Endpoint> getEndpoints() {
@@ -68,6 +88,11 @@ public class TabletServerRegistration {
         return resource;
     }
 
+    /** Returns the immutable advertised API capabilities. */
+    public List<ServerApiVersion> getApiVersions() {
+        return apiVersions;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -80,12 +105,13 @@ public class TabletServerRegistration {
         return registerTimestamp == that.registerTimestamp
                 && Objects.equals(endpoints, that.endpoints)
                 && Objects.equals(rack, that.rack)
-                && Objects.equals(resource, that.resource);
+                && Objects.equals(resource, that.resource)
+                && Objects.equals(apiVersions, that.apiVersions);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(endpoints, registerTimestamp, rack, resource);
+        return Objects.hash(endpoints, registerTimestamp, rack, resource, apiVersions);
     }
 
     @Override
@@ -99,6 +125,8 @@ public class TabletServerRegistration {
                 + rack
                 + "', resource="
                 + resource
+                + ", apiVersions="
+                + apiVersions
                 + '}';
     }
 }

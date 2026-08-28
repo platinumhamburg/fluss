@@ -23,22 +23,36 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.security.acl.Resource;
 import org.apache.fluss.security.acl.ResourceType;
+import org.apache.fluss.server.zk.data.bulkload.BulkLoadTransaction;
+import org.apache.fluss.server.zk.data.bulkload.BulkLoadTransactionJsonSerde;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableJsonSerde;
 import org.apache.fluss.server.zk.data.lease.KvSnapshotLeaseMetadata;
 import org.apache.fluss.server.zk.data.lease.KvSnapshotLeaseMetadataJsonSerde;
 import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
 import org.apache.fluss.server.zk.data.producer.ProducerOffsetsJsonSerde;
+import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.core.JsonParser;
+import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
+import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.fluss.utils.json.JsonDeserializer;
 import org.apache.fluss.utils.json.JsonSerdeUtils;
 import org.apache.fluss.utils.types.Tuple2;
 
 import javax.annotation.Nullable;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.UUID;
+
+import static org.apache.fluss.utils.Preconditions.checkArgument;
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /** The data and path stored in ZooKeeper nodes (znodes). */
 public final class ZkData {
+
+    private static final ObjectMapper BULK_LOAD_OBJECT_MAPPER = createBulkLoadObjectMapper();
 
     // ------------------------------------------------------------------------------------------
     // ZNodes under "/metadata/"
@@ -427,6 +441,28 @@ public final class ZkData {
 
         public static TabletServerRegistration decode(byte[] json) {
             return JsonSerdeUtils.readValue(json, TabletServerRegistrationJsonSerde.INSTANCE);
+        }
+    }
+
+    /** Parent for TabletServer ZooKeeper-session fences used by BulkLoad commands. */
+    public static final class TabletServerSessionFencesZNode {
+        public static String path() {
+            return "/tabletservers/session-fences";
+        }
+    }
+
+    /** Ephemeral proof that a TabletServer registration belongs to one exact ZooKeeper session. */
+    public static final class TabletServerSessionFenceZNode {
+        public static String path(int serverId, long sessionId) {
+            return TabletServerSessionFencesZNode.path()
+                    + "/"
+                    + serverId
+                    + "-"
+                    + Long.toUnsignedString(sessionId, 16);
+        }
+
+        public static byte[] encode() {
+            return new byte[0];
         }
     }
 
@@ -904,6 +940,99 @@ public final class ZkData {
     }
 
     // ------------------------------------------------------------------------------------------
+    // ZNodes under "/bulk_load/"
+    // ------------------------------------------------------------------------------------------
+
+    /** Root znode for all BulkLoad metadata. */
+    public static final class BulkLoadZNode {
+        public static String path() {
+            return "/bulk_load";
+        }
+    }
+
+    /** Static parent of all BulkLoad transactions. */
+    public static final class BulkLoadTransactionsZNode {
+        public static String path() {
+            return BulkLoadZNode.path() + "/transactions";
+        }
+    }
+
+    /** Static table-transaction parent and per-table transaction collection. */
+    public static final class BulkLoadTableTransactionsZNode {
+        public static String path() {
+            return BulkLoadTransactionsZNode.path() + "/tables";
+        }
+
+        public static String path(long tableId) {
+            return path() + "/" + requireNonNegativeId(tableId, "table ID");
+        }
+
+        @Nullable
+        public static Long parsePath(String zkPath) {
+            return parseCollectionPath(zkPath, path());
+        }
+    }
+
+    /** Static partition-transaction parent and per-partition transaction collection. */
+    public static final class BulkLoadPartitionTransactionsZNode {
+        public static String path() {
+            return BulkLoadTransactionsZNode.path() + "/partitions";
+        }
+
+        public static String path(long partitionId) {
+            return path() + "/" + requireNonNegativeId(partitionId, "partition ID");
+        }
+
+        @Nullable
+        public static Long parsePath(String zkPath) {
+            return parseCollectionPath(zkPath, path());
+        }
+    }
+
+    /** One non-partitioned table BulkLoad transaction root. */
+    public static final class BulkLoadTableTransactionZNode {
+        public static String path(long tableId, String bulkLoadId) {
+            return transactionPath(BulkLoadTableTransactionsZNode.path(), tableId, bulkLoadId);
+        }
+
+        @Nullable
+        public static Tuple2<Long, String> parsePath(String zkPath) {
+            return parseTransactionPath(zkPath, BulkLoadTableTransactionsZNode.path(), null);
+        }
+
+        public static byte[] encode(BulkLoadTransaction transaction) {
+            return JsonSerdeUtils.writeValueAsBytes(
+                    transaction, BulkLoadTransactionJsonSerde.INSTANCE);
+        }
+
+        public static BulkLoadTransaction decode(byte[] json) {
+            return readBulkLoadValue(json, BulkLoadTransactionJsonSerde.INSTANCE);
+        }
+    }
+
+    /** One partition BulkLoad transaction root. */
+    public static final class BulkLoadPartitionTransactionZNode {
+        public static String path(long partitionId, String bulkLoadId) {
+            return transactionPath(
+                    BulkLoadPartitionTransactionsZNode.path(), partitionId, bulkLoadId);
+        }
+
+        @Nullable
+        public static Tuple2<Long, String> parsePath(String zkPath) {
+            return parseTransactionPath(zkPath, BulkLoadPartitionTransactionsZNode.path(), null);
+        }
+
+        public static byte[] encode(BulkLoadTransaction transaction) {
+            return JsonSerdeUtils.writeValueAsBytes(
+                    transaction, BulkLoadTransactionJsonSerde.INSTANCE);
+        }
+
+        public static BulkLoadTransaction decode(byte[] json) {
+            return readBulkLoadValue(json, BulkLoadTransactionJsonSerde.INSTANCE);
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
     // ZNodes under "/producers/"
     // ------------------------------------------------------------------------------------------
 
@@ -998,6 +1127,119 @@ public final class ZkData {
 
         public static KvSnapshotLeaseMetadata decode(byte[] json) {
             return JsonSerdeUtils.readValue(json, KvSnapshotLeaseMetadataJsonSerde.INSTANCE);
+        }
+    }
+
+    private static String transactionPath(String prefix, long targetId, String bulkLoadId) {
+        return prefix
+                + "/"
+                + requireNonNegativeId(targetId, "target ID")
+                + "/"
+                + requireCanonicalBulkLoadId(bulkLoadId);
+    }
+
+    private static long requireNonNegativeId(long id, String name) {
+        checkArgument(id >= 0, "BulkLoad %s must be non-negative.", name);
+        return id;
+    }
+
+    @Nullable
+    private static Long parseCollectionPath(String zkPath, String prefix) {
+        if (zkPath == null || !zkPath.startsWith(prefix + "/")) {
+            return null;
+        }
+        String fragment = zkPath.substring(prefix.length() + 1);
+        if (fragment.indexOf('/') >= 0) {
+            return null;
+        }
+        return parseCanonicalLong(fragment);
+    }
+
+    @Nullable
+    private static Tuple2<Long, String> parseTransactionPath(
+            String zkPath, String prefix, @Nullable String suffix) {
+        if (zkPath == null || !zkPath.startsWith(prefix + "/")) {
+            return null;
+        }
+        String[] fragments = zkPath.substring(prefix.length() + 1).split("/", -1);
+        int expectedLength = suffix == null ? 2 : 3;
+        if (fragments.length != expectedLength
+                || (suffix != null && !suffix.equals(fragments[2]))) {
+            return null;
+        }
+        Long targetId = parseCanonicalLong(fragments[0]);
+        String bulkLoadId = parseCanonicalBulkLoadId(fragments[1]);
+        return targetId == null || bulkLoadId == null ? null : Tuple2.of(targetId, bulkLoadId);
+    }
+
+    @Nullable
+    private static Long parseCanonicalLong(String fragment) {
+        if (!isCanonicalNonNegativeNumber(fragment)) {
+            return null;
+        }
+        try {
+            return Long.parseLong(fragment);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private static boolean isCanonicalNonNegativeNumber(String fragment) {
+        if (fragment == null || fragment.isEmpty()) {
+            return false;
+        }
+        if (fragment.length() > 1 && fragment.charAt(0) == '0') {
+            return false;
+        }
+        for (int i = 0; i < fragment.length(); i++) {
+            char character = fragment.charAt(i);
+            if (character < '0' || character > '9') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    @Nullable
+    private static String parseCanonicalBulkLoadId(String fragment) {
+        try {
+            return requireCanonicalBulkLoadId(fragment);
+        } catch (IllegalArgumentException | NullPointerException e) {
+            return null;
+        }
+    }
+
+    private static String requireCanonicalBulkLoadId(String bulkLoadId) {
+        String canonical = UUID.fromString(checkNotNull(bulkLoadId)).toString();
+        checkArgument(canonical.equals(bulkLoadId), "BulkLoad ID must be a canonical UUID.");
+        return bulkLoadId;
+    }
+
+    private static ObjectMapper createBulkLoadObjectMapper() {
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
+        return mapper;
+    }
+
+    private static <T> T readBulkLoadValue(byte[] json, JsonDeserializer<T> deserializer) {
+        checkArgument(json != null, "BulkLoad JSON must not be null.");
+        checkArgument(
+                json.length < 3
+                        || json[0] != (byte) 0xEF
+                        || json[1] != (byte) 0xBB
+                        || json[2] != (byte) 0xBF,
+                "BulkLoad JSON must not contain a UTF-8 BOM.");
+        try (JsonParser parser = BULK_LOAD_OBJECT_MAPPER.getFactory().createParser(json)) {
+            JsonNode node = BULK_LOAD_OBJECT_MAPPER.readTree(parser);
+            if (node == null) {
+                throw new IOException("No BulkLoad JSON content.");
+            }
+            if (parser.nextToken() != null) {
+                throw new IOException("Trailing content after BulkLoad JSON value.");
+            }
+            return deserializer.deserialize(node);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
         }
     }
 }

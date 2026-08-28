@@ -34,7 +34,7 @@ import java.util.Set;
  * LogActiveRefsFetchResult}. KV has no per-bucket failure dimension because the {@code
  * LIST_KV_SNAPSHOTS} RPC returns snapshot ids directly (no second-read of an external file), so the
  * per-bucket payload is just {@code Map<Integer, Set<String>>} of {@code snap-{id}} directory
- * names. Buckets absent from the map are treated by the consumer as "empty active set → skip".
+ * names. Buckets absent from the map have an empty active set after a successful target listing.
  */
 @Internal
 public final class KvActiveRefsFetchResult {
@@ -78,13 +78,9 @@ public final class KvActiveRefsFetchResult {
      * Per-bucket active snapshot directory names ({@code snap-{id}}). Empty map when {@link
      * #listOk()} is false.
      *
-     * <p><b>Bucket absent from the map means "the RPC returned no active-snapshot entries for this
-     * bucket"</b>, which the consumer must treat as "cannot prove what is active here → skip KV
-     * cleanup for this bucket and emit {@code skip_kv_bucket reason=empty_active_set}". Empty does
-     * not mean "no active snapshots exist": the server enumerates buckets from ZK and that path can
-     * transiently underreport (partial reads, znode creation lag, stale historical bucket counts),
-     * so treating empty as no-op-skip is the only response compatible with the action's "may leak,
-     * must not mis-delete" hard constraint.
+     * <p>A bucket absent from the map has no active snapshot at the successful listing point. The
+     * cleaner still applies its age threshold, so files created concurrently with the listing are
+     * not eligible for deletion.
      */
     public Map<Integer, Set<String>> activeSnapDirsByBucket() {
         return activeSnapDirsByBucket;

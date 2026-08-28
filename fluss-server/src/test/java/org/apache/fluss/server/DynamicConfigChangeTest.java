@@ -54,6 +54,11 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -140,6 +145,110 @@ public class DynamicConfigChangeTest {
         DynamicConfigManager manager = new DynamicConfigManager(zookeeperClient, configuration);
         managers.add(manager);
         return manager;
+    }
+
+    @Test
+    void testOnlyActiveTransactionLimitIsDynamic() {
+        DynamicServerConfig dynamicServerConfig = new DynamicServerConfig(new Configuration());
+
+        assertThat(
+                        dynamicServerConfig.isAllowedConfig(
+                                ConfigOptions.BULKLOAD_MAX_ACTIVE_TRANSACTIONS.key()))
+                .isTrue();
+        assertThat(dynamicServerConfig.isAllowedConfig("bulkload.future-option")).isFalse();
+        assertThat(
+                        dynamicServerConfig.isAllowedConfig(
+                                ConfigOptions.BULKLOAD_RESULT_RETENTION.key()))
+                .isFalse();
+        assertThat(dynamicServerConfig.isAllowedConfig("bulk.enabled")).isFalse();
+        assertThat(dynamicServerConfig.isAllowedConfig("bulkloader.max-active-transactions"))
+                .isFalse();
+        assertThat(dynamicServerConfig.isAllowedConfig("xbulkload.max-active-transactions"))
+                .isFalse();
+        assertThat(dynamicServerConfig.isAllowedConfig("unknown.key")).isFalse();
+    }
+
+    @Test
+    void testRegisterAndReplayUsesOneEffectiveConfigurationBoundary() throws Exception {
+        zookeeperClient.upsertServerEntityConfig(
+                Collections.singletonMap(
+                        ConfigOptions.BULKLOAD_MAX_ACTIVE_TRANSACTIONS.key(), "17"));
+        DynamicConfigManager manager = createListeningManager(new Configuration());
+        manager.startup();
+        AtomicReference<Configuration> applied = new AtomicReference<>();
+        ServerReconfigurable listener =
+                new ServerReconfigurable() {
+                    @Override
+                    public void validate(Configuration newConfig) {}
+
+                    @Override
+                    public void reconfigure(Configuration newConfig) {
+                        applied.set(new Configuration(newConfig));
+                    }
+                };
+
+        manager.registerAndReplay(listener);
+
+        assertThat(applied.get().get(ConfigOptions.BULKLOAD_MAX_ACTIVE_TRANSACTIONS)).isEqualTo(17);
+    }
+
+    @Test
+    void testRegisterReplayDoesNotLoseConcurrentBulkLoadLimitUpdate() throws Exception {
+        Configuration initial = new Configuration();
+        initial.set(ConfigOptions.BULKLOAD_MAX_ACTIVE_TRANSACTIONS, 101);
+        initial.set(ConfigOptions.REMOTE_DATA_DIR, DEFAULT_REMOTE_DATA_DIR);
+        DynamicServerConfig config = new DynamicServerConfig(initial);
+        CountDownLatch replayEntered = new CountDownLatch(1);
+        CountDownLatch releaseReplay = new CountDownLatch(1);
+        CountDownLatch updateStarted = new CountDownLatch(1);
+        List<Integer> applied = Collections.synchronizedList(new ArrayList<>());
+        ServerReconfigurable listener =
+                new ServerReconfigurable() {
+                    @Override
+                    public void validate(Configuration newConfig) {}
+
+                    @Override
+                    public void reconfigure(Configuration newConfig) {
+                        applied.add(newConfig.get(ConfigOptions.BULKLOAD_MAX_ACTIVE_TRANSACTIONS));
+                        if (replayEntered.getCount() > 0) {
+                            replayEntered.countDown();
+                            try {
+                                assertThat(releaseReplay.await(10, TimeUnit.SECONDS)).isTrue();
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                throw new AssertionError(e);
+                            }
+                        }
+                    }
+                };
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> replay = executor.submit(() -> config.registerAndReplay(listener));
+            assertThat(replayEntered.await(10, TimeUnit.SECONDS)).isTrue();
+            Future<?> update =
+                    executor.submit(
+                            () -> {
+                                updateStarted.countDown();
+                                config.updateDynamicConfig(
+                                        Collections.singletonMap(
+                                                ConfigOptions.BULKLOAD_MAX_ACTIVE_TRANSACTIONS
+                                                        .key(),
+                                                "17"),
+                                        false);
+                                return null;
+                            });
+            assertThat(updateStarted.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(update).isNotDone();
+
+            releaseReplay.countDown();
+
+            replay.get(10, TimeUnit.SECONDS);
+            update.get(10, TimeUnit.SECONDS);
+            assertThat(applied).containsExactly(101, 17);
+        } finally {
+            releaseReplay.countDown();
+            executor.shutdownNow();
+        }
     }
 
     @Test

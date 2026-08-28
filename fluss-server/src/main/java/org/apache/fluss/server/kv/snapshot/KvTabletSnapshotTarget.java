@@ -29,15 +29,19 @@ import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FlussPaths;
+import org.apache.fluss.utils.types.Tuple2;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
 import java.io.IOException;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executor;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -71,6 +75,11 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
     private final Consumer<Long> updateMinRetainOffset;
     private final Supplier<Integer> bucketLeaderEpochSupplier;
     private final Supplier<Integer> coordinatorEpochSupplier;
+    private final @Nullable Supplier<Tuple2<String, Integer>> sourceMetadataSupplier;
+
+    /** Metadata identities are frozen by snapshot ID before asynchronous snapshot I/O starts. */
+    private final ConcurrentMap<Long, Optional<Tuple2<String, Integer>>> frozenSourceMetadata =
+            new ConcurrentHashMap<>();
 
     private final SnapshotRunner snapshotRunner;
 
@@ -116,7 +125,8 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
                 bucketLeaderEpochSupplier,
                 coordinatorEpochSupplier,
                 logOffsetOfLatestSnapshot,
-                snapshotSize);
+                snapshotSize,
+                null);
     }
 
     public KvTabletSnapshotTarget(
@@ -136,6 +146,43 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
             long logOffsetOfLatestSnapshot,
             long snapshotSize)
             throws IOException {
+        this(
+                tableBucket,
+                completedKvSnapshotCommitter,
+                zooKeeperClient,
+                rocksIncrementalSnapshot,
+                remoteKvTabletDir,
+                snapshotWriteBufferSize,
+                ioExecutor,
+                cancelStreamRegistry,
+                snapshotIdCounter,
+                tabletStateSupplier,
+                updateMinRetainOffset,
+                bucketLeaderEpochSupplier,
+                coordinatorEpochSupplier,
+                logOffsetOfLatestSnapshot,
+                snapshotSize,
+                null);
+    }
+
+    public KvTabletSnapshotTarget(
+            TableBucket tableBucket,
+            CompletedKvSnapshotCommitter completedKvSnapshotCommitter,
+            @Nonnull ZooKeeperClient zooKeeperClient,
+            RocksIncrementalSnapshot rocksIncrementalSnapshot,
+            FsPath remoteKvTabletDir,
+            int snapshotWriteBufferSize,
+            Executor ioExecutor,
+            CloseableRegistry cancelStreamRegistry,
+            SequenceIDCounter snapshotIdCounter,
+            Supplier<TabletState> tabletStateSupplier,
+            Consumer<Long> updateMinRetainOffset,
+            Supplier<Integer> bucketLeaderEpochSupplier,
+            Supplier<Integer> coordinatorEpochSupplier,
+            long logOffsetOfLatestSnapshot,
+            long snapshotSize,
+            @Nullable Supplier<Tuple2<String, Integer>> sourceMetadataSupplier)
+            throws IOException {
         this.tableBucket = tableBucket;
         this.completedKvSnapshotCommitter = completedKvSnapshotCommitter;
         this.zooKeeperClient = zooKeeperClient;
@@ -149,6 +196,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
         this.updateMinRetainOffset = updateMinRetainOffset;
         this.bucketLeaderEpochSupplier = bucketLeaderEpochSupplier;
         this.coordinatorEpochSupplier = coordinatorEpochSupplier;
+        this.sourceMetadataSupplier = sourceMetadataSupplier;
         this.logOffsetOfLatestSnapshot = logOffsetOfLatestSnapshot;
         this.snapshotSize = snapshotSize;
         this.ioExecutor = ioExecutor;
@@ -184,8 +232,11 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
         // get the bucket leader and coordinator epoch when the snapshot is triggered
         int bucketLeaderEpoch = bucketLeaderEpochSupplier.get();
         int coordinatorEpoch = coordinatorEpochSupplier.get();
-        SnapshotLocation snapshotLocation = initSnapshotLocation(currentSnapshotId);
+        Tuple2<String, Integer> sourceMetadata = freezeSourceMetadata();
+        frozenSourceMetadata.put(currentSnapshotId, Optional.ofNullable(sourceMetadata));
+        SnapshotLocation snapshotLocation = null;
         try {
+            snapshotLocation = initSnapshotLocation(currentSnapshotId);
             PeriodicSnapshotManager.SnapshotRunnable snapshotRunnable =
                     new PeriodicSnapshotManager.SnapshotRunnable(
                             snapshotRunner.snapshot(
@@ -196,8 +247,11 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
                             snapshotLocation);
             return Optional.of(snapshotRunnable);
         } catch (Exception t) {
+            frozenSourceMetadata.remove(currentSnapshotId);
             // dispose the snapshot location
-            snapshotLocation.disposeOnFailure();
+            if (snapshotLocation != null) {
+                snapshotLocation.disposeOnFailure();
+            }
             throw t;
         }
     }
@@ -234,8 +288,14 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
                         tabletState.getAutoIncIDRanges());
         try {
             // commit the completed snapshot
+            Optional<Tuple2<String, Integer>> frozen = frozenSourceMetadata.remove(snapshotId);
+            Tuple2<String, Integer> sourceMetadata = frozen == null ? null : frozen.orElse(null);
             completedKvSnapshotCommitter.commitKvSnapshot(
-                    completedSnapshot, coordinatorEpoch, bucketLeaderEpoch);
+                    completedSnapshot,
+                    coordinatorEpoch,
+                    bucketLeaderEpoch,
+                    sourceMetadata == null ? null : sourceMetadata.f0,
+                    sourceMetadata == null ? null : sourceMetadata.f1);
             // update local state after successful commit
             updateStateOnCommitSuccess(snapshotId, snapshotResult);
         } catch (Exception e) {
@@ -249,6 +309,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
     @Override
     public void handleSnapshotFailure(
             long snapshotId, SnapshotLocation snapshotLocation, Throwable cause) {
+        frozenSourceMetadata.remove(snapshotId);
         LOG.warn(
                 "Snapshot {} failure or cancellation for TableBucket {}.",
                 snapshotId,
@@ -267,6 +328,20 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
     @VisibleForTesting
     protected RocksIncrementalSnapshot getRocksIncrementalSnapshot() {
         return rocksIncrementalSnapshot;
+    }
+
+    private @Nullable Tuple2<String, Integer> freezeSourceMetadata() {
+        if (sourceMetadataSupplier == null) {
+            return null;
+        }
+        Tuple2<String, Integer> source = sourceMetadataSupplier.get();
+        if (source == null) {
+            return null;
+        }
+        if (source.f0 == null || source.f0.isEmpty() || source.f1 == null || source.f1 < 0) {
+            throw new IllegalStateException("Periodic KV snapshot source metadata is invalid.");
+        }
+        return source;
     }
 
     /**

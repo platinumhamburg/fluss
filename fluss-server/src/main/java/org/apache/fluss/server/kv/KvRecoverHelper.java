@@ -144,6 +144,7 @@ public class KvRecoverHelper {
                     readLogRecordsAndApply(
                             nextLogOffset,
                             localLogStartOffset,
+                            Math.max(nextLogOffset, logTablet.getHighWatermark()),
                             rowCountUpdater,
                             autoIncIdRangeUpdater,
                             FetchIsolation.HIGH_WATERMARK,
@@ -177,6 +178,7 @@ public class KvRecoverHelper {
         readLogRecordsAndApply(
                 nextLogOffset,
                 localLogStartOffset,
+                logTablet.localLogEndOffset(),
                 // records in pre-write-buffer shouldn't affect the row count, the high-watermark
                 // of pre-write-buffer records will update the row-count async
                 new NoOpRowCountUpdater(),
@@ -199,11 +201,15 @@ public class KvRecoverHelper {
     private long readLogRecordsAndApply(
             long startFetchOffset,
             long localLogStartOffset,
+            long targetOffset,
             RowCountUpdater rowCountUpdater,
             AutoIncIDRangeUpdater autoIncIdRangeUpdater,
             FetchIsolation fetchIsolation,
             ThrowingConsumer<KeyValueAndLogOffset, Exception> resumeRecordConsumer)
             throws Exception {
+        if (startFetchOffset == targetOffset) {
+            return startFetchOffset;
+        }
         try (LogRecordReadContext readContext = createLogRecordReadContext()) {
             long nextFetchOffset = startFetchOffset;
             while (true) {
@@ -228,6 +234,11 @@ public class KvRecoverHelper {
                 }
 
                 for (LogRecordBatch logRecordBatch : batches) {
+                    requireContinuousBatch(
+                            nextFetchOffset,
+                            logRecordBatch.baseLogOffset(),
+                            logRecordBatch.nextLogOffset(),
+                            targetOffset);
                     nextFetchOffset =
                             applyLogRecordBatch(
                                     logRecordBatch,
@@ -237,7 +248,41 @@ public class KvRecoverHelper {
                                     resumeRecordConsumer);
                 }
             }
+            if (nextFetchOffset != targetOffset) {
+                throw new IllegalStateException(
+                        String.format(
+                                "KV recovery log coverage ended at %s instead of required offset %s.",
+                                nextFetchOffset, targetOffset));
+            }
             return nextFetchOffset;
+        }
+    }
+
+    /** Verifies and advances one exact recovery batch boundary. */
+    public static long requireContinuousBatch(
+            long expectedNextOffset,
+            long batchBaseOffset,
+            long batchNextOffset,
+            long targetOffset) {
+        if (batchBaseOffset != expectedNextOffset
+                || batchNextOffset <= batchBaseOffset
+                || batchNextOffset > targetOffset) {
+            throw new IllegalStateException(
+                    String.format(
+                            "Discontinuous KV recovery batch: expected %s, found %s with next %s and target %s.",
+                            expectedNextOffset, batchBaseOffset, batchNextOffset, targetOffset));
+        }
+        return batchNextOffset;
+    }
+
+    /** Requires one recovery phase to end at its exact handoff offset. */
+    public static void requireExactRecoveryOffset(
+            long expectedOffset, long actualOffset, String boundary) {
+        if (actualOffset != expectedOffset) {
+            throw new IllegalStateException(
+                    String.format(
+                            "KV recovery %s ended at %s instead of required offset %s.",
+                            boundary, actualOffset, expectedOffset));
         }
     }
 

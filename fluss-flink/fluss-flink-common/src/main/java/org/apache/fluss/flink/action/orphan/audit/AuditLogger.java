@@ -118,7 +118,8 @@ public final class AuditLogger {
 
     /**
      * Skip KV cleanup for one (tableId, partitionId) target — emitted when {@code ListKvSnapshots}
-     * fails after retries. {@code partitionId} is null for non-partitioned tables.
+     * fails after retries or, since LIST_KV_SNAPSHOTS v1, returns a reference set whose
+     * completeness cannot be proven. {@code partitionId} is null for non-partitioned tables.
      */
     public void logSkipKvTarget(long tableId, Long partitionId, String reason) {
         AUDIT.warn(
@@ -126,21 +127,6 @@ public final class AuditLogger {
                 reason,
                 tableId,
                 partitionId,
-                Instant.now());
-    }
-
-    /**
-     * Skip KV cleanup for a single bucket whose {@code ListKvSnapshots} response carried no
-     * active-snapshot entries. Empty per-bucket active set is treated as "cannot prove what is
-     * active" and the bucket is skipped to avoid mis-deletion.
-     */
-    public void logSkipKvBucket(long tableId, Long partitionId, int bucketId, String reason) {
-        AUDIT.warn(
-                "action=skip_kv_bucket reason={} table_id={} partition_id={} bucket_id={} ts={}",
-                reason,
-                tableId,
-                partitionId,
-                bucketId,
                 Instant.now());
     }
 
@@ -155,20 +141,6 @@ public final class AuditLogger {
                 reason,
                 tableId,
                 partitionId,
-                Instant.now());
-    }
-
-    /**
-     * Skip log cleanup for a single bucket whose remote manifest was not returned by the {@code
-     * ListRemoteLogManifests} RPC (the bucket has not yet committed any remote manifest).
-     */
-    public void logSkipLogBucket(long tableId, Long partitionId, int bucketId, String reason) {
-        AUDIT.warn(
-                "action=skip_log_bucket reason={} table_id={} partition_id={} bucket_id={} ts={}",
-                reason,
-                tableId,
-                partitionId,
-                bucketId,
                 Instant.now());
     }
 

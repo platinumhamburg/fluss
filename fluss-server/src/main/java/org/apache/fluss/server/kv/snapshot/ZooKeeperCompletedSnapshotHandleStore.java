@@ -25,6 +25,8 @@ import org.apache.fluss.utils.types.Tuple2;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
@@ -80,6 +82,38 @@ public class ZooKeeperCompletedSnapshotHandleStore implements CompletedSnapshotH
         } finally {
             if (!success) {
                 // Cleanup the snapshot metadata handle if it was not written to zookeeper
+                snapshotHandle.discard();
+            }
+        }
+    }
+
+    @Override
+    public void add(
+            TableBucket tableBucket,
+            long snapshotId,
+            CompletedSnapshotHandle snapshotHandle,
+            @Nullable String sourceMetadataPath,
+            @Nullable Integer sourceMetadataVersion,
+            int coordinatorZkVersion,
+            int leaderAndIsrZkVersion)
+            throws Exception {
+        checkNotNull(snapshotHandle, "completed snapshot handle");
+
+        boolean success = false;
+        try {
+            client.registerTableBucketSnapshot(
+                    tableBucket,
+                    new BucketSnapshot(
+                            snapshotId,
+                            snapshotHandle.getLogOffset(),
+                            snapshotHandle.getMetadataFilePath().toString()),
+                    sourceMetadataPath,
+                    sourceMetadataVersion,
+                    coordinatorZkVersion,
+                    leaderAndIsrZkVersion);
+            success = true;
+        } finally {
+            if (!success) {
                 snapshotHandle.discard();
             }
         }

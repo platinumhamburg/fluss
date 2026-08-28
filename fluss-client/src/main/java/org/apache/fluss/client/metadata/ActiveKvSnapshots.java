@@ -30,7 +30,7 @@ import java.util.Set;
  * Per-bucket active KV snapshot ids for a table or partition scope. The active set is the union of
  * retained snapshots and lease-pinned (still-in-use) snapshots reported by the coordinator.
  *
- * @since 1.0
+ * @since 1.1
  */
 @PublicEvolving
 public final class ActiveKvSnapshots {

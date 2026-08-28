@@ -31,6 +31,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.entity.RegisterTableBucketLeadAndIsrInfo;
+import org.apache.fluss.server.zk.ZkAsyncResponse.ZkGetDataResponse;
 import org.apache.fluss.server.zk.data.BucketAssignment;
 import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.CoordinatorAddress;
@@ -42,6 +43,7 @@ import org.apache.fluss.server.zk.data.ServerTags;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.server.zk.data.TabletServerRegistration;
+import org.apache.fluss.server.zk.data.ZkData;
 import org.apache.fluss.server.zk.data.ZkData.BucketIdZNode;
 import org.apache.fluss.server.zk.data.lease.KvSnapshotLeaseMetadata;
 import org.apache.fluss.shaded.curator5.org.apache.curator.CuratorZookeeperClient;
@@ -70,6 +72,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.cluster.rebalance.RebalanceStatus.COMPLETED;
@@ -134,6 +141,89 @@ class ZooKeeperClientTest {
     }
 
     @Test
+    void testGetDataWithStatPreservesVersionAndEphemeralOwner() throws Exception {
+        String persistentPath = "/data-with-stat";
+        zookeeperClient.getCuratorClient().create().forPath(persistentPath, new byte[] {1});
+
+        ZooKeeperClient.DataWithStat value = zookeeperClient.getDataWithStat(persistentPath);
+        assertThat(value.getData()).containsExactly(1);
+        assertThat(value.getStat().getVersion()).isZero();
+        assertThat(value.getStat().getEphemeralOwner()).isZero();
+        assertThat(zookeeperClient.getDataWithStatIfExists("/absent-data-with-stat")).isEmpty();
+    }
+
+    @Test
+    void testStrictBatchDataReadRejectsPartialResponses() {
+        List<ZkGetDataResponse> responses =
+                Arrays.asList(
+                        new ZkGetDataResponse(
+                                "/partitions/p1", KeeperException.Code.OK, new byte[] {1}),
+                        new ZkGetDataResponse("/partitions/p2", KeeperException.Code.NONODE, null));
+
+        assertThatThrownBy(
+                        () ->
+                                ZooKeeperClient.processGetDataResponsesStrict(
+                                        responses,
+                                        ZkGetDataResponse::getPath,
+                                        data -> data[0],
+                                        "partition registrations"))
+                .isInstanceOf(KeeperException.NoNodeException.class)
+                .hasMessageContaining("/partitions/p2");
+    }
+
+    @Test
+    void testCoordinatorStartupPartitionDropRecreateFailsIdentityVerification() throws Exception {
+        TablePath tablePath = TablePath.of("db", "partition-race");
+        String partitionName = "p0";
+        String path = ZkData.PartitionZNode.path(tablePath, partitionName);
+        PartitionRegistration original = new PartitionRegistration(10L, 20L, remoteDataDir);
+        zookeeperClient
+                .getCuratorClient()
+                .create()
+                .creatingParentsIfNeeded()
+                .forPath(path, ZkData.PartitionZNode.encode(original));
+
+        ZooKeeperClient.PartitionRegistrationSnapshot snapshot =
+                zookeeperClient
+                        .getPartitionRegistrationSnapshotsForTables(
+                                Collections.singletonList(tablePath))
+                        .get(tablePath)
+                        .get(partitionName);
+        assertThat(
+                        zookeeperClient.verifyPartitionRegistrationSnapshot(
+                                tablePath, partitionName, snapshot))
+                .isSameAs(snapshot);
+        zookeeperClient.getCuratorClient().delete().forPath(path);
+        PartitionRegistration recreated = new PartitionRegistration(10L, 21L, remoteDataDir);
+        zookeeperClient
+                .getCuratorClient()
+                .create()
+                .forPath(path, ZkData.PartitionZNode.encode(recreated));
+
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.verifyPartitionRegistrationSnapshot(
+                                        tablePath, partitionName, snapshot))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("changed while initializing");
+        assertThat(snapshot.getRegistration().getPartitionId()).isEqualTo(20L);
+        assertThat(recreated.getPartitionId()).isEqualTo(21L);
+    }
+
+    @Test
+    void testCheckedSerializedSizeUsesPathDataAndOperationOverhead() {
+        long checkSize = ZooKeeperClient.estimateCheckSerializedSize("/a");
+        long shortCreate = ZooKeeperClient.estimateCreateSerializedSize("/a", new byte[] {1});
+        long longCreate =
+                ZooKeeperClient.estimateCreateSerializedSize("/longer", new byte[] {1, 2});
+        assertThat(checkSize).isPositive();
+        assertThat(shortCreate).isGreaterThan(checkSize);
+        assertThat(longCreate).isGreaterThan(shortCreate);
+        assertThatThrownBy(() -> ZooKeeperClient.checkedAdd(Long.MAX_VALUE, 1))
+                .isInstanceOf(ArithmeticException.class);
+    }
+
+    @Test
     void testTabletServer() throws Exception {
         // try to get tablet server, should return empty
         assertThat(zookeeperClient.getTabletServer(1)).isEmpty();
@@ -151,6 +241,18 @@ class ZooKeeperClientTest {
                         System.currentTimeMillis());
         zookeeperClient.registerTabletServer(2, registration2);
         zookeeperClient.registerTabletServer(1, registration1);
+        long sessionId =
+                zookeeperClient
+                        .getCuratorClient()
+                        .getZookeeperClient()
+                        .getZooKeeper()
+                        .getSessionId();
+        ZooKeeperClient.DataWithStat sessionFence =
+                zookeeperClient.getDataWithStat(
+                        ZkData.TabletServerSessionFenceZNode.path(1, sessionId));
+        assertThat(sessionFence.getData()).isEmpty();
+        assertThat(sessionFence.getStat().getVersion()).isZero();
+        assertThat(sessionFence.getStat().getEphemeralOwner()).isEqualTo(sessionId);
         // now get the tablet servers
         assertThat(zookeeperClient.getSortedTabletServerList()).isEqualTo(new int[] {1, 2});
         // get tablet server1
@@ -654,6 +756,163 @@ class ZooKeeperClientTest {
     }
 
     @Test
+    void testFencedSnapshotDoesNotRecreateMissingPhysicalIdentityRoot() throws Exception {
+        long tableId = 901L;
+        TablePath tablePath = TablePath.of("parent_boundary", "snapshot");
+        TableBucket tableBucket = registerFencedCommitTarget(tableId, tablePath);
+        ZooKeeperClient.DataWithStat metadata = activeMetadata(tablePath);
+        int leaderAndIsrVersion = leaderAndIsrVersion(tableBucket);
+        String identityRoot = ZkData.TableIdZNode.path(tableId);
+        zookeeperClient
+                .getCuratorClient()
+                .delete()
+                .deletingChildrenIfNeeded()
+                .forPath(identityRoot);
+
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.registerTableBucketSnapshot(
+                                        tableBucket,
+                                        new BucketSnapshot(1L, 0L, "file:///tmp/missing-root"),
+                                        ZkData.TableZNode.path(tablePath),
+                                        metadata.getStat().getVersion(),
+                                        zkEpoch.getCoordinatorEpochZkVersion(),
+                                        leaderAndIsrVersion))
+                .isInstanceOf(KeeperException.NoNodeException.class);
+        assertThat(zookeeperClient.getCuratorClient().checkExists().forPath(identityRoot)).isNull();
+    }
+
+    @Test
+    void testFencedManifestDoesNotRecreateMissingPhysicalIdentityRoot() throws Exception {
+        long tableId = 902L;
+        TablePath tablePath = TablePath.of("parent_boundary", "manifest");
+        TableBucket tableBucket = registerFencedCommitTarget(tableId, tablePath);
+        ZooKeeperClient.DataWithStat metadata = activeMetadata(tablePath);
+        int leaderAndIsrVersion = leaderAndIsrVersion(tableBucket);
+        String identityRoot = ZkData.TableIdZNode.path(tableId);
+        zookeeperClient
+                .getCuratorClient()
+                .delete()
+                .deletingChildrenIfNeeded()
+                .forPath(identityRoot);
+
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.upsertRemoteLogManifestHandle(
+                                        tableBucket,
+                                        new org.apache.fluss.server.zk.data.RemoteLogManifestHandle(
+                                                new FsPath("file:///tmp/missing-root-manifest"),
+                                                1L),
+                                        ZkData.TableZNode.path(tablePath),
+                                        metadata.getStat().getVersion(),
+                                        zkEpoch.getCoordinatorEpochZkVersion(),
+                                        leaderAndIsrVersion))
+                .isInstanceOf(KeeperException.NoNodeException.class);
+        assertThat(zookeeperClient.getCuratorClient().checkExists().forPath(identityRoot)).isNull();
+    }
+
+    @Test
+    void testConcurrentFencedSnapshotsTolerateStructuralParentRace() throws Exception {
+        long tableId = 903L;
+        TablePath tablePath = TablePath.of("parent_boundary", "race");
+        TableBucket tableBucket = registerFencedCommitTarget(tableId, tablePath);
+        ZooKeeperClient.DataWithStat metadata = activeMetadata(tablePath);
+        int leaderAndIsrVersion = leaderAndIsrVersion(tableBucket);
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            CompletableFuture<Void> first =
+                    registerSnapshotAsync(
+                            executor,
+                            start,
+                            tableBucket,
+                            1L,
+                            tablePath,
+                            metadata.getStat().getVersion(),
+                            leaderAndIsrVersion);
+            CompletableFuture<Void> second =
+                    registerSnapshotAsync(
+                            executor,
+                            start,
+                            tableBucket,
+                            2L,
+                            tablePath,
+                            metadata.getStat().getVersion(),
+                            leaderAndIsrVersion);
+            start.countDown();
+            CompletableFuture.allOf(first, second).get(20, TimeUnit.SECONDS);
+        } finally {
+            executor.shutdownNow();
+        }
+
+        assertThat(zookeeperClient.getTableBucketSnapshot(tableBucket, 1L)).isPresent();
+        assertThat(zookeeperClient.getTableBucketSnapshot(tableBucket, 2L)).isPresent();
+    }
+
+    private CompletableFuture<Void> registerSnapshotAsync(
+            ExecutorService executor,
+            CountDownLatch start,
+            TableBucket tableBucket,
+            long snapshotId,
+            TablePath tablePath,
+            int metadataVersion,
+            int leaderAndIsrVersion) {
+        return CompletableFuture.runAsync(
+                () -> {
+                    try {
+                        start.await();
+                        zookeeperClient.registerTableBucketSnapshot(
+                                tableBucket,
+                                new BucketSnapshot(
+                                        snapshotId, 0L, "file:///tmp/parent-race-" + snapshotId),
+                                ZkData.TableZNode.path(tablePath),
+                                metadataVersion,
+                                zkEpoch.getCoordinatorEpochZkVersion(),
+                                leaderAndIsrVersion);
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                },
+                executor);
+    }
+
+    private TableBucket registerFencedCommitTarget(long tableId, TablePath tablePath)
+            throws Exception {
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(Schema.newBuilder().column("a", DataTypes.INT()).build())
+                        .distributedBy(1)
+                        .build();
+        zookeeperClient.registerTable(
+                tablePath, TableRegistration.newTable(tableId, remoteDataDir, descriptor));
+        TableBucket tableBucket = new TableBucket(tableId, 0);
+        zookeeperClient.registerTableAssignment(
+                tableId, TableAssignment.builder().add(0, BucketAssignment.of(1)).build());
+        zookeeperClient.registerLeaderAndIsr(
+                tableBucket,
+                new LeaderAndIsr(
+                        1,
+                        0,
+                        Collections.singletonList(1),
+                        Collections.emptyList(),
+                        zkEpoch.getCoordinatorEpoch(),
+                        0),
+                zkEpoch.getCoordinatorEpochZkVersion());
+        return tableBucket;
+    }
+
+    private ZooKeeperClient.DataWithStat activeMetadata(TablePath tablePath) throws Exception {
+        return zookeeperClient.getDataWithStat(ZkData.TableZNode.path(tablePath));
+    }
+
+    private int leaderAndIsrVersion(TableBucket tableBucket) throws Exception {
+        return zookeeperClient
+                .getDataWithStat(ZkData.LeaderAndIsrZNode.path(tableBucket))
+                .getStat()
+                .getVersion();
+    }
+
+    @Test
     void testKvSnapshotLease() throws Exception {
         Map<Long, FsPath> tableIdToRemotePath = new HashMap<>();
         tableIdToRemotePath.put(150002L, new FsPath("/test/cp1"));
@@ -752,6 +1011,53 @@ class ZooKeeperClientTest {
         zookeeperClient.deletePartition(tablePath, "p1");
         partitions = zookeeperClient.getPartitions(tablePath);
         assertThat(partitions).containsExactly("p2");
+    }
+
+    @Test
+    void testCheckedMultiReturnsStatFromAppliedSet() throws Exception {
+        String path = "/checked-multi-result";
+        zookeeperClient.getCuratorClient().create().forPath(path, new byte[0]);
+
+        ZooKeeperClient.CheckedMultiResult result =
+                zookeeperClient.submitCheckedMulti(
+                        Collections.singletonList(
+                                ZooKeeperClient.CheckedOperation.set(path, new byte[] {1}, 0)),
+                        4096);
+
+        assertThat(result.getStat(path)).isNotNull();
+        assertThat(result.getStat(path).getVersion()).isOne();
+        assertThat(zookeeperClient.getDataWithStat(path).getData()).containsExactly(1);
+    }
+
+    @Test
+    void testCheckedMultiAtomicallyAssertsPathAbsence() throws Exception {
+        String absentPath = "/checked-multi-absent";
+        String writePath = "/checked-multi-absence-write";
+        zookeeperClient.getCuratorClient().create().forPath(writePath, new byte[] {0});
+
+        zookeeperClient.submitCheckedMulti(
+                Arrays.asList(
+                        ZooKeeperClient.CheckedOperation.assertAbsent(absentPath),
+                        ZooKeeperClient.CheckedOperation.set(writePath, new byte[] {1}, 0)),
+                4096);
+
+        assertThat(zookeeperClient.pathExists(absentPath)).isFalse();
+        assertThat(zookeeperClient.getDataWithStat(writePath).getData()).containsExactly(1);
+
+        zookeeperClient.getCuratorClient().create().forPath(absentPath, new byte[] {9});
+
+        assertThatThrownBy(
+                        () ->
+                                zookeeperClient.submitCheckedMulti(
+                                        Arrays.asList(
+                                                ZooKeeperClient.CheckedOperation.assertAbsent(
+                                                        absentPath),
+                                                ZooKeeperClient.CheckedOperation.set(
+                                                        writePath, new byte[] {2}, 1)),
+                                        4096))
+                .isInstanceOf(KeeperException.NodeExistsException.class);
+        assertThat(zookeeperClient.getDataWithStat(absentPath).getData()).containsExactly(9);
+        assertThat(zookeeperClient.getDataWithStat(writePath).getData()).containsExactly(1);
     }
 
     @Test

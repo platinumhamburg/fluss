@@ -39,6 +39,7 @@ import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.DatabaseInfo;
 import org.apache.fluss.metadata.DatabaseSummary;
+import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaInfo;
@@ -65,6 +66,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -332,7 +334,23 @@ public class MetadataManager {
             throw new DatabaseNotEmptyException("Database " + name + " is not empty.");
         }
 
-        uncheck(() -> zookeeperClient.deleteDatabase(name), "Fail to drop database: " + name);
+        List<PhysicalDdlTarget> targets = new ArrayList<>();
+        if (cascade) {
+            for (String tableName : listTables(name)) {
+                TablePath tablePath = TablePath.of(name, tableName);
+                TableRegistration registration = getTableRegistration(tablePath);
+                targets.addAll(physicalDdlTargets(tablePath, registration));
+            }
+            validateNoBulkLoad(targets);
+        }
+
+        try {
+            zookeeperClient.deleteDatabase(name);
+        } catch (Exception failure) {
+            if (databaseExists(name) && (targets.isEmpty() || !allLogicalTargetsGone(targets))) {
+                throw new FlussRuntimeException("Fail to drop database: " + name, failure);
+            }
+        }
     }
 
     public void dropTable(TablePath tablePath, boolean ignoreIfNotExists)
@@ -344,9 +362,19 @@ public class MetadataManager {
             throw new TableNotExistException("Table " + tablePath + " does not exist.");
         }
 
+        TableRegistration registration = getTableRegistration(tablePath);
+        List<PhysicalDdlTarget> targets = physicalDdlTargets(tablePath, registration);
+        validateNoBulkLoad(targets);
+
         // in here, we just delete the table node in zookeeper, which will then trigger
         // the physical deletion in tablet servers and assignments in zk
-        uncheck(() -> zookeeperClient.deleteTable(tablePath), "Fail to drop table: " + tablePath);
+        try {
+            zookeeperClient.deleteTable(tablePath);
+        } catch (Exception failure) {
+            if (!allLogicalTargetsGone(targets)) {
+                throw new FlussRuntimeException("Fail to drop table: " + tablePath, failure);
+            }
+        }
     }
 
     public void completeDeleteTable(long tableId) {
@@ -436,6 +464,7 @@ public class MetadataManager {
         try {
 
             TableInfo table = getTable(tablePath);
+            validateTableDdl(tablePath, getTableRegistration(tablePath));
             TableDescriptor tableDescriptor = table.toTableDescriptor();
 
             // validate the table column changes
@@ -517,6 +546,7 @@ public class MetadataManager {
         try {
             // it throws TableNotExistException if the table or database not exists
             TableRegistration tableReg = getTableRegistration(tablePath);
+            validateTableDdl(tablePath, tableReg);
             SchemaInfo schemaInfo = getLatestSchema(tablePath);
             // we can't use MetadataManager#getTable here, because it will add the default
             // lake options to the table properties, which may cause the validation failure
@@ -906,14 +936,22 @@ public class MetadataManager {
                             partition.getPartitionQualifiedName(), tablePath));
         }
 
+        PhysicalDdlTarget target =
+                physicalDdlTarget(tablePath, partitionName, optionalPartitionRegistration.get());
+        validateNoBulkLoad(target);
+
         try {
             zookeeperClient.deletePartition(tablePath, partitionName);
-        } catch (Exception e) {
-            throw new FlussRuntimeException(
-                    String.format(
-                            "Fail to delete partition '%s' from zookeeper for table %s.",
-                            partitionName, tablePath),
-                    e);
+        } catch (Exception failure) {
+            if (!logicalTargetGone(target)) {
+                throw new FlussRuntimeException(
+                        "Fail to delete partition '"
+                                + partitionName
+                                + "' from table "
+                                + tablePath
+                                + ".",
+                        failure);
+            }
         }
     }
 
@@ -928,6 +966,118 @@ public class MetadataManager {
                             tablePath, partitionName),
                     e);
         }
+    }
+
+    private void validateTableDdl(TablePath tablePath, TableRegistration registration) {
+        validateNoBulkLoad(physicalDdlTargets(tablePath, registration));
+    }
+
+    private List<PhysicalDdlTarget> physicalDdlTargets(
+            TablePath tablePath, TableRegistration registration) {
+        List<PhysicalDdlTarget> targets = new ArrayList<>();
+        targets.add(
+                new PhysicalDdlTarget(
+                        PhysicalTablePath.of(tablePath),
+                        registration.tableId,
+                        null,
+                        registration.bulkLoadId));
+        if (registration.isPartitioned()) {
+            try {
+                for (Map.Entry<String, PartitionRegistration> partition :
+                        zookeeperClient.getPartitionRegistrations(tablePath).entrySet()) {
+                    targets.add(
+                            physicalDdlTarget(tablePath, partition.getKey(), partition.getValue()));
+                }
+            } catch (RuntimeException failure) {
+                throw failure;
+            } catch (Exception failure) {
+                throw new FlussRuntimeException(
+                        "Failed to validate BulkLoad state for table " + tablePath + ".", failure);
+            }
+        }
+        return targets;
+    }
+
+    private void validateNoBulkLoad(List<PhysicalDdlTarget> targets) {
+        for (PhysicalDdlTarget target : targets) {
+            validateNoBulkLoad(target);
+        }
+    }
+
+    void validateNoBulkLoad(PhysicalTablePath path, long tableId, @Nullable Long partitionId) {
+        try {
+            PhysicalDdlTarget target;
+            if (partitionId == null) {
+                TableRegistration registration = getTableRegistration(path.getTablePath());
+                target =
+                        new PhysicalDdlTarget(
+                                path, registration.tableId, null, registration.bulkLoadId);
+            } else {
+                PartitionRegistration registration =
+                        getOptionalPartitionRegistration(
+                                        path.getTablePath(), path.getPartitionName())
+                                .orElseThrow(
+                                        () ->
+                                                new InvalidAlterTableException(
+                                                        "Physical target registration is missing."));
+                target =
+                        physicalDdlTarget(
+                                path.getTablePath(), path.getPartitionName(), registration);
+            }
+            if (target.tableId != tableId
+                    || !java.util.Objects.equals(target.partitionId, partitionId)) {
+                throw new InvalidAlterTableException("Physical target identity changed.");
+            }
+            validateNoBulkLoad(target);
+            return;
+        } catch (Exception failure) {
+            if (failure instanceof InvalidAlterTableException) {
+                throw (InvalidAlterTableException) failure;
+            }
+            throw new InvalidAlterTableException("BulkLoad target state is unreadable.", failure);
+        }
+    }
+
+    private static void validateNoBulkLoad(PhysicalDdlTarget target) {
+        if (target.bulkLoadId != null) {
+            throw new InvalidAlterTableException("BulkLoad still owns the physical target.");
+        }
+    }
+
+    private boolean allLogicalTargetsGone(List<PhysicalDdlTarget> targets) {
+        for (PhysicalDdlTarget target : targets) {
+            if (!logicalTargetGone(target)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean logicalTargetGone(PhysicalDdlTarget target) {
+        try {
+            if (target.partitionId == null) {
+                Optional<TableRegistration> registration =
+                        zookeeperClient.getTable(target.path.getTablePath());
+                return !registration.isPresent() || registration.get().tableId != target.tableId;
+            }
+            Optional<PartitionRegistration> registration =
+                    zookeeperClient.getPartition(
+                            target.path.getTablePath(), target.path.getPartitionName());
+            return !registration.isPresent()
+                    || registration.get().getPartitionId() != target.partitionId.longValue();
+        } catch (Exception failure) {
+            throw new FlussRuntimeException(
+                    "Failed to reconcile DDL deletion for " + target.path + ".", failure);
+        }
+    }
+
+    private static PhysicalDdlTarget physicalDdlTarget(
+            TablePath tablePath, String partitionName, PartitionRegistration registration) {
+        return new PhysicalDdlTarget(
+                PhysicalTablePath.of(tablePath, partitionName),
+                registration.getTableId(),
+                registration.getPartitionId(),
+                registration.getBulkLoadId());
     }
 
     private void rethrowIfIsNotNoNodeException(
@@ -954,6 +1104,24 @@ public class MetadataManager {
             runnable.run();
         } catch (Exception e) {
             throw new FlussRuntimeException(errorMsg, e);
+        }
+    }
+
+    private static final class PhysicalDdlTarget {
+        private final PhysicalTablePath path;
+        private final long tableId;
+        private final @Nullable Long partitionId;
+        private final @Nullable String bulkLoadId;
+
+        private PhysicalDdlTarget(
+                PhysicalTablePath path,
+                long tableId,
+                @Nullable Long partitionId,
+                @Nullable String bulkLoadId) {
+            this.path = path;
+            this.tableId = tableId;
+            this.partitionId = partitionId;
+            this.bulkLoadId = bulkLoadId;
         }
     }
 }

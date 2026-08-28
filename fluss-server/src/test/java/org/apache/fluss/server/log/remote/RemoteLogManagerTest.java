@@ -22,6 +22,7 @@ import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.remote.RemoteLogFetchInfo;
+import org.apache.fluss.remote.RemoteLogManifest;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.protocol.ApiError;
@@ -32,11 +33,16 @@ import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.StopReplicaResultForBucket;
 import org.apache.fluss.server.log.FetchParams;
+import org.apache.fluss.server.log.LogOffsetMetadata;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaManager;
+import org.apache.fluss.server.tablet.bulkload.BulkLoadTargetMetadata;
 import org.apache.fluss.server.testutils.ServerTestTags;
+import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
+import org.apache.fluss.server.zk.data.bulkload.BulkLoadDataState;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
@@ -47,19 +53,23 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.File;
+import java.lang.reflect.Field;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH_PA_2024;
+import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
+import static org.apache.fluss.record.TestData.DATA1_TABLE_ID_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
@@ -68,6 +78,7 @@ import static org.apache.fluss.server.zk.data.LeaderAndIsr.INITIAL_LEADER_EPOCH;
 import static org.apache.fluss.utils.FlussPaths.remoteLogDir;
 import static org.apache.fluss.utils.FlussPaths.remoteLogTabletDir;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link RemoteLogManager}. */
@@ -76,6 +87,84 @@ class RemoteLogManagerTest extends RemoteLogTestBase {
     @BeforeEach
     public void setup() throws Exception {
         super.setup();
+    }
+
+    @Test
+    void testOrdinaryManifestValidationAllowsRetainedPrefixAndRejectsGap() {
+        TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID, 0);
+        RemoteLogSegment first = remoteSegment(tableBucket, 10L, 20L);
+        RemoteLogSegment second = remoteSegment(tableBucket, 20L, 30L);
+        RemoteLogManifestHandle handle =
+                new RemoteLogManifestHandle(new FsPath("file:///manifest"), 30L);
+
+        assertThatCode(
+                        () ->
+                                RemoteLogManager.validateOrdinaryManifest(
+                                        DATA1_PHYSICAL_TABLE_PATH,
+                                        tableBucket,
+                                        handle,
+                                        new RemoteLogManifest(
+                                                DATA1_PHYSICAL_TABLE_PATH,
+                                                tableBucket,
+                                                Arrays.asList(second, first))))
+                .doesNotThrowAnyException();
+
+        RemoteLogSegment gapped = remoteSegment(tableBucket, 21L, 30L);
+        assertThatThrownBy(
+                        () ->
+                                RemoteLogManager.validateOrdinaryManifest(
+                                        DATA1_PHYSICAL_TABLE_PATH,
+                                        tableBucket,
+                                        handle,
+                                        new RemoteLogManifest(
+                                                DATA1_PHYSICAL_TABLE_PATH,
+                                                tableBucket,
+                                                Arrays.asList(first, gapped))))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("not contiguous");
+    }
+
+    @Test
+    void testLoadingRecoveryRejectsGeneratedManifestWithoutSnapshot() throws Exception {
+        TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 0);
+        registerGeneratedManifest(tableBucket, 10L);
+        Replica replica = makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, tableBucket);
+
+        assertThatThrownBy(() -> remoteLogManager.restoreReplica(replica, false))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Snapshot");
+    }
+
+    @Test
+    void testLoadingRecoveryRejectsGeneratedManifestSnapshotBoundaryMismatch() throws Exception {
+        TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 0);
+        registerGeneratedManifest(tableBucket, 10L);
+        zkClient.registerTableBucketSnapshot(
+                tableBucket, new BucketSnapshot(1L, 9L, "file:///snapshot"));
+        Replica replica = makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, tableBucket);
+
+        assertThatThrownBy(() -> remoteLogManager.restoreReplica(replica, false))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Snapshot")
+                .hasMessageContaining("Remote Log");
+    }
+
+    @Test
+    void testActiveSnapshotOnlyRecoveryRejectsHighWatermarkBeyondLocalEnd() throws Exception {
+        TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 0);
+        zkClient.registerTableBucketSnapshot(
+                tableBucket, new BucketSnapshot(1L, 4L, "file:///snapshot"));
+        Replica replica = makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, tableBucket);
+        logManager.initializeEmptyLocalTail(tableBucket, 5L);
+        Field highWatermark = LogTablet.class.getDeclaredField("highWatermarkMetadata");
+        highWatermark.setAccessible(true);
+        highWatermark.set(replica.getLogTablet(), new LogOffsetMetadata(6L));
+        assertThat(replica.getLocalLogEndOffset()).isEqualTo(5L);
+        assertThat(replica.getLogHighWatermark()).isEqualTo(6L);
+
+        assertThatThrownBy(() -> remoteLogManager.registerReplica(replica))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("contradictory local history");
     }
 
     @ParameterizedTest
@@ -105,6 +194,76 @@ class RemoteLogManagerTest extends RemoteLogTestBase {
         assertThat(remoteLogSegmentList.size()).isEqualTo(4);
         assertThat(remoteLogManager.lookupPositionForOffset(remoteLogSegmentList.get(0), 2L))
                 .isGreaterThan(10);
+    }
+
+    @Test
+    void testPauseLogTieringStopsSchedulingWithoutDeletingReadState() throws Exception {
+        TableBucket tableBucket = makeTableBucket(false);
+        makeLogTableAsLeader(tableBucket, false);
+        Replica replica = replicaManager.getReplicaOrException(tableBucket);
+        addMultiSegmentsToLogTablet(replica.getLogTablet(), 5);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        List<RemoteLogSegment> uploaded =
+                remoteLogManager.relevantRemoteLogSegments(tableBucket, 0L);
+        assertThat(uploaded).isNotEmpty();
+
+        remoteLogManager.pauseLogTiering(replica);
+        addMultiSegmentsToLogTablet(replica.getLogTablet(), 2);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        assertThat(remoteLogManager.relevantRemoteLogSegments(tableBucket, 0L))
+                .containsExactlyElementsOf(uploaded);
+        assertThat(remoteLogManager.remoteLogTablet(tableBucket)).isNotNull();
+        assertThat(remoteLogManager.lookupPositionForOffset(uploaded.get(0), 0L))
+                .isGreaterThanOrEqualTo(0);
+    }
+
+    @Test
+    void testResumeLogTieringIsIdempotentForSameLeaderReplica() throws Exception {
+        TableBucket tableBucket = makeTableBucket(false);
+        makeLogTableAsLeader(tableBucket, false);
+        Replica replica = replicaManager.getReplicaOrException(tableBucket);
+        remoteLogManager.pauseLogTiering(replica);
+
+        remoteLogManager.resumeLogTiering(replica);
+        RemoteLogManager.TaskWithFuture resumed = remoteLogManager.getTaskWithFuture(tableBucket);
+        assertThat(resumed).isNotNull();
+
+        remoteLogManager.resumeLogTiering(replica);
+
+        assertThat(remoteLogManager.getTaskWithFuture(tableBucket)).isSameAs(resumed);
+        assertThat(remoteLogTaskScheduler.getActivePeriodicScheduledTask()).hasSize(1);
+    }
+
+    @Test
+    void testRemoteTieringCommitCarriesActiveMetadataIdentity() throws Exception {
+        TableBucket tableBucket = makeTableBucket(false);
+        BulkLoadTargetMetadata active =
+                new BulkLoadTargetMetadata(
+                        "/active-metadata", tableBucket, 1, BulkLoadDataState.ACTIVE, null);
+        makeLeaderAndFollower(
+                Collections.singletonList(
+                        new NotifyLeaderAndIsrData(
+                                DATA1_PHYSICAL_TABLE_PATH,
+                                tableBucket,
+                                Collections.singletonList(TABLET_SERVER_ID),
+                                new LeaderAndIsr(
+                                        TABLET_SERVER_ID,
+                                        INITIAL_LEADER_EPOCH,
+                                        Collections.singletonList(TABLET_SERVER_ID),
+                                        Collections.emptyList(),
+                                        INITIAL_COORDINATOR_EPOCH,
+                                        INITIAL_BUCKET_EPOCH),
+                                active)));
+        addMultiSegmentsToLogTablet(
+                replicaManager.getReplicaOrException(tableBucket).getLogTablet(), 5);
+
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+
+        assertThat(testCoordinatorGateway.lastRemoteLogManifestCommit.get().getMetadataPath())
+                .isEqualTo(active.getMetadataPath());
+        assertThat(testCoordinatorGateway.lastRemoteLogManifestCommit.get().getMetadataVersion())
+                .isEqualTo(active.getMetadataVersion());
     }
 
     @ParameterizedTest
@@ -847,6 +1006,41 @@ class RemoteLogManagerTest extends RemoteLogTestBase {
                         manifestSegments.stream()
                                 .map(s -> s.remoteLogSegmentId().toString())
                                 .collect(Collectors.toSet()));
+    }
+
+    private RemoteLogSegment remoteSegment(
+            TableBucket tableBucket, long startOffset, long endOffset) {
+        return RemoteLogSegment.Builder.builder()
+                .physicalTablePath(DATA1_PHYSICAL_TABLE_PATH)
+                .tableBucket(tableBucket)
+                .remoteLogSegmentId(UUID.randomUUID())
+                .remoteLogStartOffset(startOffset)
+                .remoteLogEndOffset(endOffset)
+                .maxTimestamp(manualClock.milliseconds())
+                .segmentSizeInBytes(1)
+                .build();
+    }
+
+    private void registerGeneratedManifest(TableBucket tableBucket, long endOffset)
+            throws Exception {
+        RemoteLogSegment segment =
+                RemoteLogSegment.Builder.builder()
+                        .physicalTablePath(DATA1_PHYSICAL_TABLE_PATH_PK)
+                        .tableBucket(tableBucket)
+                        .remoteLogSegmentId(UUID.randomUUID())
+                        .remoteLogStartOffset(0L)
+                        .remoteLogEndOffset(endOffset)
+                        .maxTimestamp(manualClock.milliseconds())
+                        .segmentSizeInBytes(1)
+                        .build();
+        FsPath manifestPath =
+                remoteLogStorage.writeRemoteLogManifestSnapshot(
+                        new RemoteLogManifest(
+                                DATA1_PHYSICAL_TABLE_PATH_PK,
+                                tableBucket,
+                                Collections.singletonList(segment)));
+        zkClient.upsertRemoteLogManifestHandle(
+                tableBucket, new RemoteLogManifestHandle(manifestPath, endOffset));
     }
 
     private TableBucket makeTableBucket(boolean partitionTable) {

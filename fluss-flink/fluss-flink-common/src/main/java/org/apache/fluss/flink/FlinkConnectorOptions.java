@@ -212,6 +212,31 @@ public class FlinkConnectorOptions {
                                     + "Use this mode when data is highly skewed across partitions or when there are many partitions. "
                                     + "Note: This mode has overhead costs including data statistics collection and additional shuffle operations.");
 
+    public static final ConfigOption<Boolean> SINK_BULK_LOAD_ENABLED =
+            ConfigOptions.key("sink.bulk-load.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether batch INSERT INTO a primary-key table uses the BulkLoad "
+                                    + "protocol to import into an empty target. Only effective "
+                                    + "in batch mode.");
+
+    public static final ConfigOption<Duration> SINK_BULK_LOAD_BUILD_TIMEOUT =
+            ConfigOptions.key("sink.bulk-load.build-timeout")
+                    .durationType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Build deadline passed to BulkLoad Begin. Must cover the whole "
+                                    + "job duration; server default is used when absent.");
+
+    public static final ConfigOption<Duration> SINK_BULK_LOAD_AWAIT_TIMEOUT =
+            ConfigOptions.key("sink.bulk-load.await-timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofMinutes(30))
+                    .withDescription(
+                            "Client-side upper bound for retrying CommitBulkLoad until the "
+                                    + "target becomes ready for access.");
+
     // --------------------------------------------------------------------------------------------
     // table storage specific options
     // --------------------------------------------------------------------------------------------

@@ -64,6 +64,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 import static org.apache.fluss.cluster.rebalance.RebalanceStatus.COMPLETED;
 import static org.apache.fluss.cluster.rebalance.RebalanceStatus.NOT_STARTED;
@@ -96,6 +97,8 @@ public class RebalanceManagerTest {
                 ZOO_KEEPER_EXTENSION_WRAPPER
                         .getCustomExtension()
                         .getZooKeeperClient(NOPErrorHandler.INSTANCE);
+        assertThat(zookeeperClient.getCuratorClient().blockUntilConnected(30, TimeUnit.SECONDS))
+                .isTrue();
         zkEpoch = zookeeperClient.fenceBecomeCoordinatorLeader("1");
     }
 
@@ -106,6 +109,9 @@ public class RebalanceManagerTest {
         String remoteDataDir = "/tmp/fluss/remote-data";
         Configuration conf = new Configuration();
         conf.set(ConfigOptions.REMOTE_DATA_DIR, remoteDataDir);
+        metadataManager =
+                new MetadataManager(
+                        zookeeperClient, conf, new LakeCatalogDynamicLoader(conf, null, true));
 
         kvSnapshotLeaseManager =
                 new KvSnapshotLeaseManager(
@@ -149,11 +155,6 @@ public class RebalanceManagerTest {
             scheduler.shutdown();
         }
         zookeeperClient.deleteRebalanceTask();
-        metadataManager =
-                new MetadataManager(
-                        zookeeperClient,
-                        new Configuration(),
-                        new LakeCatalogDynamicLoader(new Configuration(), null, true));
     }
 
     @Test
@@ -354,10 +355,7 @@ public class RebalanceManagerTest {
 
         @Override
         public java.util.concurrent.ScheduledFuture<?> scheduleWithFixedDelay(
-                Runnable command,
-                long initialDelay,
-                long delay,
-                java.util.concurrent.TimeUnit unit) {
+                Runnable command, long initialDelay, long delay, TimeUnit unit) {
             return null;
         }
     }

@@ -22,6 +22,7 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.metadata.ActiveKvSnapshots;
 import org.apache.fluss.client.metadata.RemoteLogManifestInfo;
+import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.flink.action.orphan.RpcErrorClassifier;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
 import org.apache.fluss.fs.FSDataInputStream;
@@ -29,6 +30,7 @@ import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.remote.RemoteLogManifest;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
+import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.RetryUtils;
@@ -44,6 +46,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
@@ -167,9 +170,17 @@ public final class ActiveRefsFetcher {
                             backoffMillis,
                             MAX_BACKOFF_MILLIS,
                             e ->
-                                    RpcErrorClassifier.classify(e)
-                                            != RpcErrorClassifier.Category.NOT_FOUND);
+                                    !ExceptionUtils.findThrowable(
+                                                            e, UnsupportedVersionException.class)
+                                                    .isPresent()
+                                            && RpcErrorClassifier.classify(e)
+                                                    != RpcErrorClassifier.Category.NOT_FOUND);
         } catch (IOException e) {
+            Optional<UnsupportedVersionException> unsupported =
+                    ExceptionUtils.findThrowable(e, UnsupportedVersionException.class);
+            if (unsupported.isPresent()) {
+                throw unsupported.get();
+            }
             return LogActiveRefsFetchResult.listFailed(
                     formatRpcFailureReason(tableId, partitionId, e.getCause()));
         }
@@ -235,9 +246,17 @@ public final class ActiveRefsFetcher {
                             backoffMillis,
                             MAX_BACKOFF_MILLIS,
                             e ->
-                                    RpcErrorClassifier.classify(e)
-                                            != RpcErrorClassifier.Category.NOT_FOUND);
+                                    !ExceptionUtils.findThrowable(
+                                                            e, UnsupportedVersionException.class)
+                                                    .isPresent()
+                                            && RpcErrorClassifier.classify(e)
+                                                    != RpcErrorClassifier.Category.NOT_FOUND);
         } catch (IOException e) {
+            Optional<UnsupportedVersionException> unsupported =
+                    ExceptionUtils.findThrowable(e, UnsupportedVersionException.class);
+            if (unsupported.isPresent()) {
+                throw unsupported.get();
+            }
             return KvActiveRefsFetchResult.listFailed(
                     formatRpcFailureReason(tableId, partitionId, e.getCause()));
         }

@@ -111,6 +111,8 @@ class CoordinatorServiceOrphanRpcsITCase {
         request.setTableId(tableId);
         ListRemoteLogManifestsResponse response = gateway.listRemoteLogManifests(request).get();
 
+        assertThat(response.hasActiveReferencesComplete()).isTrue();
+        assertThat(response.isActiveReferencesComplete()).isTrue();
         assertThat(response.getManifestsList()).hasSize(2);
         assertThat(response.getManifestsList())
                 .extracting(PbRemoteLogManifestEntry::getRemoteLogEndOffset)
@@ -145,6 +147,8 @@ class CoordinatorServiceOrphanRpcsITCase {
         request.setTableId(pkTableId);
         ListKvSnapshotsResponse response = gateway.listKvSnapshots(request).get();
 
+        assertThat(response.hasActiveReferencesComplete()).isTrue();
+        assertThat(response.isActiveReferencesComplete()).isTrue();
         assertThat(response.getTableId()).isEqualTo(pkTableId);
         assertThat(response.hasPartitionId()).isFalse();
         List<PbKvSnapshot> bucket0 =

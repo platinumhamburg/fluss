@@ -45,6 +45,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
+import static org.apache.fluss.config.ConfigOptions.BULKLOAD_MAX_ACTIVE_TRANSACTIONS;
 import static org.apache.fluss.config.ConfigOptions.DATALAKE_FORMAT;
 import static org.apache.fluss.config.ConfigOptions.KV_LEADER_REPLICA_MEMORY_RESERVED;
 import static org.apache.fluss.config.ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC;
@@ -78,6 +79,7 @@ class DynamicServerConfig {
                     Arrays.asList(
                             DATALAKE_FORMAT.key(),
                             LOG_RETENTION_ROLL_ACTIVE_SEGMENT_ENABLED.key(),
+                            BULKLOAD_MAX_ACTIVE_TRANSACTIONS.key(),
                             LOG_REPLICA_MIN_IN_SYNC_REPLICAS_NUMBER.key(),
                             KV_LEADER_REPLICA_MEMORY_RESERVED.key(),
                             KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key(),
@@ -135,6 +137,27 @@ class DynamicServerConfig {
 
     void register(ServerReconfigurable serverReconfigurable) {
         serverReconfigures.put(serverReconfigurable.getClass(), serverReconfigurable);
+    }
+
+    void registerAndReplay(ServerReconfigurable serverReconfigurable) {
+        lock.writeLock().lock();
+        try {
+            Configuration snapshot = new Configuration(currentConfig);
+            serverReconfigurable.validate(snapshot);
+            serverReconfigures.put(serverReconfigurable.getClass(), serverReconfigurable);
+            try {
+                serverReconfigurable.reconfigure(snapshot);
+            } catch (RuntimeException failure) {
+                serverReconfigures.remove(serverReconfigurable.getClass(), serverReconfigurable);
+                throw failure;
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    void unregister(ServerReconfigurable serverReconfigurable) {
+        serverReconfigures.remove(serverReconfigurable.getClass(), serverReconfigurable);
     }
 
     /**

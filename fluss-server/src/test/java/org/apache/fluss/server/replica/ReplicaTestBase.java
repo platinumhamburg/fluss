@@ -158,7 +158,7 @@ public class ReplicaTestBase {
     protected TestingCompletedKvSnapshotCommitter snapshotReporter;
     protected TestCoordinatorGateway testCoordinatorGateway;
     private FlussScheduler scheduler;
-    private ExecutorService ioExecutor;
+    protected ExecutorService ioExecutor;
 
     // remote log related
     protected TestingRemoteLogStorage remoteLogStorage;
@@ -528,6 +528,14 @@ public class ReplicaTestBase {
     protected Replica makeLogReplica(PhysicalTablePath physicalTablePath, TableBucket tableBucket)
             throws Exception {
         return makeReplica(physicalTablePath, tableBucket, false, null);
+    }
+
+    protected Replica makeLogReplica(
+            PhysicalTablePath physicalTablePath,
+            TableBucket tableBucket,
+            SnapshotContext snapshotContext)
+            throws Exception {
+        return makeReplica(physicalTablePath, tableBucket, false, snapshotContext);
     }
 
     protected Replica makeKvReplica(

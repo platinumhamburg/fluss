@@ -21,6 +21,8 @@ import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.rpc.messages.CommitRemoteLogManifestRequest;
 
+import javax.annotation.Nullable;
+
 import java.util.Objects;
 
 /** The data for request {@link CommitRemoteLogManifestRequest}. */
@@ -47,6 +49,12 @@ public class CommitRemoteLogManifestData {
     /** The leader epoch of the bucket when the snapshot is triggered. */
     private final int bucketLeaderEpoch;
 
+    /** Canonical target registration path frozen when tiering started. */
+    private final @Nullable String sourceMetadataPath;
+
+    /** Target registration version frozen when tiering started. */
+    private final @Nullable Integer sourceMetadataVersion;
+
     public CommitRemoteLogManifestData(
             TableBucket tableBucket,
             FsPath remoteLogManifestPath,
@@ -61,7 +69,30 @@ public class CommitRemoteLogManifestData {
                 remoteLogEndOffset,
                 remoteLogEndOffset,
                 coordinatorEpoch,
-                bucketLeaderEpoch);
+                bucketLeaderEpoch,
+                null,
+                null);
+    }
+
+    public CommitRemoteLogManifestData(
+            TableBucket tableBucket,
+            FsPath remoteLogManifestPath,
+            long remoteLogStartOffset,
+            long remoteLogEndOffset,
+            int coordinatorEpoch,
+            int bucketLeaderEpoch,
+            @Nullable String sourceMetadataPath,
+            @Nullable Integer sourceMetadataVersion) {
+        this(
+                tableBucket,
+                remoteLogManifestPath,
+                remoteLogStartOffset,
+                remoteLogEndOffset,
+                remoteLogEndOffset,
+                coordinatorEpoch,
+                bucketLeaderEpoch,
+                sourceMetadataPath,
+                sourceMetadataVersion);
     }
 
     public CommitRemoteLogManifestData(
@@ -72,6 +103,28 @@ public class CommitRemoteLogManifestData {
             long highestCopiedEndOffset,
             int coordinatorEpoch,
             int bucketLeaderEpoch) {
+        this(
+                tableBucket,
+                remoteLogManifestPath,
+                remoteLogStartOffset,
+                remoteLogEndOffset,
+                highestCopiedEndOffset,
+                coordinatorEpoch,
+                bucketLeaderEpoch,
+                null,
+                null);
+    }
+
+    public CommitRemoteLogManifestData(
+            TableBucket tableBucket,
+            FsPath remoteLogManifestPath,
+            long remoteLogStartOffset,
+            long remoteLogEndOffset,
+            long highestCopiedEndOffset,
+            int coordinatorEpoch,
+            int bucketLeaderEpoch,
+            @Nullable String sourceMetadataPath,
+            @Nullable Integer sourceMetadataVersion) {
         this.tableBucket = tableBucket;
         this.remoteLogManifestPath = remoteLogManifestPath;
         this.remoteLogStartOffset = remoteLogStartOffset;
@@ -79,6 +132,8 @@ public class CommitRemoteLogManifestData {
         this.highestCopiedEndOffset = highestCopiedEndOffset;
         this.coordinatorEpoch = coordinatorEpoch;
         this.bucketLeaderEpoch = bucketLeaderEpoch;
+        this.sourceMetadataPath = sourceMetadataPath;
+        this.sourceMetadataVersion = sourceMetadataVersion;
     }
 
     public TableBucket getTableBucket() {
@@ -107,6 +162,14 @@ public class CommitRemoteLogManifestData {
 
     public int getBucketLeaderEpoch() {
         return bucketLeaderEpoch;
+    }
+
+    public @Nullable String getSourceMetadataPath() {
+        return sourceMetadataPath;
+    }
+
+    public @Nullable Integer getSourceMetadataVersion() {
+        return sourceMetadataVersion;
     }
 
     @Override
@@ -141,7 +204,9 @@ public class CommitRemoteLogManifestData {
                 && remoteLogEndOffset == that.remoteLogEndOffset
                 && highestCopiedEndOffset == that.highestCopiedEndOffset
                 && coordinatorEpoch == that.coordinatorEpoch
-                && bucketLeaderEpoch == that.bucketLeaderEpoch;
+                && bucketLeaderEpoch == that.bucketLeaderEpoch
+                && Objects.equals(sourceMetadataPath, that.sourceMetadataPath)
+                && Objects.equals(sourceMetadataVersion, that.sourceMetadataVersion);
     }
 
     @Override
@@ -152,6 +217,8 @@ public class CommitRemoteLogManifestData {
                 remoteLogEndOffset,
                 highestCopiedEndOffset,
                 coordinatorEpoch,
-                bucketLeaderEpoch);
+                bucketLeaderEpoch,
+                sourceMetadataPath,
+                sourceMetadataVersion);
     }
 }

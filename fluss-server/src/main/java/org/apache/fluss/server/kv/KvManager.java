@@ -391,6 +391,20 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         }
     }
 
+    /** Removes every local artifact created by a failed KV recovery attempt. */
+    public void resetRecoveryAttempt(
+            File dataDir, PhysicalTablePath tablePath, TableBucket tableBucket) {
+        try {
+            dropKv(tableBucket);
+        } finally {
+            FileUtils.deleteDirectoryQuietly(getTabletDir(dataDir, tablePath, tableBucket));
+        }
+    }
+
+    public KvTablet loadKv(File tabletDir, SchemaGetter schemaGetter) throws Exception {
+        return loadKv(tabletDir, schemaGetter, null);
+    }
+
     public KvTablet loadKv(
             File tabletDir, SchemaGetter schemaGetter, @Nullable Runnable flushCompleteListener)
             throws Exception {

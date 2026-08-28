@@ -19,6 +19,7 @@ package org.apache.fluss.server.zk.data;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.metadata.TableDescriptor.TableDistribution;
+import org.apache.fluss.server.zk.data.bulkload.BulkLoadDataState;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.core.JsonGenerator;
 import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.JsonNode;
 import org.apache.fluss.utils.json.JsonDeserializer;
@@ -30,6 +31,8 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /** Json serializer and deserializer for {@link TableRegistration}. */
 @Internal
@@ -48,15 +51,19 @@ public class TableRegistrationJsonSerde
     static final String REMOTE_DATA_DIR = "remote_data_dir";
     static final String CREATED_TIME = "created_time";
     static final String MODIFIED_TIME = "modified_time";
+    static final String DATA_STATE = "data_state";
+    static final String BULK_LOAD_ID = "bulk_load_id";
     private static final String VERSION_KEY = "version";
-    private static final int VERSION = 1;
+    static final int VERSION = 2;
+    private static final int LEGACY_VERSION = 1;
 
     @Override
     public void serialize(TableRegistration tableReg, JsonGenerator generator) throws IOException {
         generator.writeStartObject();
 
         // serialize data version.
-        generator.writeNumberField(VERSION_KEY, VERSION);
+        generator.writeNumberField(
+                VERSION_KEY, tableReg.bulkLoadId == null ? LEGACY_VERSION : VERSION);
 
         // serialize table id
         generator.writeNumberField(TABLE_ID_NAME, tableReg.tableId);
@@ -112,11 +119,17 @@ public class TableRegistrationJsonSerde
         // serialize modifiedTime
         generator.writeNumberField(MODIFIED_TIME, tableReg.modifiedTime);
 
+        if (tableReg.bulkLoadId != null) {
+            generator.writeNumberField(DATA_STATE, tableReg.dataState.getCode());
+            generator.writeStringField(BULK_LOAD_ID, tableReg.bulkLoadId);
+        }
+
         generator.writeEndObject();
     }
 
     @Override
     public TableRegistration deserialize(JsonNode node) {
+        int version = readVersion(node);
         long tableId = node.get(TABLE_ID_NAME).asLong();
 
         JsonNode commentNode = node.get(COMMENT_NAME);
@@ -157,6 +170,23 @@ public class TableRegistrationJsonSerde
         long createdTime = node.get(CREATED_TIME).asLong();
         long modifiedTime = node.get(MODIFIED_TIME).asLong();
 
+        BulkLoadDataState dataState = BulkLoadDataState.ACTIVE;
+        String bulkLoadId = null;
+        if (version == VERSION) {
+            JsonNode dataStateNode = node.get(DATA_STATE);
+            JsonNode bulkLoadIdNode = node.get(BULK_LOAD_ID);
+            checkArgument(
+                    dataStateNode != null
+                            && dataStateNode.isIntegralNumber()
+                            && dataStateNode.canConvertToInt(),
+                    "TableRegistration version 2 data_state must be an integer.");
+            checkArgument(
+                    bulkLoadIdNode != null && bulkLoadIdNode.isTextual(),
+                    "TableRegistration version 2 bulk_load_id must be a string.");
+            dataState = BulkLoadDataState.fromCode(dataStateNode.intValue());
+            bulkLoadId = bulkLoadIdNode.textValue();
+        }
+
         return new TableRegistration(
                 tableId,
                 comment,
@@ -166,7 +196,26 @@ public class TableRegistrationJsonSerde
                 customProperties,
                 remoteDataDir,
                 createdTime,
-                modifiedTime);
+                modifiedTime,
+                dataState,
+                bulkLoadId);
+    }
+
+    private static int readVersion(JsonNode node) {
+        JsonNode versionNode = node.get(VERSION_KEY);
+        String version = versionNode == null ? "missing" : versionNode.toString();
+        checkArgument(
+                node.has(VERSION_KEY)
+                        && versionNode.isIntegralNumber()
+                        && versionNode.canConvertToInt(),
+                "TableRegistration version must be an integer: %s.",
+                version);
+        int versionValue = versionNode.intValue();
+        checkArgument(
+                versionValue > 0 && versionValue <= VERSION,
+                "Unsupported TableRegistration version %s.",
+                versionValue);
+        return versionValue;
     }
 
     private Map<String, String> deserializeProperties(JsonNode node) {

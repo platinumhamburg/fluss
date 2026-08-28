@@ -141,7 +141,10 @@ class RemoteLogDownloaderTest {
 
             futures.get(1).getRecycleCallback().run();
             futures.get(2).getRecycleCallback().run();
-            assertThat(remoteLogDownloader.getPrefetchSemaphore().availablePermits()).isEqualTo(2);
+            // The active download thread may temporarily hold one permit while polling an empty
+            // queue.
+            assertThat(remoteLogDownloader.getPrefetchSemaphore().availablePermits())
+                    .isBetween(1, 2);
             // the removal of log files are async, so we need to wait for the removal.
             retry(
                     Duration.ofMinutes(1),

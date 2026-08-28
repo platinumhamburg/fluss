@@ -30,6 +30,7 @@ import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.PbLookupRespForBucket;
 import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.messages.PutKvResponse;
+import org.apache.fluss.server.kv.KvRecoverHelper;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
@@ -59,6 +60,7 @@ import static org.apache.fluss.testutils.DataTestUtils.getKeyValuePairs;
 import static org.apache.fluss.testutils.DataTestUtils.toKvRecordBatch;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * IT case for recovering KV state from remote log when local log segments are insufficient.
@@ -88,6 +90,30 @@ class KvRecoverFromRemoteLogITCase {
                     .setNumOfTabletServers(3)
                     .setClusterConf(initConfig())
                     .build();
+
+    @Test
+    void testRecoveryRejectsMissingPrefixMiddleAndRemoteLocalBoundary() {
+        assertThatThrownBy(() -> KvRecoverHelper.requireContinuousBatch(0L, 1L, 2L, 10L))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("expected 0")
+                .hasMessageContaining("found 1");
+        assertThatThrownBy(() -> KvRecoverHelper.requireContinuousBatch(4L, 6L, 7L, 10L))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("expected 4")
+                .hasMessageContaining("found 6");
+        assertThatThrownBy(() -> KvRecoverHelper.requireContinuousBatch(7L, 7L, 11L, 10L))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("target 10");
+        assertThatThrownBy(
+                        () ->
+                                KvRecoverHelper.requireExactRecoveryOffset(
+                                        10L, 9L, "remote/local handoff"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("remote/local handoff")
+                .hasMessageContaining("ended at 9")
+                .hasMessageContaining("required offset 10");
+        assertThat(KvRecoverHelper.requireContinuousBatch(7L, 7L, 10L, 10L)).isEqualTo(10L);
+    }
 
     @Test
     void testKvRecoverFromRemoteLogAfterLeaderTransfer() throws Exception {
@@ -176,7 +202,13 @@ class KvRecoverFromRemoteLogITCase {
         waitUntil(
                 () -> leaderLogTablet.canFetchFromRemoteLog(snapshotLogOffset),
                 Duration.ofMinutes(2),
-                "Fail to wait for remote log to cover beyond snapshot offset " + snapshotLogOffset);
+                "Fail to wait for remote log to cover snapshot offset " + snapshotLogOffset);
+        leaderLogTablet.updateMinRetainOffset(leaderLogTablet.getHighWatermark());
+        waitUntil(
+                () -> leaderLogTablet.localLogStartOffset() > snapshotLogOffset,
+                Duration.ofMinutes(2),
+                "Fail to delete a non-empty local range after snapshot offset "
+                        + snapshotLogOffset);
 
         // =====================================================================
         // Step 3: Restart follower → catches up via remote fetch path
@@ -191,7 +223,7 @@ class KvRecoverFromRemoteLogITCase {
         // =====================================================================
         // Step 4: Assert the remote log recovery precondition
         // =====================================================================
-        // Verify: snapshotLogOffset < followerLocalLogStartOffset
+        // Verify a non-empty remote range rather than accepting only the boundary handoff.
         // This is the exact condition checked in Replica.recoverKvTablet():
         //   if (startRecoverLogOffset < logTablet.localLogStartOffset()) { ... }
         // When the follower becomes leader and downloads S1 (logOffset = snapshotLogOffset),
@@ -202,7 +234,7 @@ class KvRecoverFromRemoteLogITCase {
         long followerLocalLogStart = followerReplica.getLogTablet().localLogStartOffset();
         assertThat(snapshotLogOffset)
                 .as(
-                        "Snapshot log offset (%d) should be less than follower's "
+                        "Snapshot log offset (%d) should not exceed follower's "
                                 + "localLogStartOffset (%d) to trigger remote log recovery",
                         snapshotLogOffset, followerLocalLogStart)
                 .isLessThan(followerLocalLogStart);
@@ -222,7 +254,7 @@ class KvRecoverFromRemoteLogITCase {
                         currentLeaderAndIsr.bucketEpoch() + 1);
 
         FLUSS_CLUSTER_EXTENSION.notifyLeaderAndIsr(
-                followerToPromote, tablePath, tableBucket, newLeaderAndIsr, replicas);
+                followerToPromote, tableBucket, newLeaderAndIsr, replicas);
 
         // =====================================================================
         // Step 6: Verify the new leader recovers all data correctly

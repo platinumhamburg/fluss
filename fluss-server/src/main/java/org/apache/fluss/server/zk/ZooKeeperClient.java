@@ -88,8 +88,11 @@ import org.apache.fluss.server.zk.data.ZkData.TableIdZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableSequenceIdZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableZNode;
 import org.apache.fluss.server.zk.data.ZkData.TablesZNode;
+import org.apache.fluss.server.zk.data.ZkData.TabletServerSessionFenceZNode;
+import org.apache.fluss.server.zk.data.ZkData.TabletServerSessionFencesZNode;
 import org.apache.fluss.server.zk.data.ZkData.WriterIdZNode;
 import org.apache.fluss.server.zk.data.ZkVersion;
+import org.apache.fluss.server.zk.data.bulkload.BulkLoadDataState;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
 import org.apache.fluss.server.zk.data.lease.KvSnapshotLeaseMetadata;
@@ -98,6 +101,7 @@ import org.apache.fluss.shaded.curator5.org.apache.curator.framework.CuratorFram
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.api.BackgroundCallback;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.api.CuratorEvent;
 import org.apache.fluss.shaded.curator5.org.apache.curator.framework.api.transaction.CuratorOp;
+import org.apache.fluss.shaded.curator5.org.apache.curator.framework.api.transaction.CuratorTransactionResult;
 import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.CreateMode;
 import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.KeeperException;
 import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.data.Stat;
@@ -220,6 +224,313 @@ public class ZooKeeperClient implements AutoCloseable {
         } catch (KeeperException.NoNodeException e) {
             return Optional.empty();
         }
+    }
+
+    /** Returns node data together with the exact ZooKeeper stat observed by the same read. */
+    public DataWithStat getDataWithStat(String path) throws Exception {
+        Stat stat = new Stat();
+        byte[] data = zkClient.getData().storingStatIn(stat).forPath(path);
+        return new DataWithStat(data, stat);
+    }
+
+    /** Returns data and stat, treating only an authoritative NoNode response as absence. */
+    public Optional<DataWithStat> getDataWithStatIfExists(String path) throws Exception {
+        try {
+            return Optional.of(getDataWithStat(path));
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Returns child names together with the exact parent stat observed by the same read. */
+    public ChildrenWithStat getChildrenWithStat(String path) throws Exception {
+        Stat stat = new Stat();
+        List<String> children = zkClient.getChildren().storingStatIn(stat).forPath(path);
+        return new ChildrenWithStat(children, stat);
+    }
+
+    /** Returns children and stat, treating only an authoritative NoNode response as absence. */
+    public Optional<ChildrenWithStat> getChildrenWithStatIfExists(String path) throws Exception {
+        try {
+            return Optional.of(getChildrenWithStat(path));
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Returns whether the path authoritatively exists. */
+    public boolean pathExists(String path) throws Exception {
+        return zkClient.checkExists().forPath(path) != null;
+    }
+
+    /** Submits a bounded multi whose complete operation list has already been captured. */
+    public CheckedMultiResult submitCheckedMulti(
+            List<CheckedOperation> operations, long maxSerializedBytes) throws Exception {
+        long size = 17L;
+        List<CuratorOp> curatorOps = new ArrayList<>(operations.size());
+        for (CheckedOperation operation : operations) {
+            size = checkedAdd(size, operation.serializedSize());
+            switch (operation.type) {
+                case CHECK:
+                    curatorOps.add(zkOp.checkOp(operation.path, operation.version));
+                    break;
+                case ASSERT_ABSENT:
+                    curatorOps.add(
+                            zkOp.createOp(operation.path, new byte[0], CreateMode.PERSISTENT));
+                    curatorOps.add(
+                            zkClient.transactionOp()
+                                    .delete()
+                                    .withVersion(0)
+                                    .forPath(operation.path));
+                    break;
+                case CREATE:
+                    curatorOps.add(
+                            zkOp.createOp(operation.path, operation.data, CreateMode.PERSISTENT));
+                    break;
+                case SET:
+                    curatorOps.add(
+                            zkClient.transactionOp()
+                                    .setData()
+                                    .withVersion(operation.version)
+                                    .forPath(operation.path, operation.data));
+                    break;
+                case DELETE:
+                    curatorOps.add(
+                            zkClient.transactionOp()
+                                    .delete()
+                                    .withVersion(operation.version)
+                                    .forPath(operation.path));
+                    break;
+                default:
+                    throw new IllegalStateException("Unsupported checked operation.");
+            }
+        }
+        if (size > maxSerializedBytes) {
+            throw new IllegalArgumentException(
+                    "ZooKeeper multi serialized size "
+                            + size
+                            + " exceeds limit "
+                            + maxSerializedBytes
+                            + '.');
+        }
+        Collection<CuratorTransactionResult> results =
+                zkClient.transaction().forOperations(curatorOps);
+        List<CheckedOperationResult> checkedResults = new ArrayList<>(results.size());
+        for (CuratorTransactionResult result : results) {
+            checkedResults.add(
+                    new CheckedOperationResult(result.getForPath(), result.getResultStat()));
+        }
+        return new CheckedMultiResult(checkedResults);
+    }
+
+    public static long estimateCheckSerializedSize(String path) {
+        return checkedAdd(17L, utf8Length(path));
+    }
+
+    public static long estimateCreateSerializedSize(String path, byte[] data) {
+        return checkedAdd(48L, checkedAdd(utf8Length(path), data.length));
+    }
+
+    public static long estimateSetSerializedSize(String path, byte[] data) {
+        return checkedAdd(21L, checkedAdd(utf8Length(path), data.length));
+    }
+
+    public static long estimateDeleteSerializedSize(String path) {
+        return checkedAdd(17L, utf8Length(path));
+    }
+
+    public static long checkedAdd(long left, long right) {
+        return Math.addExact(left, right);
+    }
+
+    private static int utf8Length(String value) {
+        return value.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+    }
+
+    /** Immutable result of one data+stat read. */
+    public static final class DataWithStat {
+        private final byte[] data;
+        private final Stat stat;
+
+        private DataWithStat(byte[] data, Stat stat) {
+            this.data = Arrays.copyOf(data, data.length);
+            this.stat = stat;
+        }
+
+        public byte[] getData() {
+            return Arrays.copyOf(data, data.length);
+        }
+
+        public Stat getStat() {
+            return stat;
+        }
+    }
+
+    /** Immutable result of one children+stat read. */
+    public static final class ChildrenWithStat {
+        private final List<String> children;
+        private final Stat stat;
+
+        private ChildrenWithStat(List<String> children, Stat stat) {
+            List<String> sortedChildren = new ArrayList<>(children);
+            Collections.sort(sortedChildren);
+            this.children = Collections.unmodifiableList(sortedChildren);
+            this.stat = stat;
+        }
+
+        public List<String> getChildren() {
+            return children;
+        }
+
+        public Stat getStat() {
+            return stat;
+        }
+    }
+
+    /** Immutable table registration and ZooKeeper version observed by one startup read. */
+    public static final class TableRegistrationSnapshot {
+        private final TableRegistration registration;
+        private final int version;
+
+        private TableRegistrationSnapshot(TableRegistration registration, int version) {
+            this.registration = registration;
+            this.version = version;
+        }
+
+        /** Returns the registration decoded by the same strict batch read. */
+        public TableRegistration getRegistration() {
+            return registration;
+        }
+
+        /** Returns the ZooKeeper version observed with the registration data. */
+        public int getVersion() {
+            return version;
+        }
+    }
+
+    /** Immutable partition registration and ZooKeeper version observed by one startup read. */
+    public static final class PartitionRegistrationSnapshot {
+        private final PartitionRegistration registration;
+        private final int version;
+
+        private PartitionRegistrationSnapshot(PartitionRegistration registration, int version) {
+            this.registration = registration;
+            this.version = version;
+        }
+
+        /** Returns the registration decoded by the same strict batch read. */
+        public PartitionRegistration getRegistration() {
+            return registration;
+        }
+
+        /** Returns the ZooKeeper version observed with the registration data. */
+        public int getVersion() {
+            return version;
+        }
+    }
+
+    /** Results returned by the same ZooKeeper multi that applied the checked writes. */
+    public static final class CheckedMultiResult {
+        private final List<CheckedOperationResult> results;
+
+        private CheckedMultiResult(List<CheckedOperationResult> results) {
+            this.results = Collections.unmodifiableList(new ArrayList<>(results));
+        }
+
+        @Nullable
+        public Stat getStat(String path) {
+            for (CheckedOperationResult result : results) {
+                if (path.equals(result.path) && result.stat != null) {
+                    return result.stat;
+                }
+            }
+            return null;
+        }
+    }
+
+    private static final class CheckedOperationResult {
+        private final String path;
+        private final @Nullable Stat stat;
+
+        private CheckedOperationResult(String path, @Nullable Stat stat) {
+            this.path = path;
+            this.stat = stat;
+        }
+    }
+
+    /** One fully resolved operation in a checked ZooKeeper multi. */
+    public static final class CheckedOperation {
+        private final OperationType type;
+        private final String path;
+        private final byte[] data;
+        private final int version;
+
+        private CheckedOperation(OperationType type, String path, byte[] data, int version) {
+            this.type = type;
+            this.path = checkNotNull(path);
+            this.data = data == null ? null : Arrays.copyOf(data, data.length);
+            this.version = version;
+        }
+
+        public static CheckedOperation check(String path, int version) {
+            return new CheckedOperation(OperationType.CHECK, path, null, version);
+        }
+
+        /** Atomically requires a path to remain absent for the checked multi. */
+        public static CheckedOperation assertAbsent(String path) {
+            return new CheckedOperation(OperationType.ASSERT_ABSENT, path, null, -1);
+        }
+
+        public static CheckedOperation create(String path, byte[] data) {
+            return new CheckedOperation(OperationType.CREATE, path, data, -1);
+        }
+
+        public static CheckedOperation set(String path, byte[] data, int version) {
+            return new CheckedOperation(OperationType.SET, path, data, version);
+        }
+
+        public static CheckedOperation delete(String path, int version) {
+            return new CheckedOperation(OperationType.DELETE, path, null, version);
+        }
+
+        public String getPath() {
+            return path;
+        }
+
+        public boolean isCheck() {
+            return type == OperationType.CHECK || type == OperationType.ASSERT_ABSENT;
+        }
+
+        public int getVersion() {
+            return version;
+        }
+
+        long serializedSize() {
+            switch (type) {
+                case CHECK:
+                    return estimateCheckSerializedSize(path);
+                case ASSERT_ABSENT:
+                    return checkedAdd(
+                            estimateCreateSerializedSize(path, new byte[0]),
+                            estimateDeleteSerializedSize(path));
+                case CREATE:
+                    return estimateCreateSerializedSize(path, data);
+                case SET:
+                    return estimateSetSerializedSize(path, data);
+                case DELETE:
+                    return estimateDeleteSerializedSize(path);
+                default:
+                    throw new IllegalStateException("Unsupported checked operation.");
+            }
+        }
+    }
+
+    private enum OperationType {
+        CHECK,
+        ASSERT_ABSENT,
+        CREATE,
+        SET,
+        DELETE
     }
 
     public String getDefaultRemoteDataDir() {
@@ -362,15 +673,48 @@ public class ZooKeeperClient implements AutoCloseable {
             int tabletServerId, TabletServerRegistration tabletServerRegistration)
             throws Exception {
         String path = ServerIdZNode.path(tabletServerId);
-        zkClient.create()
-                .creatingParentsIfNeeded()
-                .withMode(CreateMode.EPHEMERAL)
-                .forPath(path, ServerIdZNode.encode(tabletServerRegistration));
+        long sessionId = zkClient.getZookeeperClient().getZooKeeper().getSessionId();
+        if (sessionId == 0) {
+            throw new IllegalStateException(
+                    "Cannot register TabletServer without an active ZooKeeper session.");
+        }
+        ensurePersistentPath(ServerIdsZNode.path());
+        ensurePersistentPath(TabletServerSessionFencesZNode.path());
+        CuratorOp registration =
+                zkClient.transactionOp()
+                        .create()
+                        .withMode(CreateMode.EPHEMERAL)
+                        .forPath(path, ServerIdZNode.encode(tabletServerRegistration));
+        String sessionFencePath = TabletServerSessionFenceZNode.path(tabletServerId, sessionId);
+        CuratorOp sessionFence =
+                zkClient.transactionOp()
+                        .create()
+                        .withMode(CreateMode.EPHEMERAL)
+                        .forPath(sessionFencePath, TabletServerSessionFenceZNode.encode());
+        zkClient.transaction().forOperations(registration, sessionFence);
         LOG.info(
-                "Registered tablet server {} at path {} with registration {}.",
+                "Registered tablet server {} at path {} with registration {} and session fence {}.",
                 tabletServerId,
                 path,
-                tabletServerRegistration);
+                tabletServerRegistration,
+                sessionFencePath);
+    }
+
+    private void ensurePersistentPath(String path) throws Exception {
+        try {
+            zkClient.create()
+                    .creatingParentsIfNeeded()
+                    .withMode(CreateMode.PERSISTENT)
+                    .forPath(path);
+        } catch (KeeperException.NodeExistsException ignored) {
+            // Parent already exists.
+        }
+    }
+
+    /** Ensures the static collection paths used by BulkLoad metadata. */
+    public void ensureBulkLoadMetadataPaths() throws Exception {
+        ensurePersistentPath(ZkData.BulkLoadTableTransactionsZNode.path());
+        ensurePersistentPath(ZkData.BulkLoadPartitionTransactionsZNode.path());
     }
 
     /** Get the tablet server registered in ZK. */
@@ -825,6 +1169,37 @@ public class ZooKeeperClient implements AutoCloseable {
                 "tables registration");
     }
 
+    /** Gets strict, versioned table registration snapshots for Coordinator startup. */
+    public Map<TablePath, TableRegistrationSnapshot> getTableRegistrationSnapshots(
+            Collection<TablePath> tablePaths) throws Exception {
+        Map<String, TablePath> path2TablePathMap =
+                tablePaths.stream().collect(Collectors.toMap(TableZNode::path, path -> path));
+        List<ZkGetDataResponse> responses = getDataInBackground(path2TablePathMap.keySet());
+        Map<TablePath, TableRegistrationSnapshot> result = new HashMap<>();
+        for (ZkGetDataResponse response : responses) {
+            response.maybeThrow();
+            if (response.getData() == null || response.getData().length == 0) {
+                throw new IllegalStateException(
+                        "Empty table registration data at " + response.getPath() + ".");
+            }
+            if (response.getStat() == null) {
+                throw new IllegalStateException(
+                        "Missing table registration version at " + response.getPath() + ".");
+            }
+            TableRegistration registration = TableZNode.decode(response.getData());
+            if (registration.remoteDataDir == null) {
+                registration = registration.newRemoteDataDir(defaultRemoteDataDir);
+            }
+            result.put(
+                    path2TablePathMap.get(response.getPath()),
+                    new TableRegistrationSnapshot(registration, response.getStat().getVersion()));
+        }
+        if (!result.keySet().equals(new HashSet<>(tablePaths))) {
+            throw new IllegalStateException("Incomplete startup table registrations.");
+        }
+        return result;
+    }
+
     /** Get the latest schema for given tables in ZK. */
     public Map<TablePath, SchemaInfo> getLatestSchemas(Collection<TablePath> tablePaths)
             throws Exception {
@@ -924,12 +1299,16 @@ public class ZooKeeperClient implements AutoCloseable {
         return partitions;
     }
 
-    /** Get the partition and the id for the partitions of tables in ZK. */
-    public Map<TablePath, Map<String, Long>> getPartitionNameAndIdsForTables(
-            List<TablePath> tablePaths) throws Exception {
-        Map<TablePath, Map<String, Long>> result = new HashMap<>();
+    /** Gets strict, identity-bearing partition registration snapshots for Coordinator startup. */
+    public Map<TablePath, Map<String, PartitionRegistrationSnapshot>>
+            getPartitionRegistrationSnapshotsForTables(List<TablePath> tablePaths)
+                    throws Exception {
+        Map<TablePath, Map<String, PartitionRegistrationSnapshot>> result = new HashMap<>();
 
         Map<TablePath, List<String>> tablePath2Partitions = getPartitionsForTables(tablePaths);
+        if (tablePath2Partitions.size() != tablePaths.size()) {
+            throw new IllegalStateException("Incomplete startup partition registrations.");
+        }
 
         // each TablePath has a list of partitions
         Map<String, TablePath> zkPath2TablePath = new HashMap<>();
@@ -945,22 +1324,55 @@ public class ZooKeeperClient implements AutoCloseable {
         }
 
         List<ZkGetDataResponse> responses = getDataInBackground(zkPath2TablePath.keySet());
+        Map<String, PartitionRegistrationSnapshot> registrations = new HashMap<>();
         for (ZkGetDataResponse response : responses) {
-            if (response.getResultCode() == KeeperException.Code.OK) {
-                String zkPath = response.getPath();
-                TablePath tablePath = zkPath2TablePath.get(zkPath);
-                String partitionName = zkPath2PartitionName.get(zkPath);
-                long partitionId = PartitionZNode.decode(response.getData()).getPartitionId();
-                result.computeIfAbsent(tablePath, k -> new HashMap<>())
-                        .put(partitionName, partitionId);
-            } else {
-                LOG.warn(
-                        "Failed to get data for path {}: {}",
-                        response.getPath(),
-                        response.getResultCode());
+            response.maybeThrow();
+            if (response.getData() == null || response.getData().length == 0) {
+                throw new IllegalStateException(
+                        "Empty partition registrations data at " + response.getPath() + ".");
             }
+            if (response.getStat() == null) {
+                throw new IllegalStateException(
+                        "Missing partition registration version at " + response.getPath() + ".");
+            }
+            registrations.put(
+                    response.getPath(),
+                    new PartitionRegistrationSnapshot(
+                            PartitionZNode.decode(response.getData()),
+                            response.getStat().getVersion()));
         }
+        if (!registrations.keySet().equals(zkPath2TablePath.keySet())) {
+            throw new IllegalStateException("Incomplete startup partition registrations.");
+        }
+        registrations.forEach(
+                (zkPath, snapshot) ->
+                        result.computeIfAbsent(zkPath2TablePath.get(zkPath), k -> new HashMap<>())
+                                .put(zkPath2PartitionName.get(zkPath), snapshot));
         return result;
+    }
+
+    /**
+     * Verifies that a startup partition snapshot still names the same physical registration.
+     *
+     * <p>Any concurrent drop/recreate or mutation fails leadership initialization instead of
+     * binding the new registration under the old physical ID.
+     */
+    public PartitionRegistrationSnapshot verifyPartitionRegistrationSnapshot(
+            TablePath tablePath, String partitionName, PartitionRegistrationSnapshot snapshot)
+            throws Exception {
+        String path = PartitionZNode.path(tablePath, partitionName);
+        DataWithStat current = getDataWithStat(path);
+        PartitionRegistration currentRegistration = PartitionZNode.decode(current.getData());
+        if (current.getStat().getVersion() != snapshot.getVersion()
+                || !currentRegistration.equals(snapshot.getRegistration())) {
+            throw new IllegalStateException(
+                    "Startup partition registration changed while initializing "
+                            + tablePath
+                            + "/"
+                            + partitionName
+                            + ".");
+        }
+        return snapshot;
     }
 
     /** Get the partition registrations of a table in ZK by partition spec. */
@@ -1168,12 +1580,52 @@ public class ZooKeeperClient implements AutoCloseable {
     // --------------------------------------------------------------------------------------------
     // Table Bucket snapshot
     // --------------------------------------------------------------------------------------------
+    /** Allocates an ID from the same per-bucket sequence used by ordinary snapshots. */
+    public long allocateTableBucketSnapshotId(TableBucket tableBucket) throws Exception {
+        return new ZkSequenceIDCounter(
+                        zkClient, ZkData.BucketSnapshotSequenceIdZNode.path(tableBucket))
+                .getAndIncrement();
+    }
+
     public void registerTableBucketSnapshot(TableBucket tableBucket, BucketSnapshot snapshot)
             throws Exception {
         String path = BucketSnapshotIdZNode.path(tableBucket, snapshot.getSnapshotId());
         zkClient.create()
                 .creatingParentsIfNeeded()
                 .forPath(path, BucketSnapshotIdZNode.encode(snapshot));
+    }
+
+    /** Registers a snapshot under the coordinator and exact source-metadata v1 fences. */
+    public void registerTableBucketSnapshot(
+            TableBucket tableBucket,
+            BucketSnapshot snapshot,
+            @Nullable String sourceMetadataPath,
+            @Nullable Integer sourceMetadataVersion,
+            int coordinatorZkVersion,
+            int leaderAndIsrZkVersion)
+            throws Exception {
+        String path = BucketSnapshotIdZNode.path(tableBucket, snapshot.getSnapshotId());
+        ensureParentExists(
+                path,
+                tableBucket,
+                sourceMetadataPath,
+                sourceMetadataVersion,
+                coordinatorZkVersion,
+                leaderAndIsrZkVersion);
+        requireSourceMetadataPair(sourceMetadataPath, sourceMetadataVersion);
+        if (sourceMetadataPath != null) {
+            requireActiveSourceMetadata(tableBucket, sourceMetadataPath, sourceMetadataVersion);
+        }
+        List<CuratorOp> operations =
+                ordinaryCommitChecks(
+                        tableBucket,
+                        sourceMetadataPath,
+                        sourceMetadataVersion,
+                        coordinatorZkVersion,
+                        leaderAndIsrZkVersion);
+        operations.add(
+                zkOp.createOp(path, BucketSnapshotIdZNode.encode(snapshot), CreateMode.PERSISTENT));
+        zkClient.transaction().forOperations(operations);
     }
 
     public void deleteTableBucketSnapshot(TableBucket tableBucket, long snapshotId)
@@ -1363,6 +1815,148 @@ public class ZooKeeperClient implements AutoCloseable {
             zkClient.create()
                     .creatingParentsIfNeeded()
                     .forPath(path, BucketRemoteLogsZNode.encode(remoteLogManifestHandle));
+        }
+    }
+
+    /** Upserts a remote-log manifest under coordinator and exact source-metadata v1 fences. */
+    public void upsertRemoteLogManifestHandle(
+            TableBucket tableBucket,
+            RemoteLogManifestHandle remoteLogManifestHandle,
+            @Nullable String sourceMetadataPath,
+            @Nullable Integer sourceMetadataVersion,
+            int coordinatorZkVersion,
+            int leaderAndIsrZkVersion)
+            throws Exception {
+        String path = BucketRemoteLogsZNode.path(tableBucket);
+        ensureParentExists(
+                path,
+                tableBucket,
+                sourceMetadataPath,
+                sourceMetadataVersion,
+                coordinatorZkVersion,
+                leaderAndIsrZkVersion);
+        requireSourceMetadataPair(sourceMetadataPath, sourceMetadataVersion);
+        if (sourceMetadataPath != null) {
+            requireActiveSourceMetadata(tableBucket, sourceMetadataPath, sourceMetadataVersion);
+        }
+        byte[] data = BucketRemoteLogsZNode.encode(remoteLogManifestHandle);
+        Optional<DataWithStat> current = getDataWithStatIfExists(path);
+        CuratorOp write =
+                current.isPresent()
+                        ? zkClient.transactionOp()
+                                .setData()
+                                .withVersion(current.get().getStat().getVersion())
+                                .forPath(path, data)
+                        : zkOp.createOp(path, data, CreateMode.PERSISTENT);
+        List<CuratorOp> operations =
+                ordinaryCommitChecks(
+                        tableBucket,
+                        sourceMetadataPath,
+                        sourceMetadataVersion,
+                        coordinatorZkVersion,
+                        leaderAndIsrZkVersion);
+        operations.add(write);
+        zkClient.transaction().forOperations(operations);
+    }
+
+    private void ensureParentExists(
+            String path,
+            TableBucket tableBucket,
+            @Nullable String sourceMetadataPath,
+            @Nullable Integer sourceMetadataVersion,
+            int coordinatorZkVersion,
+            int leaderAndIsrZkVersion)
+            throws Exception {
+        int lastSlash = path.lastIndexOf('/');
+        if (lastSlash <= 0) {
+            throw new KeeperException.NoNodeException(path);
+        }
+        String parentPath = path.substring(0, lastSlash);
+        if (zkClient.checkExists().forPath(parentPath) != null) {
+            return;
+        }
+        String snapshotParent = BucketSnapshotsZNode.path(tableBucket);
+        if (!parentPath.equals(snapshotParent)) {
+            // BucketId/TableId/PartitionId nodes carry physical identity or are owned by replica
+            // assignment. Ordinary commits must never recreate them as null structural nodes.
+            throw new KeeperException.NoNodeException(parentPath);
+        }
+        String bucketRoot = ZkData.BucketIdZNode.path(tableBucket);
+        if (zkClient.checkExists().forPath(bucketRoot) == null) {
+            throw new KeeperException.NoNodeException(bucketRoot);
+        }
+        requireSourceMetadataPair(sourceMetadataPath, sourceMetadataVersion);
+        if (sourceMetadataPath != null) {
+            requireActiveSourceMetadata(tableBucket, sourceMetadataPath, sourceMetadataVersion);
+        }
+        try {
+            List<CuratorOp> operations =
+                    ordinaryCommitChecks(
+                            tableBucket,
+                            sourceMetadataPath,
+                            sourceMetadataVersion,
+                            coordinatorZkVersion,
+                            leaderAndIsrZkVersion);
+            operations.add(zkOp.checkOp(bucketRoot, -1));
+            operations.add(zkOp.createOp(parentPath, null, CreateMode.PERSISTENT));
+            zkClient.transaction().forOperations(operations);
+        } catch (KeeperException.NodeExistsException ignored) {
+            // The structural parent already exists.
+        }
+    }
+
+    private List<CuratorOp> ordinaryCommitChecks(
+            TableBucket tableBucket,
+            @Nullable String sourceMetadataPath,
+            @Nullable Integer sourceMetadataVersion,
+            int coordinatorZkVersion,
+            int leaderAndIsrZkVersion)
+            throws Exception {
+        requireSourceMetadataPair(sourceMetadataPath, sourceMetadataVersion);
+        List<CuratorOp> operations = new ArrayList<>();
+        operations.add(zkOp.checkOp(ZkData.CoordinatorEpochZNode.path(), coordinatorZkVersion));
+        operations.add(zkOp.checkOp(LeaderAndIsrZNode.path(tableBucket), leaderAndIsrZkVersion));
+        if (sourceMetadataPath != null) {
+            operations.add(zkOp.checkOp(sourceMetadataPath, sourceMetadataVersion));
+        }
+        return operations;
+    }
+
+    private static void requireSourceMetadataPair(
+            @Nullable String sourceMetadataPath, @Nullable Integer sourceMetadataVersion) {
+        if ((sourceMetadataPath == null) != (sourceMetadataVersion == null)) {
+            throw new IllegalArgumentException(
+                    "Source metadata path and version must either both be present or both absent.");
+        }
+    }
+
+    private void requireActiveSourceMetadata(
+            TableBucket tableBucket, String sourceMetadataPath, int sourceMetadataVersion)
+            throws Exception {
+        DataWithStat metadata = getDataWithStat(sourceMetadataPath);
+        if (metadata.getStat().getVersion() != sourceMetadataVersion) {
+            throw new KeeperException.BadVersionException(sourceMetadataPath);
+        }
+        BulkLoadDataState state;
+        String bulkLoadId;
+        if (tableBucket.getPartitionId() == null) {
+            TableRegistration registration = TableZNode.decode(metadata.getData());
+            if (registration.tableId != tableBucket.getTableId()) {
+                throw new IllegalStateException("Source table metadata identity changed.");
+            }
+            state = registration.dataState;
+            bulkLoadId = registration.bulkLoadId;
+        } else {
+            PartitionRegistration registration = PartitionZNode.decode(metadata.getData());
+            if (registration.getTableId() != tableBucket.getTableId()
+                    || registration.getPartitionId() != tableBucket.getPartitionId()) {
+                throw new IllegalStateException("Source partition metadata identity changed.");
+            }
+            state = registration.getDataState();
+            bulkLoadId = registration.getBulkLoadId();
+        }
+        if (state != BulkLoadDataState.ACTIVE || bulkLoadId != null) {
+            throw new IllegalStateException("Source metadata is not ordinary ACTIVE metadata.");
         }
     }
 
@@ -1998,6 +2592,26 @@ public class ZooKeeperClient implements AutoCloseable {
                         response.getPath(),
                         response.getResultCode());
             }
+        }
+        return result;
+    }
+
+    /** Decodes a batch only when every ZooKeeper response is successful and non-empty. */
+    public static <K, V> Map<K, V> processGetDataResponsesStrict(
+            List<ZkGetDataResponse> responses,
+            Function<ZkGetDataResponse, K> keyExtractor,
+            Function<byte[], V> decoder,
+            String operationName)
+            throws KeeperException {
+        Map<K, V> result = new HashMap<>();
+        for (ZkGetDataResponse response : responses) {
+            response.maybeThrow();
+            byte[] data = response.getData();
+            if (data == null || data.length == 0) {
+                throw new IllegalStateException(
+                        "Empty " + operationName + " data at " + response.getPath() + ".");
+            }
+            result.put(keyExtractor.apply(response), decoder.apply(data));
         }
         return result;
     }

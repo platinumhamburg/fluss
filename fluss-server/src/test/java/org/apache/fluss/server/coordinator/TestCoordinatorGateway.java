@@ -22,6 +22,8 @@ import org.apache.fluss.exception.IneligibleReplicaException;
 import org.apache.fluss.exception.NetworkException;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
+import org.apache.fluss.rpc.messages.AbortBulkLoadRequest;
+import org.apache.fluss.rpc.messages.AbortBulkLoadResponse;
 import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseRequest;
 import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseResponse;
 import org.apache.fluss.rpc.messages.AddServerTagRequest;
@@ -36,8 +38,12 @@ import org.apache.fluss.rpc.messages.AlterTableRequest;
 import org.apache.fluss.rpc.messages.AlterTableResponse;
 import org.apache.fluss.rpc.messages.ApiVersionsRequest;
 import org.apache.fluss.rpc.messages.ApiVersionsResponse;
+import org.apache.fluss.rpc.messages.BeginBulkLoadRequest;
+import org.apache.fluss.rpc.messages.BeginBulkLoadResponse;
 import org.apache.fluss.rpc.messages.CancelRebalanceRequest;
 import org.apache.fluss.rpc.messages.CancelRebalanceResponse;
+import org.apache.fluss.rpc.messages.CommitBulkLoadRequest;
+import org.apache.fluss.rpc.messages.CommitBulkLoadResponse;
 import org.apache.fluss.rpc.messages.CommitKvSnapshotRequest;
 import org.apache.fluss.rpc.messages.CommitKvSnapshotResponse;
 import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
@@ -70,6 +76,8 @@ import org.apache.fluss.rpc.messages.DropPartitionRequest;
 import org.apache.fluss.rpc.messages.DropPartitionResponse;
 import org.apache.fluss.rpc.messages.DropTableRequest;
 import org.apache.fluss.rpc.messages.DropTableResponse;
+import org.apache.fluss.rpc.messages.GetBulkLoadStatusRequest;
+import org.apache.fluss.rpc.messages.GetBulkLoadStatusResponse;
 import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
 import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
 import org.apache.fluss.rpc.messages.GetDatabaseInfoRequest;
@@ -136,6 +144,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getAdjustIsrData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getCommitRemoteLogManifestData;
@@ -147,6 +156,8 @@ public class TestCoordinatorGateway implements CoordinatorGateway {
 
     private final @Nullable ZooKeeperClient zkClient;
     public final AtomicBoolean commitRemoteLogManifestFail = new AtomicBoolean(false);
+    public final AtomicReference<CommitRemoteLogManifestRequest> lastRemoteLogManifestCommit =
+            new AtomicReference<>();
     public final Map<TableBucket, Integer> currentLeaderEpoch = new HashMap<>();
     private Set<Integer> shutdownTabletServers;
     private boolean networkIssueEnable = false;
@@ -158,6 +169,31 @@ public class TestCoordinatorGateway implements CoordinatorGateway {
     public TestCoordinatorGateway(ZooKeeperClient zkClient) {
         this.zkClient = zkClient;
         this.shutdownTabletServers = new HashSet<>();
+    }
+
+    @Override
+    public CompletableFuture<BeginBulkLoadResponse> beginBulkLoad(BeginBulkLoadRequest request) {
+        return FutureUtils.completedExceptionally(
+                new UnsupportedOperationException("BulkLoad RPC is not implemented."));
+    }
+
+    @Override
+    public CompletableFuture<CommitBulkLoadResponse> commitBulkLoad(CommitBulkLoadRequest request) {
+        return FutureUtils.completedExceptionally(
+                new UnsupportedOperationException("BulkLoad RPC is not implemented."));
+    }
+
+    @Override
+    public CompletableFuture<AbortBulkLoadResponse> abortBulkLoad(AbortBulkLoadRequest request) {
+        return FutureUtils.completedExceptionally(
+                new UnsupportedOperationException("BulkLoad RPC is not implemented."));
+    }
+
+    @Override
+    public CompletableFuture<GetBulkLoadStatusResponse> getBulkLoadStatus(
+            GetBulkLoadStatusRequest request) {
+        return FutureUtils.completedExceptionally(
+                new UnsupportedOperationException("BulkLoad RPC is not implemented."));
     }
 
     @Override
@@ -361,6 +397,7 @@ public class TestCoordinatorGateway implements CoordinatorGateway {
     @Override
     public CompletableFuture<CommitRemoteLogManifestResponse> commitRemoteLogManifest(
             CommitRemoteLogManifestRequest request) {
+        lastRemoteLogManifestCommit.set(request);
         if (commitRemoteLogManifestFail.get()) {
             return CompletableFuture.completedFuture(
                     new CommitRemoteLogManifestResponse().setCommitSuccess(false));

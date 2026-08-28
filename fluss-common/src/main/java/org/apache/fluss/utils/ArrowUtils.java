@@ -172,6 +172,9 @@ public class ArrowUtils {
         try (ReadChannel channel =
                         new ReadChannel(new ByteBufferReadableChannel(arrowBatchBuffer));
                 ArrowRecordBatch batch = deserializeRecordBatch(channel, allocator)) {
+            if (arrowBatchBuffer.hasRemaining()) {
+                throw new IOException("Unexpected bytes after Arrow record batch.");
+            }
             FlussVectorLoader vectorLoader =
                     new FlussVectorLoader(schemaRoot, ArrowCompressionFactory.INSTANCE);
             vectorLoader.load(batch);

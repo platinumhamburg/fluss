@@ -19,11 +19,15 @@ package org.apache.fluss.client.utils;
 
 import org.apache.fluss.client.write.KvWriteBatch;
 import org.apache.fluss.client.write.ReadyWriteBatch;
+import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.PreAllocatedPagedOutputView;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.rpc.messages.ListKvSnapshotsResponse;
+import org.apache.fluss.rpc.messages.ListRemoteLogManifestsResponse;
+import org.apache.fluss.rpc.messages.PbRemoteLogManifestEntry;
 import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.protocol.MergeMode;
 
@@ -124,6 +128,67 @@ class ClientRpcMessageUtilsTest {
                 ClientRpcMessageUtils.makePutKvRequest(TABLE_ID, ACKS, TIMEOUT_MS, readyBatches);
 
         assertThat(request.getAggMode()).isEqualTo(MergeMode.OVERWRITE.getProtoValue());
+    }
+
+    @Test
+    void testToRemoteLogManifestInfosRequiresCompleteActiveReferencesResponse() {
+        assertThatThrownBy(
+                        () ->
+                                ClientRpcMessageUtils.toRemoteLogManifestInfos(
+                                        new ListRemoteLogManifestsResponse()))
+                .isInstanceOf(UnsupportedVersionException.class);
+
+        ListRemoteLogManifestsResponse incompleteResponse =
+                new ListRemoteLogManifestsResponse().setActiveReferencesComplete(false);
+        assertThatThrownBy(() -> ClientRpcMessageUtils.toRemoteLogManifestInfos(incompleteResponse))
+                .isInstanceOf(UnsupportedVersionException.class);
+
+        ListRemoteLogManifestsResponse completeResponse = new ListRemoteLogManifestsResponse();
+        completeResponse.setActiveReferencesComplete(true);
+        PbRemoteLogManifestEntry entry = completeResponse.addManifest();
+        entry.setTableBucket().setTableId(TABLE_ID).setBucketId(3);
+        entry.setRemoteLogManifestPath("oss://bucket/manifest");
+        entry.setRemoteLogEndOffset(100L);
+
+        assertThat(ClientRpcMessageUtils.toRemoteLogManifestInfos(completeResponse))
+                .singleElement()
+                .satisfies(
+                        info -> {
+                            assertThat(info.getTableBucket())
+                                    .isEqualTo(new TableBucket(TABLE_ID, 3));
+                            assertThat(info.getRemoteLogManifestPath())
+                                    .isEqualTo("oss://bucket/manifest");
+                            assertThat(info.getRemoteLogEndOffset()).isEqualTo(100L);
+                        });
+    }
+
+    @Test
+    void testToActiveKvSnapshotsRequiresCompleteActiveReferencesResponse() {
+        assertThatThrownBy(
+                        () ->
+                                ClientRpcMessageUtils.toActiveKvSnapshots(
+                                        new ListKvSnapshotsResponse().setTableId(TABLE_ID)))
+                .isInstanceOf(UnsupportedVersionException.class);
+
+        ListKvSnapshotsResponse incompleteResponse =
+                new ListKvSnapshotsResponse()
+                        .setTableId(TABLE_ID)
+                        .setActiveReferencesComplete(false);
+        assertThatThrownBy(() -> ClientRpcMessageUtils.toActiveKvSnapshots(incompleteResponse))
+                .isInstanceOf(UnsupportedVersionException.class);
+
+        ListKvSnapshotsResponse completeResponse =
+                new ListKvSnapshotsResponse()
+                        .setTableId(TABLE_ID)
+                        .setActiveReferencesComplete(true);
+        completeResponse.addActiveSnapshot().setBucketId(3).setSnapshotId(100L);
+
+        assertThat(ClientRpcMessageUtils.toActiveKvSnapshots(completeResponse).getTableId())
+                .isEqualTo(TABLE_ID);
+        assertThat(
+                        ClientRpcMessageUtils.toActiveKvSnapshots(completeResponse)
+                                .getSnapshotIdsByBucket())
+                .containsEntry(3, Collections.singleton(100L));
     }
 
     private KvWriteBatch createKvWriteBatch(int bucketId, MergeMode mergeMode) throws Exception {

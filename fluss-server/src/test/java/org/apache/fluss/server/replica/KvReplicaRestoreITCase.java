@@ -39,7 +39,10 @@ import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.types.Tuple2;
 
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.time.Duration;
@@ -63,6 +66,7 @@ import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** The IT case for the restoring of kv replica. */
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class KvReplicaRestoreITCase {
 
     @RegisterExtension
@@ -82,11 +86,13 @@ class KvReplicaRestoreITCase {
     }
 
     @Test
+    @Order(2)
     void testRestore() throws Exception {
         // create multiple tables for testing
         int tableNum = 2;
         int bucketNum = 3;
         List<TableBucket> tableBuckets = new ArrayList<>();
+        List<TablePath> tablePaths = new ArrayList<>();
         for (int i = 0; i < tableNum; i++) {
             TableDescriptor tableDescriptor =
                     TableDescriptor.builder()
@@ -95,6 +101,7 @@ class KvReplicaRestoreITCase {
                             .logFormat(i % 2 == 0 ? LogFormat.ARROW : LogFormat.COMPACTED)
                             .build();
             TablePath tablePath = TablePath.of("test_db", "test_table_" + i);
+            tablePaths.add(tablePath);
             long tableId = createTable(FLUSS_CLUSTER_EXTENSION, tablePath, tableDescriptor);
             for (int bucket = 0; bucket < bucketNum; bucket++) {
                 tableBuckets.add(new TableBucket(tableId, bucket));
@@ -110,6 +117,12 @@ class KvReplicaRestoreITCase {
                     genKvRecordBatch(new Object[] {1, "k1"}, new Object[] {2, "k2"});
 
             putRecordBatchAndAssertSuccess(tableBucket, leaderServer, kvRecordBatch);
+        }
+
+        // Make the restore prerequisite deterministic instead of depending on the periodic
+        // scheduler racing the asynchronous writes above.
+        for (TablePath tablePath : tablePaths) {
+            FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tablePath);
         }
 
         // wait for snapshot finish so that we can restore from snapshot
@@ -212,6 +225,7 @@ class KvReplicaRestoreITCase {
     }
 
     @Test
+    @Order(1)
     void testRowCountRecoveryAfterFailover() throws Exception {
         // Create a primary key table
         TableDescriptor tableDescriptor =
@@ -262,9 +276,12 @@ class KvReplicaRestoreITCase {
             AtomicInteger newLeader = new AtomicInteger(-1);
             waitUntil(
                     () -> {
-                        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tableBucket);
-                        newLeader.set(leader);
-                        return leader != currentLeader;
+                        int candidate = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tableBucket);
+                        if (candidate != currentLeader) {
+                            newLeader.set(candidate);
+                            return true;
+                        }
+                        return false;
                     },
                     Duration.ofMinutes(2),
                     "Fail to elect a new leader after stopping tablet server " + currentLeader);

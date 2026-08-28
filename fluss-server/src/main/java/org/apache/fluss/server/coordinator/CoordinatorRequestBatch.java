@@ -27,13 +27,16 @@ import org.apache.fluss.metadata.TablePartition;
 import org.apache.fluss.rpc.messages.NotifyKvSnapshotOffsetRequest;
 import org.apache.fluss.rpc.messages.NotifyLakeTableOffsetRequest;
 import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrRequest;
+import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrResponse;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsRequest;
 import org.apache.fluss.rpc.messages.PbNotifyLakeTableOffsetReqForBucket;
 import org.apache.fluss.rpc.messages.PbNotifyLeaderAndIsrReqForBucket;
 import org.apache.fluss.rpc.messages.PbStopReplicaReqForBucket;
 import org.apache.fluss.rpc.messages.PbStopReplicaRespForBucket;
 import org.apache.fluss.rpc.messages.StopReplicaRequest;
+import org.apache.fluss.rpc.messages.StopReplicaResponse;
 import org.apache.fluss.rpc.messages.UpdateMetadataRequest;
+import org.apache.fluss.rpc.messages.UpdateMetadataResponse;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.server.coordinator.event.AccessContextEvent;
 import org.apache.fluss.server.coordinator.event.DeleteReplicaResponseReceivedEvent;
@@ -44,8 +47,15 @@ import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.metadata.BucketMetadata;
 import org.apache.fluss.server.metadata.PartitionMetadata;
 import org.apache.fluss.server.metadata.TableMetadata;
+import org.apache.fluss.server.tablet.bulkload.BulkLoadTargetMetadata;
+import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.server.zk.data.PartitionRegistration;
+import org.apache.fluss.server.zk.data.TableRegistration;
+import org.apache.fluss.server.zk.data.ZkData;
+import org.apache.fluss.server.zk.data.bulkload.BulkLoadDataState;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
+import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.KeeperException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -60,6 +70,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.server.metadata.PartitionMetadata.DELETED_PARTITION_ID;
@@ -75,6 +86,8 @@ import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeNotifyRemo
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeStopBucketReplica;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeUpdateMetadataRequest;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toTableBucket;
+import static org.apache.fluss.utils.Preconditions.checkNotNull;
+import static org.apache.fluss.utils.Preconditions.checkState;
 
 /** A request sender for coordinator server to request to tablet server by batch. */
 public class CoordinatorRequestBatch {
@@ -92,6 +105,7 @@ public class CoordinatorRequestBatch {
     // a map from tablet server to stop replica for each bucket.
     private final Map<Integer, Map<TableBucket, PbStopReplicaReqForBucket>> stopReplicaRequestMap =
             new HashMap<>();
+    private final Map<Integer, Set<TableBucket>> localOnlyStopReplicaRequestMap = new HashMap<>();
 
     // a set of tabletServers to send update metadata request.
     private final Set<Integer> updateMetadataRequestTabletServerSet = new HashSet<>();
@@ -114,14 +128,24 @@ public class CoordinatorRequestBatch {
     private final CoordinatorChannelManager coordinatorChannelManager;
     private final EventManager eventManager;
     private final CoordinatorContext coordinatorContext;
+    private final @Nullable ZooKeeperClient zooKeeperClient;
 
     public CoordinatorRequestBatch(
             CoordinatorChannelManager coordinatorChannelManager,
             EventManager eventManager,
             CoordinatorContext coordinatorContext) {
+        this(coordinatorChannelManager, eventManager, coordinatorContext, null);
+    }
+
+    public CoordinatorRequestBatch(
+            CoordinatorChannelManager coordinatorChannelManager,
+            EventManager eventManager,
+            CoordinatorContext coordinatorContext,
+            @Nullable ZooKeeperClient zooKeeperClient) {
         this.coordinatorChannelManager = coordinatorChannelManager;
         this.eventManager = eventManager;
         this.coordinatorContext = coordinatorContext;
+        this.zooKeeperClient = zooKeeperClient;
     }
 
     public void newBatch() {
@@ -162,6 +186,19 @@ public class CoordinatorRequestBatch {
                                     + "a new one. Some NotifyLakeTableOffset request in %s might be lost.",
                             notifyLakeTableOffsetRequestMap));
         }
+    }
+
+    /** Discards an incomplete batch before an authoritative drop transition starts. */
+    public void discardIncompleteBatch() {
+        notifyLeaderAndIsrRequestMap.clear();
+        stopReplicaRequestMap.clear();
+        localOnlyStopReplicaRequestMap.clear();
+        updateMetadataRequestTabletServerSet.clear();
+        updateMetadataRequestBucketMap.clear();
+        updateMetadataRequestPartitionMap.clear();
+        notifyRemoteLogOffsetsRequestMap.clear();
+        notifyKvSnapshotOffsetRequestMap.clear();
+        notifyLakeTableOffsetRequestMap.clear();
     }
 
     public void sendRequestToTabletServers(int coordinatorEpoch) {
@@ -206,12 +243,83 @@ public class CoordinatorRequestBatch {
         }
     }
 
+    /** Sends one isolated local-only StopReplica request. */
+    public void sendStopReplicaRequest(
+            int serverId,
+            int coordinatorEpoch,
+            List<TableBucket> buckets,
+            Map<TableBucket, Integer> leaderEpochs,
+            BiConsumer<StopReplicaResponse, ? super Throwable> responseConsumer) {
+        StopReplicaRequest request = new StopReplicaRequest().setCoordinatorEpoch(coordinatorEpoch);
+        List<PbStopReplicaReqForBucket> items = new ArrayList<>();
+        for (TableBucket bucket : buckets) {
+            items.add(
+                    makeStopBucketReplica(
+                            bucket,
+                            true,
+                            false,
+                            checkNotNull(
+                                    leaderEpochs.get(bucket),
+                                    "BulkLoad cleanup leader epoch is required.")));
+        }
+        request.addAllStopReplicasReqs(items);
+        try {
+            coordinatorChannelManager.sendStopBucketReplicaRequest(
+                    serverId, request, responseConsumer);
+        } catch (Throwable failure) {
+            responseConsumer.accept(null, failure);
+        }
+    }
+
+    /** Sends one isolated UpdateMetadata request and exposes its acknowledgement. */
+    public void sendUpdateMetadataRequest(
+            int serverId,
+            UpdateMetadataRequest request,
+            BiConsumer<UpdateMetadataResponse, ? super Throwable> responseConsumer) {
+        coordinatorChannelManager.sendUpdateMetadataRequest(serverId, request, responseConsumer);
+    }
+
+    /** Sends one isolated NotifyLeaderAndIsr request and exposes its acknowledgement. */
+    public void sendNotifyLeaderAndIsrRequest(
+            int serverId,
+            NotifyLeaderAndIsrRequest request,
+            BiConsumer<NotifyLeaderAndIsrResponse, ? super Throwable> responseConsumer) {
+        coordinatorChannelManager.sendBucketLeaderAndIsrRequest(
+                serverId, request, responseConsumer);
+    }
+
     public void addNotifyLeaderRequestForTabletServers(
             Set<Integer> tabletServers,
             PhysicalTablePath tablePath,
             TableBucket tableBucket,
             List<Integer> bucketReplicas,
             LeaderAndIsr leaderAndIsr) {
+        if (!addNotifyLeaderRequests(
+                tabletServers, tablePath, tableBucket, bucketReplicas, leaderAndIsr)) {
+            return;
+        }
+
+        // TODO for these cases, we can send NotifyLeaderAndIsrRequest instead of another
+        // updateMetadata request, trace by: https://github.com/apache/fluss/issues/983
+        addUpdateMetadataRequestForTabletServers(
+                coordinatorContext.getLiveTabletServers().keySet(),
+                null,
+                null,
+                Collections.singleton(tableBucket));
+    }
+
+    private boolean addNotifyLeaderRequests(
+            Set<Integer> tabletServers,
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            List<Integer> bucketReplicas,
+            LeaderAndIsr leaderAndIsr) {
+        BulkLoadTargetMetadata metadataIdentity = loadAppliedTarget(tablePath, tableBucket);
+        if (zooKeeperClient != null && metadataIdentity == null) {
+            // The target was deleted after this state transition was scheduled. Do not emit a v1
+            // request without its required identity; the queued deletion event owns cleanup.
+            return false;
+        }
         tabletServers.stream()
                 .filter(s -> s >= 0 && !coordinatorContext.shuttingDownTabletServers().contains(s))
                 .forEach(
@@ -226,17 +334,11 @@ public class CoordinatorRequestBatch {
                                                     tablePath,
                                                     tableBucket,
                                                     bucketReplicas,
-                                                    leaderAndIsr));
+                                                    leaderAndIsr,
+                                                    metadataIdentity));
                             notifyBucketLeaderAndIsr.put(tableBucket, notifyLeaderAndIsrForBucket);
                         });
-
-        // TODO for these cases, we can send NotifyLeaderAndIsrRequest instead of another
-        // updateMetadata request, trace by: https://github.com/apache/fluss/issues/983
-        addUpdateMetadataRequestForTabletServers(
-                coordinatorContext.getLiveTabletServers().keySet(),
-                null,
-                null,
-                Collections.singleton(tableBucket));
+        return true;
     }
 
     public void addStopReplicaRequestForTabletServers(
@@ -245,6 +347,16 @@ public class CoordinatorRequestBatch {
             boolean deleteLocal,
             boolean deleteRemote,
             int leaderEpoch) {
+        if (deleteRemote) {
+            for (Integer tabletServer : tabletServers) {
+                checkState(
+                        !localOnlyStopReplicaRequestMap
+                                .getOrDefault(tabletServer, Collections.emptySet())
+                                .contains(tableBucket),
+                        "Local-only cleanup must not be combined with remote deletion for %s.",
+                        tableBucket);
+            }
+        }
         tabletServers.stream()
                 .filter(s -> s >= 0)
                 .forEach(
@@ -267,6 +379,34 @@ public class CoordinatorRequestBatch {
                                             leaderEpoch);
                             stopBucketReplica.put(tableBucket, protoStopReplicaForBucket);
                         });
+    }
+
+    /**
+     * Adds reassignment/history/BulkLoad cleanup that is restricted to local replica files. Remote
+     * deletion is reserved for actual table or partition deletion.
+     */
+    public void addLocalOnlyStopReplicaRequestForTabletServers(
+            Set<Integer> tabletServers,
+            TableBucket tableBucket,
+            boolean deleteLocal,
+            int leaderEpoch) {
+        for (Integer tabletServer : tabletServers) {
+            Map<TableBucket, PbStopReplicaReqForBucket> pending =
+                    stopReplicaRequestMap.get(tabletServer);
+            checkState(
+                    pending == null
+                            || pending.get(tableBucket) == null
+                            || !pending.get(tableBucket).isDeleteRemote(),
+                    "Local-only cleanup must not be combined with remote deletion for %s.",
+                    tableBucket);
+        }
+        addStopReplicaRequestForTabletServers(
+                tabletServers, tableBucket, deleteLocal, false, leaderEpoch);
+        for (Integer tabletServer : tabletServers) {
+            localOnlyStopReplicaRequestMap
+                    .computeIfAbsent(tabletServer, ignored -> new HashSet<>())
+                    .add(tableBucket);
+        }
     }
 
     /**
@@ -311,7 +451,26 @@ public class CoordinatorRequestBatch {
                         .put(partitionId, Collections.emptyList());
             } else {
                 // case3, case4, case10, case 11
-                updateMetadataRequestBucketMap.put(tableId, Collections.emptyList());
+                List<BucketMetadata> bucketMetadataList = new ArrayList<>();
+                coordinatorContext
+                        .getTableAssignment(tableId)
+                        .forEach(
+                                (bucket, replicas) -> {
+                                    TableBucket tableBucket = new TableBucket(tableId, bucket);
+                                    Optional<LeaderAndIsr> bucketLeaderAndIsr =
+                                            coordinatorContext.getBucketLeaderAndIsr(tableBucket);
+                                    bucketMetadataList.add(
+                                            new BucketMetadata(
+                                                    bucket,
+                                                    bucketLeaderAndIsr
+                                                            .map(LeaderAndIsr::leader)
+                                                            .orElse(null),
+                                                    bucketLeaderAndIsr
+                                                            .map(LeaderAndIsr::leaderEpoch)
+                                                            .orElse(null),
+                                                    replicas));
+                                });
+                updateMetadataRequestBucketMap.put(tableId, bucketMetadataList);
             }
         } else {
             // case1, case2, case5, case7, case8
@@ -416,15 +575,16 @@ public class CoordinatorRequestBatch {
                     makeNotifyLeaderAndIsrRequest(
                             coordinatorEpoch, notifyRequestEntry.getValue().values());
 
-            // Track exactly which buckets THIS request marked as pending leader activation. Only
-            // those entries (where leader == serverId) need to be cleared if the request fails
-            Set<TableBucket> addedToPendingLeaderActivation = new HashSet<>();
+            // Retain each request's local ownership so its terminal result cannot clear an
+            // overlapping activation for the same bucket.
+            Map<TableBucket, Long> pendingLeaderActivationIds = new HashMap<>();
             for (Map.Entry<TableBucket, PbNotifyLeaderAndIsrReqForBucket> entry :
                     notifyRequestEntry.getValue().entrySet()) {
                 int leader = entry.getValue().getLeader();
                 if (leader == serverId) {
-                    coordinatorContext.addPendingLeaderActivation(entry.getKey());
-                    addedToPendingLeaderActivation.add(entry.getKey());
+                    long activationId =
+                            coordinatorContext.addPendingLeaderActivationAndGetId(entry.getKey());
+                    pendingLeaderActivationIds.put(entry.getKey(), activationId);
                 }
             }
 
@@ -444,16 +604,14 @@ public class CoordinatorRequestBatch {
                             // replica in the tablet server as offline. so, in here, if encounter
                             // any error, we just ignore it.
 
-                            // Clear pending state so the health API does not report stale
-                            // RED. The coordinator will detect actual server death via
-                            // heartbeat timeout and trigger re-election separately.
-                            if (!addedToPendingLeaderActivation.isEmpty()) {
+                            if (!pendingLeaderActivationIds.isEmpty()) {
                                 eventManager.put(
                                         new AccessContextEvent<Void>(
-                                                ctx -> {
-                                                    for (TableBucket tb :
-                                                            addedToPendingLeaderActivation) {
-                                                        ctx.clearPendingLeaderActivation(tb);
+                                                context -> {
+                                                    for (Map.Entry<TableBucket, Long> entry :
+                                                            pendingLeaderActivationIds.entrySet()) {
+                                                        context.clearPendingLeaderActivation(
+                                                                entry.getKey(), entry.getValue());
                                                     }
                                                     return null;
                                                 }));
@@ -463,7 +621,9 @@ public class CoordinatorRequestBatch {
                         // put the response receive event into the event manager
                         eventManager.put(
                                 new NotifyLeaderAndIsrResponseReceivedEvent(
-                                        getNotifyLeaderAndIsrResponseData(response), serverId));
+                                        getNotifyLeaderAndIsrResponseData(response),
+                                        serverId,
+                                        pendingLeaderActivationIds));
                     });
         }
         notifyLeaderAndIsrRequestMap.clear();
@@ -564,6 +724,7 @@ public class CoordinatorRequestBatch {
                     });
         }
         stopReplicaRequestMap.clear();
+        localOnlyStopReplicaRequestMap.clear();
     }
 
     public void sendUpdateMetadataRequest() {
@@ -711,12 +872,235 @@ public class CoordinatorRequestBatch {
 
         // TODO Todo Distinguish which tablet servers need to be updated instead of sending all live
         // tablet servers.
-        return makeUpdateMetadataRequest(
-                coordinatorContext.getCoordinatorServerInfo(),
-                coordinatorContext.getCoordinatorEpoch(),
-                new HashSet<>(coordinatorContext.getLiveTabletServers().values()),
-                tableMetadataList,
-                partitionMetadataList);
+        UpdateMetadataRequest request =
+                makeUpdateMetadataRequest(
+                        coordinatorContext.getCoordinatorServerInfo(),
+                        coordinatorContext.getCoordinatorEpoch(),
+                        new HashSet<>(coordinatorContext.getLiveTabletServers().values()),
+                        tableMetadataList,
+                        partitionMetadataList);
+        addUpdateMetadataIdentities(request);
+        return request;
+    }
+
+    private @Nullable BulkLoadTargetMetadata loadAppliedTarget(
+            PhysicalTablePath physicalPath, TableBucket tableBucket) {
+        if (zooKeeperClient == null) {
+            return null;
+        }
+        try {
+            String metadataPath = metadataPath(physicalPath);
+            ZooKeeperClient.DataWithStat metadata = zooKeeperClient.getDataWithStat(metadataPath);
+            if (physicalPath.getPartitionName() == null) {
+                TableRegistration registration = ZkData.TableZNode.decode(metadata.getData());
+                validatePhysicalIdentity(registration, tableBucket);
+                return new BulkLoadTargetMetadata(
+                        metadataPath,
+                        tableBucket,
+                        metadata.getStat().getVersion(),
+                        registration.dataState,
+                        registration.dataState == BulkLoadDataState.LOADING
+                                ? registration.bulkLoadId
+                                : null);
+            }
+            PartitionRegistration registration = ZkData.PartitionZNode.decode(metadata.getData());
+            validatePhysicalIdentity(registration, tableBucket);
+            return new BulkLoadTargetMetadata(
+                    metadataPath,
+                    tableBucket,
+                    metadata.getStat().getVersion(),
+                    registration.getDataState(),
+                    registration.getDataState() == BulkLoadDataState.LOADING
+                            ? registration.getBulkLoadId()
+                            : null);
+        } catch (KeeperException.NoNodeException e) {
+            if (isExactQueuedDeletion(physicalPath, tableBucket)) {
+                // A response to an earlier NotifyLeaderAndIsr can race with the exact table or
+                // partition deletion already queued in this coordinator context.
+                return null;
+            }
+            throw new IllegalStateException(
+                    "Active target metadata is missing for " + tableBucket + '.', e);
+        } catch (Exception e) {
+            throw new IllegalStateException(
+                    "Failed to load exact target metadata for " + tableBucket + '.', e);
+        }
+    }
+
+    private boolean isExactQueuedDeletion(PhysicalTablePath physicalPath, TableBucket tableBucket) {
+        if (!coordinatorContext.isToBeDeleted(tableBucket)) {
+            return false;
+        }
+        if (tableBucket.getPartitionId() == null) {
+            return physicalPath.getPartitionName() == null
+                    && physicalPath
+                            .getTablePath()
+                            .equals(coordinatorContext.getTablePathById(tableBucket.getTableId()));
+        }
+        Optional<PhysicalTablePath> contextPath =
+                coordinatorContext.getPhysicalTablePath(tableBucket.getPartitionId());
+        return contextPath.isPresent() && contextPath.get().equals(physicalPath);
+    }
+
+    private static void validatePhysicalIdentity(
+            TableRegistration registration, TableBucket tableBucket) {
+        if (registration.tableId != tableBucket.getTableId()
+                || tableBucket.getPartitionId() != null) {
+            throw new IllegalStateException(
+                    "Target table registration does not match " + tableBucket + '.');
+        }
+    }
+
+    private static void validatePhysicalIdentity(
+            PartitionRegistration registration, TableBucket tableBucket) {
+        if (registration.getTableId() != tableBucket.getTableId()
+                || tableBucket.getPartitionId() == null
+                || registration.getPartitionId() != tableBucket.getPartitionId()) {
+            throw new IllegalStateException(
+                    "Target partition registration does not match " + tableBucket + '.');
+        }
+    }
+
+    private void addUpdateMetadataIdentities(UpdateMetadataRequest request) {
+        if (zooKeeperClient == null) {
+            return;
+        }
+        // Tables whose partitions carry the deletion marker in this very push are being
+        // dropped (or shrunk), so their znodes may already be gone; identity attachment for
+        // such tables tolerates a missing node and rewrites the entry to the deletion marker.
+        // Tables queued for deletion never reach addIdentity in real form because getTableInfo
+        // already rewrote them into deletion markers. Fail-closed semantics remain for
+        // genuinely active tables whose metadata is unexpectedly missing.
+        Set<Long> deletingTableIds = new HashSet<>();
+        for (org.apache.fluss.rpc.messages.PbPartitionMetadata partition :
+                request.getPartitionMetadatasList()) {
+            if (partition.getPartitionId() == DELETED_PARTITION_ID
+                    || DELETED_PARTITION_NAME.equals(partition.getPartitionName())) {
+                deletingTableIds.add(partition.getTableId());
+            }
+        }
+        for (org.apache.fluss.rpc.messages.PbTableMetadata table :
+                request.getTableMetadatasList()) {
+            if (isDeletedTableMetadata(table)) {
+                continue;
+            }
+            PhysicalTablePath path =
+                    PhysicalTablePath.of(
+                            table.getTablePath().getDatabaseName(),
+                            table.getTablePath().getTableName(),
+                            null);
+            addIdentity(table, path, deletingTableIds.contains(table.getTableId()));
+        }
+        Map<Long, PhysicalTablePath> tablePaths = new HashMap<>();
+        for (org.apache.fluss.rpc.messages.PbTableMetadata table :
+                request.getTableMetadatasList()) {
+            if (isDeletedTableMetadata(table)) {
+                continue;
+            }
+            tablePaths.put(
+                    table.getTableId(),
+                    PhysicalTablePath.of(
+                            table.getTablePath().getDatabaseName(),
+                            table.getTablePath().getTableName(),
+                            null));
+        }
+        for (org.apache.fluss.rpc.messages.PbPartitionMetadata partition :
+                request.getPartitionMetadatasList()) {
+            if (partition.getPartitionId() == DELETED_PARTITION_ID
+                    || DELETED_PARTITION_NAME.equals(partition.getPartitionName())) {
+                continue;
+            }
+            PhysicalTablePath tablePath = tablePaths.get(partition.getTableId());
+            if (tablePath != null) {
+                addIdentity(
+                        partition,
+                        PhysicalTablePath.of(
+                                tablePath.getDatabaseName(),
+                                tablePath.getTableName(),
+                                partition.getPartitionName()));
+            }
+        }
+    }
+
+    private static boolean isDeletedTableMetadata(
+            org.apache.fluss.rpc.messages.PbTableMetadata table) {
+        return table.getTableId() == DELETED_TABLE_ID
+                || (DELETED_TABLE_PATH
+                                .getDatabaseName()
+                                .equals(table.getTablePath().getDatabaseName())
+                        && DELETED_TABLE_PATH
+                                .getTableName()
+                                .equals(table.getTablePath().getTableName()));
+    }
+
+    private void addIdentity(
+            org.apache.fluss.rpc.messages.PbTableMetadata target,
+            PhysicalTablePath path,
+            boolean allowMissingNode) {
+        try {
+            ZooKeeperClient.DataWithStat metadata =
+                    zooKeeperClient.getDataWithStat(metadataPath(path));
+            TableRegistration registration = ZkData.TableZNode.decode(metadata.getData());
+            validatePhysicalIdentity(registration, new TableBucket(target.getTableId(), 0));
+            target.setMetadataPath(metadataPath(path))
+                    .setMetadataVersion(metadata.getStat().getVersion())
+                    .setDataState(registration.dataState.getCode());
+            if (registration.bulkLoadId != null) {
+                target.setBulkLoadId(registration.bulkLoadId);
+            }
+        } catch (KeeperException.NoNodeException e) {
+            if (!allowMissingNode) {
+                throw new IllegalStateException(
+                        "Failed to attach exact table identity for " + target.getTableId() + '.',
+                        e);
+            }
+            // The table znode is removed before its drop event is processed, so a metadata
+            // push carrying a table that is being deleted always observes a missing node.
+            // Such pushes exist to clear stale tablet-server caches and guard no BulkLoad
+            // target. Rewrite the entry to the deletion-marker form (the same shape that
+            // getTableInfo emits for a queued table without residual info) so tablet servers
+            // exempt it from v1 identity validation and clear the stale metadata instead of
+            // rejecting the whole push.
+            LOG.warn(
+                    "Table {} znode is already removed; rewriting its update metadata entry to"
+                            + " the deletion marker.",
+                    target.getTableId());
+            target.setTablePath()
+                    .setDatabaseName(DELETED_TABLE_PATH.getDatabaseName())
+                    .setTableName(DELETED_TABLE_PATH.getTableName());
+        } catch (Exception e) {
+            throw new IllegalStateException(
+                    "Failed to attach exact table identity for " + target.getTableId() + '.', e);
+        }
+    }
+
+    private void addIdentity(
+            org.apache.fluss.rpc.messages.PbPartitionMetadata target, PhysicalTablePath path) {
+        try {
+            ZooKeeperClient.DataWithStat metadata =
+                    zooKeeperClient.getDataWithStat(metadataPath(path));
+            PartitionRegistration registration = ZkData.PartitionZNode.decode(metadata.getData());
+            validatePhysicalIdentity(
+                    registration, new TableBucket(target.getTableId(), target.getPartitionId(), 0));
+            target.setMetadataPath(metadataPath(path))
+                    .setMetadataVersion(metadata.getStat().getVersion())
+                    .setDataState(registration.getDataState().getCode());
+            if (registration.getBulkLoadId() != null) {
+                target.setBulkLoadId(registration.getBulkLoadId());
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException(
+                    "Failed to attach exact partition identity for "
+                            + target.getPartitionId()
+                            + '.',
+                    e);
+        }
+    }
+
+    private static String metadataPath(PhysicalTablePath path) {
+        return path.getPartitionName() == null
+                ? ZkData.TableZNode.path(path.getTablePath())
+                : ZkData.PartitionZNode.path(path.getTablePath(), path.getPartitionName());
     }
 
     @Nullable

@@ -32,6 +32,8 @@ import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.NotEnoughReplicasException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
+import org.apache.fluss.exception.StaleMetadataException;
+import org.apache.fluss.exception.StorageException;
 import org.apache.fluss.exception.TooManyScannersException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.ChangelogImage;
@@ -99,11 +101,13 @@ import org.apache.fluss.server.replica.delay.DelayedFetchLog;
 import org.apache.fluss.server.replica.delay.DelayedOperationManager;
 import org.apache.fluss.server.replica.delay.DelayedTableBucketKey;
 import org.apache.fluss.server.replica.delay.DelayedWrite;
+import org.apache.fluss.server.tablet.bulkload.BulkLoadTargetMetadata;
 import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.server.zk.ZkSequenceIDCounter;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.ZkData;
+import org.apache.fluss.server.zk.data.bulkload.BulkLoadDataState;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.FlussPaths;
@@ -214,6 +218,8 @@ public final class Replica {
     private volatile @Nullable KvTablet kvTablet;
     private volatile @Nullable CloseableRegistry closeableRegistryForKv;
     private @Nullable PeriodicSnapshotManager kvSnapshotManager;
+    private volatile @Nullable BulkLoadTargetMetadata bulkLoadTargetMetadata;
+    private volatile boolean bulkLoadRecoveryEnabled;
 
     /**
      * Server-wide {@link ScannerManager}. Active sessions for this bucket are closed in {@link
@@ -442,8 +448,15 @@ public final class Replica {
                             int requestLeaderEpoch = data.getLeaderEpoch();
                             if (requestLeaderEpoch > leaderEpoch) {
                                 boolean isNewLeader = !isLeader();
+                                int previousLeaderEpoch = leaderEpoch;
+                                leaderReplicaIdOpt.set(null);
                                 leaderEpoch = requestLeaderEpoch;
-                                onBecomeNewLeader();
+                                try {
+                                    onBecomeNewLeader();
+                                } catch (RuntimeException failure) {
+                                    leaderEpoch = previousLeaderEpoch;
+                                    throw failure;
+                                }
                                 leaderReplicaIdOpt.set(localTabletServerId);
                                 // onBecomeNewLeader may recover a KV snapshot, so start the ISR lag
                                 // grace period after it completes.
@@ -463,6 +476,12 @@ public final class Replica {
                                         localTabletServerId,
                                         tableBucket);
                             } else if (requestLeaderEpoch == leaderEpoch) {
+                                if (!isLeader() || (isKvTable() && kvTablet == null)) {
+                                    throw new NotLeaderOrFollowerException(
+                                            String.format(
+                                                    "Cannot reuse leader epoch %s for bucket %s because the local replica is not a healthy leader.",
+                                                    leaderEpoch, tableBucket));
+                                }
                                 LOG.info(
                                         "Skipped the become-leader state change for bucket {} since "
                                                 + "it's already the leader with leader epoch {}",
@@ -594,7 +613,7 @@ public final class Replica {
             // if exist. Otherwise, it'll use still the old kv tablet which will cause data loss
             dropKv();
             // now, we can create a new kv tablet
-            createKv();
+            createKv(!isBulkLoadLoading());
         }
     }
 
@@ -696,7 +715,131 @@ public final class Replica {
         }
     }
 
-    private void createKv() {
+    /** Fences this replica and reports whether it contains any local user data. */
+    public boolean fenceBulkLoadTargetAndHasLocalContent(BulkLoadTargetMetadata target)
+            throws Exception {
+        return inWriteLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    requireMatchingLoadingTarget(target);
+                    KvTablet currentKv = kvTablet;
+                    if (isKvTable() && isLeader() && currentKv == null) {
+                        throw new StorageException(
+                                "Cannot inspect KV state while fencing BulkLoad target "
+                                        + tableBucket
+                                        + '.');
+                    }
+                    boolean hasLocalContent =
+                            getLocalLogEndOffset() != 0L
+                                    || getLogHighWatermark() != 0L
+                                    || (currentKv != null && !currentKv.isUserDataEmpty());
+                    applyBulkLoadMetadataUnderLock(target, false);
+                    return hasLocalContent;
+                });
+    }
+
+    /** Applies the target carried by ordinary metadata reconciliation. */
+    void applyBulkLoadMetadata(BulkLoadTargetMetadata target) {
+        inWriteLock(leaderIsrUpdateLock, () -> applyBulkLoadMetadataUnderLock(target, false));
+    }
+
+    /** Enables ordinary replica recovery while retaining the LOADING external-access fence. */
+    void enableRecoveryUnderBulkLoadFence(BulkLoadTargetMetadata target) {
+        inWriteLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    requireMatchingLoadingTarget(target);
+                    applyBulkLoadMetadataUnderLock(target, true);
+                });
+    }
+
+    /** Replays ordinary snapshot recovery for a LOADING leader even when its epoch is unchanged. */
+    void recoverLoadingLeader(BulkLoadTargetMetadata target) {
+        inWriteLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    requireMatchingLoadingTarget(target);
+                    if (!isLeader()) {
+                        throw new StaleMetadataException(
+                                "Cannot recover a non-leader as the unchanged LOADING leader for "
+                                        + tableBucket
+                                        + '.');
+                    }
+                    applyBulkLoadMetadataUnderLock(target, true);
+                    if (isKvTable()) {
+                        dropKv();
+                        createKv(false);
+                    }
+                    updateLeaderEndOffsetSnapshot();
+                });
+    }
+
+    @VisibleForTesting
+    @Nullable
+    public BulkLoadTargetMetadata getBulkLoadTargetMetadata() {
+        return bulkLoadTargetMetadata;
+    }
+
+    /** Freezes the scalar ordinary metadata fence for snapshot and tiering commits. */
+    public @Nullable Tuple2<String, Integer> freezeActiveSourceMetadata() {
+        BulkLoadTargetMetadata target = bulkLoadTargetMetadata;
+        if (target == null) {
+            return null;
+        }
+        if (!tableBucket.equals(target.getTableBucket())
+                || target.getDataState() != BulkLoadDataState.ACTIVE
+                || target.getBulkLoadId() != null
+                || !isLeader()) {
+            throw new IllegalStateException(
+                    "Ordinary metadata commit requires an applied ACTIVE leader identity.");
+        }
+        return Tuple2.of(target.getMetadataPath(), target.getMetadataVersion());
+    }
+
+    private void applyBulkLoadMetadataUnderLock(
+            BulkLoadTargetMetadata target, boolean enableRecovery) {
+        if (!tableBucket.equals(target.getTableBucket())) {
+            throw new StaleMetadataException(
+                    "BulkLoad target identity does not match local bucket " + tableBucket + '.');
+        }
+        BulkLoadTargetMetadata current = bulkLoadTargetMetadata;
+        if (target.equals(current)) {
+            if (target.isLoading() && enableRecovery) {
+                bulkLoadRecoveryEnabled = true;
+            }
+            return;
+        }
+
+        boolean wasLoading = current != null && current.isLoading();
+        bulkLoadTargetMetadata = target;
+        bulkLoadRecoveryEnabled = target.isLoading() && enableRecovery;
+        if (target.isLoading()) {
+            scannerManager.closeScannersForBucket(tableBucket);
+            remoteLogManager.pauseLogTiering(this);
+            PeriodicSnapshotManager snapshotManager = kvSnapshotManager;
+            if (snapshotManager != null) {
+                snapshotManager.close();
+                if (closeableRegistryForKv != null) {
+                    closeableRegistryForKv.unregisterCloseable(snapshotManager);
+                }
+                kvSnapshotManager = null;
+            }
+        } else if (wasLoading && isLeader()) {
+            if (isKvTable() && kvTablet != null && kvSnapshotManager == null) {
+                startPeriodicKvSnapshot(getLatestSnapshot(tableBucket).orElse(null));
+            }
+            remoteLogManager.resumeLogTiering(this);
+        }
+    }
+
+    private void requireMatchingLoadingTarget(BulkLoadTargetMetadata target) {
+        if (!target.isLoading() || !tableBucket.equals(target.getTableBucket())) {
+            throw new StaleMetadataException(
+                    "Expected matching LOADING target for " + tableBucket + '.');
+        }
+    }
+
+    private void createKv(boolean startPeriodicSnapshot) {
         try {
             // create a closeable registry for the closable related to kv
             closeableRegistryForKv = new CloseableRegistry();
@@ -710,21 +853,36 @@ public final class Replica {
         }
 
         // init kv tablet and get the snapshot it uses to init if have any
-        Optional<CompletedSnapshot> snapshotUsed = Optional.empty();
-        for (int i = 1; i <= INIT_KV_TABLET_MAX_RETRY_TIMES; i++) {
+        Optional<CompletedSnapshot> snapshotUsed = null;
+        RuntimeException lastFailure = null;
+        for (int attempt = 1; attempt <= INIT_KV_TABLET_MAX_RETRY_TIMES; attempt++) {
             try {
                 snapshotUsed = initKvTablet();
                 break;
-            } catch (Exception e) {
+            } catch (RuntimeException failure) {
+                lastFailure = failure;
+                try {
+                    checkNotNull(kvManager)
+                            .resetRecoveryAttempt(
+                                    logTablet.getDataDir(), physicalPath, tableBucket);
+                } catch (RuntimeException resetFailure) {
+                    failure.addSuppressed(resetFailure);
+                } finally {
+                    kvTablet = null;
+                }
                 LOG.warn(
-                        "Fail to init kv tablet for bucket {}, retrying for {} times",
+                        "Fail to init kv tablet for bucket {}, attempt {}",
                         tableBucket,
-                        i,
-                        e);
+                        attempt,
+                        failure);
             }
         }
-        // start periodic kv snapshot
-        startPeriodicKvSnapshot(snapshotUsed.orElse(null));
+        if (snapshotUsed == null) {
+            throw checkNotNull(lastFailure);
+        }
+        if (startPeriodicSnapshot) {
+            startPeriodicKvSnapshot(snapshotUsed.orElse(null));
+        }
     }
 
     private void dropKv() {
@@ -735,6 +893,7 @@ public final class Replica {
         if (closeableRegistry.unregisterCloseable(closeableRegistryForKv)) {
             IOUtils.closeQuietly(closeableRegistryForKv);
         }
+        kvSnapshotManager = null;
         if (kvTablet != null) {
             bucketMetricGroup.unregisterRocksDBStatistics();
 
@@ -746,7 +905,7 @@ public final class Replica {
 
     private void mayFlushKv(long newHighWatermark) {
         KvTablet kvTablet = this.kvTablet;
-        if (kvTablet != null) {
+        if (kvTablet != null && (!isBulkLoadLoading() || bulkLoadRecoveryEnabled)) {
             kvTablet.requestFlush(newHighWatermark, fatalErrorHandler);
         }
     }
@@ -932,14 +1091,11 @@ public final class Replica {
         try {
             return Optional.ofNullable(
                     snapshotContext.getLatestCompletedSnapshotProvider().apply(tableBucket));
-        } catch (Exception e) {
-            LOG.warn(
-                    "Get latest completed snapshot for {} of table {} failed.",
-                    tableBucket,
-                    physicalPath,
-                    e);
+        } catch (Exception failure) {
+            throw new KvStorageException(
+                    "Failed to discover the latest ordinary snapshot for " + tableBucket + '.',
+                    failure);
         }
-        return Optional.empty();
     }
 
     private void recoverKvTablet(
@@ -1067,7 +1223,8 @@ public final class Replica {
                             bucketLeaderEpochSupplier,
                             coordinatorEpochSupplier,
                             lastCompletedSnapshotLogOffset,
-                            snapshotSize);
+                            snapshotSize,
+                            this::freezeActiveSourceMetadata);
             this.kvSnapshotManager =
                     PeriodicSnapshotManager.create(
                             tableBucket,
@@ -1098,6 +1255,7 @@ public final class Replica {
         return inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
+                    ensureBulkLoadAccessible();
                     if (!isLeader()) {
                         throw new NotLeaderOrFollowerException(
                                 String.format(
@@ -1125,7 +1283,12 @@ public final class Replica {
 
     public LogAppendInfo appendRecordsToFollower(MemoryLogRecords memoryLogRecords)
             throws Exception {
-        return logTablet.appendAsFollower(memoryLogRecords);
+        return inReadLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    ensureBulkLoadRecoveryAllowed();
+                    return logTablet.appendAsFollower(memoryLogRecords);
+                });
     }
 
     /**
@@ -1158,6 +1321,7 @@ public final class Replica {
         return inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
+                    ensureBulkLoadAccessible();
                     if (!isLeader()) {
                         throw new NotLeaderOrFollowerException(
                                 String.format(
@@ -1197,6 +1361,7 @@ public final class Replica {
                     inReadLock(
                             leaderIsrUpdateLock,
                             () -> {
+                                ensureBulkLoadRecoveryAllowed();
                                 LogTablet localLog = localLogOrThrow(fetchParams.fetchOnlyLeader());
                                 return readRecords(fetchParams, localLog);
                             });
@@ -1212,6 +1377,7 @@ public final class Replica {
             return inReadLock(
                     leaderIsrUpdateLock,
                     () -> {
+                        ensureBulkLoadAccessible();
                         LogTablet localLog = localLogOrThrow(fetchParams.fetchOnlyLeader());
                         return readRecords(fetchParams, localLog);
                     });
@@ -1404,6 +1570,7 @@ public final class Replica {
         return inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
+                    ensureBulkLoadAccessible();
                     try {
                         if (!isLeader()) {
                             throw new NotLeaderOrFollowerException(
@@ -1469,6 +1636,7 @@ public final class Replica {
         return inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
+                    ensureBulkLoadAccessible();
                     try {
                         if (!isLeader()) {
                             throw new NotLeaderOrFollowerException(
@@ -1499,6 +1667,7 @@ public final class Replica {
         return inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
+                    ensureBulkLoadAccessible();
                     try {
                         if (!isLeader()) {
                             throw new NotLeaderOrFollowerException(
@@ -1548,6 +1717,7 @@ public final class Replica {
         return inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
+                    ensureBulkLoadAccessible();
                     if (!isLeader()) {
                         throw new NotLeaderOrFollowerException(
                                 String.format(
@@ -1576,6 +1746,7 @@ public final class Replica {
         return inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
+                    ensureBulkLoadAccessible();
                     try {
                         if (!isLeader()) {
                             throw new NotLeaderOrFollowerException(
@@ -1646,6 +1817,7 @@ public final class Replica {
         return inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
+                    ensureBulkLoadAccessible();
                     KvTablet kv = this.kvTablet;
                     if (kv != null) {
                         // return materialized row count for primary key table
@@ -1662,6 +1834,11 @@ public final class Replica {
         return inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
+                    if (listOffsetsParam.getFollowerServerId() < 0) {
+                        ensureBulkLoadAccessible();
+                    } else {
+                        ensureBulkLoadRecoveryAllowed();
+                    }
                     int offsetType = listOffsetsParam.getOffsetType();
                     if (offsetType == ListOffsetsParam.TIMESTAMP_OFFSET_TYPE) {
                         return getOffsetByTimestamp(remoteLogManager, listOffsetsParam);
@@ -1742,6 +1919,11 @@ public final class Replica {
         inReadLock(
                 leaderIsrUpdateLock,
                 () -> logManager.truncateFullyAndStartAt(tableBucket, newOffset));
+    }
+
+    /** Advances only the local log after ordinary remote writer state is durable. */
+    public void truncateLocalFullyAndStartAt(long newOffset) {
+        inReadLock(leaderIsrUpdateLock, () -> logTablet.truncateLocalFullyAndStartAt(newOffset));
     }
 
     private LogReadInfo readRecords(FetchParams fetchParams, LogTablet logTablet)
@@ -2374,5 +2556,24 @@ public final class Replica {
     @Nullable
     public PeriodicSnapshotManager getKvSnapshotManager() {
         return kvSnapshotManager;
+    }
+
+    private boolean isBulkLoadLoading() {
+        BulkLoadTargetMetadata target = bulkLoadTargetMetadata;
+        return target != null && target.isLoading();
+    }
+
+    private void ensureBulkLoadAccessible() {
+        if (isBulkLoadLoading()) {
+            throw new StaleMetadataException(
+                    "BulkLoad target is LOADING and rejects external access: " + tableBucket);
+        }
+    }
+
+    private void ensureBulkLoadRecoveryAllowed() {
+        if (isBulkLoadLoading() && !bulkLoadRecoveryEnabled) {
+            throw new StaleMetadataException(
+                    "BulkLoad target is fenced before ordinary recovery: " + tableBucket);
+        }
     }
 }

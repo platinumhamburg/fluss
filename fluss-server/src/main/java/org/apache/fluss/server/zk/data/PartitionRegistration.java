@@ -19,6 +19,7 @@ package org.apache.fluss.server.zk.data;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.metadata.TablePartition;
+import org.apache.fluss.server.zk.data.bulkload.BulkLoadDataState;
 
 import javax.annotation.Nullable;
 
@@ -45,10 +46,25 @@ public class PartitionRegistration {
      */
     private final @Nullable String remoteDataDir;
 
+    private final BulkLoadDataState dataState;
+    private final @Nullable String bulkLoadId;
+
     public PartitionRegistration(long tableId, long partitionId, @Nullable String remoteDataDir) {
+        this(tableId, partitionId, remoteDataDir, BulkLoadDataState.ACTIVE, null);
+    }
+
+    PartitionRegistration(
+            long tableId,
+            long partitionId,
+            @Nullable String remoteDataDir,
+            BulkLoadDataState dataState,
+            @Nullable String bulkLoadId) {
+        validateDataState(dataState, bulkLoadId);
         this.tableId = tableId;
         this.partitionId = partitionId;
         this.remoteDataDir = remoteDataDir;
+        this.dataState = dataState;
+        this.bulkLoadId = bulkLoadId;
     }
 
     public long getTableId() {
@@ -64,6 +80,15 @@ public class PartitionRegistration {
         return remoteDataDir;
     }
 
+    public BulkLoadDataState getDataState() {
+        return dataState;
+    }
+
+    @Nullable
+    public String getBulkLoadId() {
+        return bulkLoadId;
+    }
+
     public TablePartition toTablePartition() {
         return new TablePartition(tableId, partitionId);
     }
@@ -77,7 +102,15 @@ public class PartitionRegistration {
      * @return a new registration with the given remote data directory
      */
     public PartitionRegistration newRemoteDataDir(String remoteDataDir) {
-        return new PartitionRegistration(tableId, partitionId, remoteDataDir);
+        return new PartitionRegistration(
+                tableId, partitionId, remoteDataDir, dataState, bulkLoadId);
+    }
+
+    /** Returns a copy with the validated BulkLoad access state and transaction UUID. */
+    public PartitionRegistration withDataState(
+            BulkLoadDataState dataState, @Nullable String bulkLoadId) {
+        return new PartitionRegistration(
+                tableId, partitionId, remoteDataDir, dataState, bulkLoadId);
     }
 
     @Override
@@ -88,12 +121,14 @@ public class PartitionRegistration {
         PartitionRegistration that = (PartitionRegistration) o;
         return tableId == that.tableId
                 && partitionId == that.partitionId
-                && Objects.equals(remoteDataDir, that.remoteDataDir);
+                && Objects.equals(remoteDataDir, that.remoteDataDir)
+                && dataState == that.dataState
+                && Objects.equals(bulkLoadId, that.bulkLoadId);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(tableId, partitionId, remoteDataDir);
+        return Objects.hash(tableId, partitionId, remoteDataDir, dataState, bulkLoadId);
     }
 
     @Override
@@ -106,6 +141,19 @@ public class PartitionRegistration {
                 + ", remoteDataDir='"
                 + remoteDataDir
                 + '\''
+                + ", dataState="
+                + dataState
+                + ", bulkLoadId='"
+                + bulkLoadId
+                + '\''
                 + '}';
+    }
+
+    private static void validateDataState(
+            BulkLoadDataState dataState, @Nullable String bulkLoadId) {
+        if (dataState == null) {
+            throw new IllegalArgumentException("BulkLoad data state must not be null.");
+        }
+        dataState.validateBulkLoadId(bulkLoadId);
     }
 }

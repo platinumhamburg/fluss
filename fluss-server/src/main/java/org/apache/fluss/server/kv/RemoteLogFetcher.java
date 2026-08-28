@@ -492,9 +492,20 @@ public class RemoteLogFetcher implements Closeable {
                     }
                     // stop if we've reached localLogStartOffset
                     if (batch.baseLogOffset() >= localLogStartOffset) {
+                        KvRecoverHelper.requireExactRecoveryOffset(
+                                localLogStartOffset, currentOffset, "remote/local handoff");
                         finished = true;
                         closeCurrentFileLogRecords();
                         return;
+                    }
+                    if (batch.nextLogOffset() > localLogStartOffset) {
+                        throw new IllegalStateException(
+                                String.format(
+                                        "Remote KV recovery batch [%s, %s) crosses local-log boundary %s for %s.",
+                                        batch.baseLogOffset(),
+                                        batch.nextLogOffset(),
+                                        localLogStartOffset,
+                                        tableBucket));
                     }
                     nextBatch = batch;
                     // advance currentOffset so subsequent segments use updated position
@@ -507,6 +518,8 @@ public class RemoteLogFetcher implements Closeable {
 
                 // move to next segment
                 if (currentSegmentIndex >= segments.size()) {
+                    KvRecoverHelper.requireExactRecoveryOffset(
+                            localLogStartOffset, currentOffset, "remote/local handoff");
                     finished = true;
                     return;
                 }
@@ -517,6 +530,8 @@ public class RemoteLogFetcher implements Closeable {
                 }
                 // skip segments that start at or after localLogStartOffset
                 if (segment.logicalStartOffset() >= localLogStartOffset) {
+                    KvRecoverHelper.requireExactRecoveryOffset(
+                            localLogStartOffset, currentOffset, "remote/local handoff");
                     finished = true;
                     return;
                 }

@@ -236,6 +236,35 @@ public class FlussConfigUtils {
                             "Invalid configuration for %s, it must be less than or equal %d bytes.",
                             ConfigOptions.LOG_SEGMENT_FILE_SIZE.key(), Integer.MAX_VALUE));
         }
+
+        validateBulkLoadConfigs(conf);
+    }
+
+    private static void validateBulkLoadConfigs(Configuration conf) {
+        validMinDuration(conf, ConfigOptions.BULKLOAD_BUILD_TIMEOUT_DEFAULT, 1);
+        validMinDuration(conf, ConfigOptions.BULKLOAD_BUILD_TIMEOUT_MAX, 1);
+        validMinDuration(conf, ConfigOptions.BULKLOAD_COMMIT_DECISION_TIMEOUT, 1);
+        validMinDuration(conf, ConfigOptions.BULKLOAD_RESULT_RETENTION, 1);
+        validMinValue(conf, ConfigOptions.BULKLOAD_MAX_ACTIVE_TRANSACTIONS, 1);
+        validMinValue(conf, ConfigOptions.BULKLOAD_MAX_TRANSACTIONS_PER_TARGET, 1);
+        validPositiveMemory(conf, ConfigOptions.BULKLOAD_MANIFEST_MAX_SIZE);
+        validPositiveMemory(conf, ConfigOptions.BULKLOAD_INPUT_MAX_SIZE);
+
+        Duration defaultBuildTimeout = conf.get(ConfigOptions.BULKLOAD_BUILD_TIMEOUT_DEFAULT);
+        Duration maxBuildTimeout = conf.get(ConfigOptions.BULKLOAD_BUILD_TIMEOUT_MAX);
+        if (defaultBuildTimeout.compareTo(maxBuildTimeout) > 0) {
+            throw new IllegalConfigurationException(
+                    "Invalid configuration for %s, it must be less than or equal to %s.",
+                    ConfigOptions.BULKLOAD_BUILD_TIMEOUT_DEFAULT.key(),
+                    ConfigOptions.BULKLOAD_BUILD_TIMEOUT_MAX.key());
+        }
+    }
+
+    private static void validPositiveMemory(Configuration conf, ConfigOption<MemorySize> option) {
+        if (conf.get(option).getBytes() <= 0) {
+            throw new IllegalConfigurationException(
+                    "Invalid configuration for %s, it must be greater than 0 bytes.", option.key());
+        }
     }
 
     private static void validateHistoricalLookupCacheRatio(Configuration conf) {
@@ -269,7 +298,16 @@ public class FlussConfigUtils {
 
     private static void validMinDuration(
             Configuration conf, ConfigOption<Duration> option, long minMillis) {
-        long millis = conf.get(option).toMillis();
+        long millis;
+        try {
+            millis = conf.get(option).toMillis();
+        } catch (ArithmeticException e) {
+            throw new IllegalConfigurationException(
+                    String.format(
+                            "Invalid configuration for %s, duration is too large to convert to milliseconds.",
+                            option.key()),
+                    e);
+        }
         if (millis < minMillis) {
             throw new IllegalConfigurationException(
                     String.format(

@@ -27,6 +27,7 @@ import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.InvalidAlterTableException;
 import org.apache.fluss.exception.InvalidCoordinatorException;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.metadata.BulkLoadState;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
@@ -83,10 +84,12 @@ import org.apache.fluss.server.zk.data.CoordinatorAddress;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
 import org.apache.fluss.server.zk.data.TableAssignment;
+import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.server.zk.data.TabletServerRegistration;
 import org.apache.fluss.server.zk.data.ZkData;
 import org.apache.fluss.server.zk.data.ZkData.PartitionIdsZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableIdsZNode;
+import org.apache.fluss.server.zk.data.bulkload.BulkLoadDataState;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
 import org.apache.fluss.testutils.common.ManuallyTriggeredScheduledExecutorService;
 import org.apache.fluss.types.DataTypes;
@@ -103,6 +106,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
 import java.time.Duration;
@@ -368,6 +374,11 @@ class CoordinatorEventProcessorTest {
         long autoPartitionTableId =
                 metadataManager.createTable(
                         autoPartitionTablePath, remoteDataDir, getPartitionedTable(), null, false);
+        zookeeperClient
+                .getCuratorClient()
+                .create()
+                .creatingParentsIfNeeded()
+                .forPath(ZkData.PartitionsZNode.path(autoPartitionTablePath));
 
         eventProcessor.shutdown();
         autoPartitionManager.close();
@@ -496,14 +507,48 @@ class CoordinatorEventProcessorTest {
         // todo: may need to fix this case;
         retryVerifyContext(ctx -> assertThat(ctx.getTablePathById(t1Id)).isNotNull());
 
+        // A failed transition may already have removed the in-memory bucket states while the
+        // authoritative assignment and online replica states still exist. Drop must recover from
+        // the assignment instead of relying on the bucket-state map.
+        fromCtx(
+                ctx -> {
+                    Set<TableBucket> assignedBuckets = ctx.getAllBucketsForTable(t1Id);
+                    assertThat(assignedBuckets).hasSize(N_BUCKETS);
+                    Set<TableBucketReplica> assignedReplicas =
+                            ctx.getBucketReplicas(assignedBuckets);
+                    assignedReplicas.forEach(
+                            replica -> ctx.putReplicaState(replica, ReplicaState.OnlineReplica));
+                    assertThat(assignedReplicas)
+                            .allSatisfy(
+                                    replica ->
+                                            assertThat(ctx.getReplicaState(replica))
+                                                    .isEqualTo(ReplicaState.OnlineReplica));
+                    assignedBuckets.forEach(ctx::removeBucketState);
+                    assertThat(ctx.getBucketStates().keySet())
+                            .doesNotContainAnyElementsOf(assignedBuckets);
+                    return null;
+                });
+        assertThat(zookeeperClient.getTableAssignment(t1Id)).isPresent();
+
         // drop the table;
         metadataManager.dropTable(t1, false);
+
+        // The watcher-triggered drop must reach the event thread even when an earlier
+        // NotifyLeaderAndIsr response is still being handled.
+        retryVerifyContext(ctx -> assertThat(ctx.isTableQueuedForDeletion(t1Id)).isTrue());
 
         // retry until the assignment has been deleted from zk, then it means
         // the table has been deleted successfully
         retry(
                 Duration.ofMinutes(1),
-                () -> assertThat(zookeeperClient.getTableAssignment(t1Id)).isEmpty());
+                () ->
+                        assertThat(zookeeperClient.getTableAssignment(t1Id))
+                                .as(
+                                        "queued=%s replicaStates=%s bucketStates=%s",
+                                        fromCtx(ctx -> ctx.isTableQueuedForDeletion(t1Id)),
+                                        fromCtx(ctx -> new HashMap<>(ctx.getReplicaStates())),
+                                        fromCtx(ctx -> new HashMap<>(ctx.getBucketStates())))
+                                .isEmpty());
     }
 
     @Test
@@ -516,7 +561,8 @@ class CoordinatorEventProcessorTest {
                 ZOO_KEEPER_EXTENSION_WRAPPER
                         .getCustomExtension()
                         .createZooKeeperClient(NOPErrorHandler.INSTANCE);
-        int newlyServerId = 3;
+        assertThat(client.getCuratorClient().blockUntilConnected(30, TimeUnit.SECONDS)).isTrue();
+        int newlyServerId = 30;
         TabletServerRegistration tabletServerRegistration =
                 new TabletServerRegistration(
                         "rack3",
@@ -548,8 +594,8 @@ class CoordinatorEventProcessorTest {
                         new LakeCatalogDynamicLoader(new Configuration(), null, true));
         TableAssignment table1Assignment =
                 TableAssignment.builder()
-                        .add(0, BucketAssignment.of(0, 3, 2))
-                        .add(1, BucketAssignment.of(3, 2, 0))
+                        .add(0, BucketAssignment.of(0, newlyServerId, 2))
+                        .add(1, BucketAssignment.of(newlyServerId, 2, 0))
                         .build();
 
         TablePath table1Path = TablePath.of(defaultDatabase, "t1");
@@ -558,7 +604,7 @@ class CoordinatorEventProcessorTest {
                         table1Path, remoteDataDir, TEST_TABLE, table1Assignment, false);
 
         TableAssignment table2Assignment =
-                TableAssignment.builder().add(0, BucketAssignment.of(3)).build();
+                TableAssignment.builder().add(0, BucketAssignment.of(newlyServerId)).build();
         TablePath table2Path = TablePath.of(defaultDatabase, "t2");
         long table2Id =
                 metadataManager.createTable(
@@ -586,7 +632,7 @@ class CoordinatorEventProcessorTest {
         verifyBucketIsr(table1Id, 1, new int[] {2, 0});
         verifyReplicaOnlineOrOffline(
                 table2Id, table2Assignment, Collections.singleton(newlyServerId));
-        verifyBucketIsr(table2Id, 0, new int[] {3});
+        verifyBucketIsr(table2Id, 0, new int[] {newlyServerId});
 
         // now, check bucket state
         TableBucket t1Bucket0 = new TableBucket(table1Id, 0);
@@ -649,7 +695,9 @@ class CoordinatorEventProcessorTest {
         assertThat(t2Bucket0State).isEqualTo(OnlineBucket);
 
         // clean up the tablet server 3
-        ZOO_KEEPER_EXTENSION_WRAPPER.getCustomExtension().cleanupPath(ZkData.ServerIdZNode.path(3));
+        ZOO_KEEPER_EXTENSION_WRAPPER
+                .getCustomExtension()
+                .cleanupPath(ZkData.ServerIdZNode.path(newlyServerId));
     }
 
     @Test
@@ -783,6 +831,110 @@ class CoordinatorEventProcessorTest {
         assertThatThrownBy(responseCompletableFuture::get)
                 .cause()
                 .isInstanceOf(InvalidCoordinatorException.class);
+    }
+
+    @Test
+    void testOrdinaryCommitsRequireCurrentActiveMetadataIdentity(@TempDir Path tempDir)
+            throws Exception {
+        TablePath tablePath = TablePath.of(defaultDatabase, "recreated_commit_identity");
+        long oldTableId =
+                createTable(
+                        tablePath,
+                        new TabletServerInfo[] {
+                            new TabletServerInfo(0, "rack0"),
+                            new TabletServerInfo(1, "rack1"),
+                            new TabletServerInfo(2, "rack2")
+                        });
+        TableBucket tableBucket = new TableBucket(oldTableId, 0);
+        waitValue(
+                () -> fromCtx(ctx -> ctx.getBucketLeaderAndIsr(tableBucket)),
+                Duration.ofMinutes(1),
+                "leader not elected");
+        String metadataPath = ZkData.TableZNode.path(tablePath);
+        TableRegistration oldRegistration = zookeeperClient.getTable(tablePath).get();
+        int oldMetadataVersion =
+                zookeeperClient.getDataWithStat(metadataPath).getStat().getVersion();
+
+        zookeeperClient.updateTable(
+                tablePath,
+                oldRegistration.withDataState(
+                        BulkLoadDataState.LOADING, "550e8400-e29b-41d4-a716-446655440000"));
+        assertSnapshotAndManifestCommitRejected(tempDir, tableBucket, 98, null, null);
+
+        zookeeperClient
+                .getCuratorClient()
+                .delete()
+                .deletingChildrenIfNeeded()
+                .forPath(metadataPath);
+        TableRegistration recreated =
+                TableRegistration.newTable(oldTableId + 1, remoteDataDir, TEST_TABLE);
+        zookeeperClient.registerTable(tablePath, recreated);
+        for (int i = 0; i < oldMetadataVersion; i++) {
+            zookeeperClient.updateTable(tablePath, recreated);
+        }
+        assertThat(zookeeperClient.getDataWithStat(metadataPath).getStat().getVersion())
+                .isEqualTo(oldMetadataVersion);
+
+        assertSnapshotAndManifestCommitRejected(
+                tempDir, tableBucket, 99, metadataPath, oldMetadataVersion);
+    }
+
+    private void assertSnapshotAndManifestCommitRejected(
+            Path tempDir,
+            TableBucket tableBucket,
+            long snapshotId,
+            String sourceMetadataPath,
+            Integer sourceMetadataVersion)
+            throws Exception {
+        CompletedSnapshot completedSnapshot =
+                mockCompletedSnapshot(tempDir, tableBucket, snapshotId);
+        LeaderAndIsr leaderAndIsr = currentLeaderAndIsr(tableBucket);
+        CompletableFuture<CommitKvSnapshotResponse> snapshotFuture = new CompletableFuture<>();
+        eventProcessor
+                .getCoordinatorEventManager()
+                .put(
+                        new CommitKvSnapshotEvent(
+                                new CommitKvSnapshotData(
+                                        completedSnapshot,
+                                        coordinatorContextEpoch(),
+                                        leaderAndIsr.leaderEpoch(),
+                                        sourceMetadataPath,
+                                        sourceMetadataVersion),
+                                snapshotFuture));
+        assertThatThrownBy(() -> snapshotFuture.get(20, TimeUnit.SECONDS))
+                .cause()
+                .isInstanceOf(IllegalStateException.class);
+
+        CompletableFuture<CommitRemoteLogManifestResponse> manifestFuture =
+                new CompletableFuture<>();
+        eventProcessor
+                .getCoordinatorEventManager()
+                .put(
+                        new CommitRemoteLogManifestEvent(
+                                new CommitRemoteLogManifestData(
+                                        tableBucket,
+                                        new FsPath("file:///tmp/rejected-manifest-" + snapshotId),
+                                        0,
+                                        1,
+                                        coordinatorContextEpoch(),
+                                        leaderAndIsr.leaderEpoch(),
+                                        sourceMetadataPath,
+                                        sourceMetadataVersion),
+                                manifestFuture));
+        assertThat(manifestFuture.get(20, TimeUnit.SECONDS).isCommitSuccess()).isFalse();
+        assertThat(
+                        new ZooKeeperCompletedSnapshotHandleStore(zookeeperClient)
+                                .get(tableBucket, snapshotId))
+                .isEmpty();
+        assertThat(zookeeperClient.getRemoteLogManifestHandle(tableBucket)).isEmpty();
+    }
+
+    private int coordinatorContextEpoch() throws Exception {
+        return fromCtx(CoordinatorContext::getCoordinatorEpoch);
+    }
+
+    private LeaderAndIsr currentLeaderAndIsr(TableBucket tableBucket) throws Exception {
+        return fromCtx(ctx -> ctx.getBucketLeaderAndIsr(tableBucket).get());
     }
 
     @Test
@@ -1383,6 +1535,14 @@ class CoordinatorEventProcessorTest {
                 });
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testNotifyResponseReleasesOnlyItsRequestPendingOwnership(boolean oldRequestFails)
+            throws Exception {
+        CoordinatorPendingLeaderActivationTestSupport.verifyLeaderChangeResponses(
+                eventProcessor, testCoordinatorChannelManager, oldRequestFails);
+    }
+
     @Test
     void testRetryOfflineLeaderEventRetriesOfflineReplicaOnLiveServer() throws Exception {
         assertThat(eventProcessor.hasOfflineLeaderRetryTaskScheduled()).isFalse();
@@ -1584,19 +1744,14 @@ class CoordinatorEventProcessorTest {
                         });
         // create table
         List<Integer> replicas = tableAssignment.getBucketAssignment(0).getReplicas();
+        List<BucketMetadata> bucketMetadata =
+                Collections.singletonList(new BucketMetadata(0, replicas.get(0), 0, replicas));
         metadataManager.createTable(t1, remoteDataDir, TEST_TABLE, tableAssignment, false);
         TableInfo tableInfo = metadataManager.getTable(t1);
 
         retry(
                 Duration.ofMinutes(1),
-                () ->
-                        verifyMetadataUpdateRequest(
-                                3,
-                                new TableMetadata(
-                                        tableInfo,
-                                        Collections.singletonList(
-                                                new BucketMetadata(
-                                                        0, replicas.get(0), 0, replicas)))));
+                () -> verifyMetadataUpdateRequest(3, new TableMetadata(tableInfo, bucketMetadata)));
 
         // alter table column.
         alterTable(
@@ -1620,7 +1775,7 @@ class CoordinatorEventProcessorTest {
                 Duration.ofMinutes(1),
                 () ->
                         verifyMetadataUpdateRequest(
-                                3, new TableMetadata(tableInfo2, Collections.emptyList())));
+                                3, new TableMetadata(tableInfo2, bucketMetadata)));
     }
 
     @Test
@@ -1643,19 +1798,14 @@ class CoordinatorEventProcessorTest {
                         });
         // create table
         List<Integer> replicas = tableAssignment.getBucketAssignment(0).getReplicas();
+        List<BucketMetadata> bucketMetadata =
+                Collections.singletonList(new BucketMetadata(0, replicas.get(0), 0, replicas));
         metadataManager.createTable(t1, remoteDataDir, TEST_TABLE, tableAssignment, false);
         TableInfo tableInfo = metadataManager.getTable(t1);
 
         retry(
                 Duration.ofMinutes(1),
-                () ->
-                        verifyMetadataUpdateRequest(
-                                3,
-                                new TableMetadata(
-                                        tableInfo,
-                                        Collections.singletonList(
-                                                new BucketMetadata(
-                                                        0, replicas.get(0), 0, replicas)))));
+                () -> verifyMetadataUpdateRequest(3, new TableMetadata(tableInfo, bucketMetadata)));
 
         // alter table properties (custom property)
         TablePropertyChanges.Builder builder = TablePropertyChanges.builder();
@@ -1679,7 +1829,7 @@ class CoordinatorEventProcessorTest {
                 Duration.ofMinutes(1),
                 () ->
                         verifyMetadataUpdateRequest(
-                                3, new TableMetadata(updatedTableInfo, Collections.emptyList())));
+                                3, new TableMetadata(updatedTableInfo, bucketMetadata)));
 
         // verify the table info in coordinator context is updated
         retryVerifyContext(
@@ -1691,6 +1841,19 @@ class CoordinatorEventProcessorTest {
                     assertThat(tableInfoInCtx.getCustomProperties().toMap())
                             .containsEntry("custom.key", "custom.value");
                 });
+    }
+
+    @Test
+    void testFeatureAdvertisementDoesNotSequenceOrdinaryTabletServerRestart() throws Exception {
+        CoordinatorMetadataDispatchTestSupport.verifyOrdinaryRestartDispatch(
+                zookeeperClient,
+                ZOO_KEEPER_EXTENSION_WRAPPER.getCustomExtension(),
+                eventProcessor,
+                metadataManager,
+                testCoordinatorChannelManager,
+                defaultDatabase,
+                remoteDataDir,
+                TEST_TABLE);
     }
 
     @Test
@@ -2153,6 +2316,38 @@ class CoordinatorEventProcessorTest {
                         assertThat(eventProcessor.getRebalanceManager().hasInProgressRebalance())
                                 .isFalse());
         verifyIsr(tb0, 1, Arrays.asList(0, 1, 2));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false, BEGUN", "false, COMMITTING", "true, BEGUN", "true, COMMITTING"})
+    void testReassignmentRejectsActiveBulkLoadWithoutMetadataMutation(
+            boolean partitioned, BulkLoadState state) throws Exception {
+        int replacementServer = 19_003 + state.ordinal() + (partitioned ? 10 : 0);
+        zookeeperClient.registerTabletServer(
+                replacementServer,
+                new TabletServerRegistration(
+                        "rack" + replacementServer,
+                        Collections.singletonList(
+                                new Endpoint(
+                                        "host" + replacementServer, 1001, DEFAULT_LISTENER_NAME)),
+                        System.currentTimeMillis()));
+        try {
+            initCoordinatorChannel();
+            BulkLoadReassignmentTestSupport.assertReassignmentRejected(
+                    zookeeperClient,
+                    metadataManager,
+                    eventProcessor.getRebalanceManager(),
+                    defaultDatabase,
+                    remoteDataDir,
+                    TEST_TABLE,
+                    replacementServer,
+                    partitioned,
+                    state);
+        } finally {
+            ZOO_KEEPER_EXTENSION_WRAPPER
+                    .getCustomExtension()
+                    .cleanupPath(ZkData.ServerIdZNode.path(replacementServer));
+        }
     }
 
     private void verifyIsr(TableBucket tb, int expectedLeader, List<Integer> expectedIsr)

@@ -33,6 +33,7 @@ import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.storage.LocalDiskManager;
 import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.clock.Clock;
@@ -47,9 +48,13 @@ import javax.annotation.concurrent.ThreadSafe;
 import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -146,34 +151,187 @@ public class RemoteLogManager implements Closeable {
 
     /** Register the replica to the remote log manager. */
     public void registerReplica(Replica replica) throws Exception {
-        if (remoteDisabled()) {
+        registerReplica(replica, true, false);
+    }
+
+    /** Restores ordinary remote state before applying a replica role. */
+    public void restoreReplica(Replica replica, boolean registerMetrics) throws Exception {
+        registerReplica(replica, registerMetrics, true);
+    }
+
+    private void registerReplica(
+            Replica replica, boolean registerMetrics, boolean initializeEmptyLocalTail)
+            throws Exception {
+        if (remoteDisabled() && !initializeEmptyLocalTail) {
+            initializeSnapshotOnlyLocalTail(
+                    replica, latestSnapshotLogOffset(replica.getTableBucket()), false);
             return;
         }
         TableBucket tableBucket = replica.getTableBucket();
         PhysicalTablePath physicalTablePath = replica.getPhysicalTablePath();
         LogTablet log = replica.getLogTablet();
-        RemoteLogTablet remoteLog = new RemoteLogTablet(physicalTablePath, tableBucket);
-        Optional<RemoteLogManifestHandle> remoteLogManifestHandleOpt =
+        RemoteLogTablet remoteLog = remoteLogs.get(tableBucket);
+        boolean newlyRegistered = remoteLog == null;
+        if (newlyRegistered) {
+            remoteLog = new RemoteLogTablet(physicalTablePath, tableBucket);
+        }
+        Optional<RemoteLogManifestHandle> manifestHandle =
                 zkClient.getRemoteLogManifestHandle(tableBucket);
-        if (remoteLogManifestHandleOpt.isPresent()) {
+        if (manifestHandle.isPresent()) {
             // If there is remote log manifest handle in remote, we will download
             // the manifest snapshot from remote storage and write to cache.
+            RemoteLogManifestHandle handle = manifestHandle.get();
             RemoteLogManifest manifest =
                     remoteLogStorage.readRemoteLogManifestSnapshot(
-                            remoteLogManifestHandleOpt.get().getRemoteLogManifestPath());
-            remoteLog.loadRemoteLogManifest(manifest);
+                            handle.getRemoteLogManifestPath());
+            validateOrdinaryManifest(physicalTablePath, tableBucket, handle, manifest);
+            if (initializeEmptyLocalTail) {
+                Optional<BucketSnapshot> latestSnapshot =
+                        zkClient.getTableBucketLatestSnapshot(tableBucket);
+                if (!latestSnapshot.isPresent()) {
+                    throw new IllegalStateException(
+                            "Ordinary Snapshot is missing for generated Remote Log recovery of "
+                                    + tableBucket
+                                    + '.');
+                }
+                if (latestSnapshot.get().getLogOffset() != handle.getRemoteLogEndOffset()) {
+                    throw new IllegalStateException(
+                            "Ordinary Snapshot and Remote Log boundaries differ for "
+                                    + tableBucket
+                                    + '.');
+                }
+                initializeEmptyLocalTail(replica, handle, manifest);
+            }
+            if (!sortedSegments(remoteLog.currentManifest()).equals(sortedSegments(manifest))) {
+                remoteLog.loadRemoteLogManifest(manifest);
+            }
+        } else {
+            initializeSnapshotOnlyLocalTail(
+                    replica, latestSnapshotLogOffset(tableBucket), initializeEmptyLocalTail);
         }
         log.updateHighestCopiedEndOffset(remoteLog.getHighestCopiedEndOffset());
         log.updateRemoteLogEndOffset(remoteLog.getRemoteLogEndOffset().orElse(-1L));
         log.updateRemoteLogStartOffset(remoteLog.getRemoteLogStartOffset());
         log.updateRemoteLogSize(remoteLog.getRemoteSizeInBytes());
-        // leader needs to register the remote log metrics
-        remoteLog.registerMetrics(replica.bucketMetrics());
-        remoteLogs.put(tableBucket, remoteLog);
+        if (registerMetrics) {
+            remoteLog.registerMetrics(replica.bucketMetrics());
+        }
+        if (newlyRegistered) {
+            remoteLogs.put(tableBucket, remoteLog);
+        }
+    }
+
+    private void initializeEmptyLocalTail(
+            Replica replica, RemoteLogManifestHandle handle, RemoteLogManifest manifest) {
+        List<RemoteLogSegment> segments = sortedSegments(manifest);
+        if (segments.isEmpty()) {
+            requireEmptyLocalTail(replica);
+            return;
+        }
+        long endOffset = handle.getRemoteLogEndOffset();
+        if (segments.get(0).remoteLogStartOffset() != 0L || endOffset <= 0L) {
+            throw new IllegalStateException(
+                    "Ordinary recovery requires a Remote Log prefix covering [0,E).");
+        }
+        long localEndOffset = replica.getLocalLogEndOffset();
+        long highWatermark = replica.getLogHighWatermark();
+        if (localEndOffset == endOffset && highWatermark == endOffset) {
+            return;
+        }
+        if (localEndOffset != 0L || highWatermark != 0L) {
+            throw new IllegalStateException(
+                    "Ordinary recovery cannot replace non-empty local history for "
+                            + replica.getTableBucket()
+                            + '.');
+        }
+        logManager.initializeEmptyLocalTail(replica.getTableBucket(), endOffset);
+    }
+
+    private long latestSnapshotLogOffset(TableBucket tableBucket) throws Exception {
+        return zkClient.getTableBucketLatestSnapshot(tableBucket)
+                .map(BucketSnapshot::getLogOffset)
+                .orElse(0L);
+    }
+
+    private void initializeSnapshotOnlyLocalTail(
+            Replica replica, long snapshotLogOffset, boolean loadingRecovery) {
+        long localEndOffset = replica.getLocalLogEndOffset();
+        long highWatermark = replica.getLogHighWatermark();
+        if (loadingRecovery) {
+            if (localEndOffset == snapshotLogOffset && highWatermark == snapshotLogOffset) {
+                return;
+            }
+        } else if (localEndOffset >= snapshotLogOffset
+                && highWatermark >= snapshotLogOffset
+                && highWatermark <= localEndOffset) {
+            return;
+        }
+        if (localEndOffset == 0L && highWatermark == 0L) {
+            logManager.initializeEmptyLocalTail(replica.getTableBucket(), snapshotLogOffset);
+            return;
+        }
+        throw new IllegalStateException(
+                "Ordinary Snapshot recovery found contradictory local history for "
+                        + replica.getTableBucket()
+                        + '.');
+    }
+
+    private static void requireEmptyLocalTail(Replica replica) {
+        if (replica.getLocalLogEndOffset() != 0L || replica.getLogHighWatermark() != 0L) {
+            throw new IllegalStateException(
+                    "Ordinary recovery without a Remote Log prefix requires empty local history for "
+                            + replica.getTableBucket()
+                            + '.');
+        }
+    }
+
+    static void validateOrdinaryManifest(
+            PhysicalTablePath physicalTablePath,
+            TableBucket tableBucket,
+            RemoteLogManifestHandle handle,
+            RemoteLogManifest manifest) {
+        if (!manifest.getPhysicalTablePath().equals(physicalTablePath)
+                || !manifest.getTableBucket().equals(tableBucket)) {
+            throw new IllegalStateException("Ordinary Remote Log identity differs.");
+        }
+
+        List<RemoteLogSegment> segments = sortedSegments(manifest);
+        if (segments.isEmpty()) {
+            if (handle.getRemoteLogEndOffset() != -1L) {
+                throw new IllegalStateException("Ordinary Remote Log boundary differs.");
+            }
+            return;
+        }
+
+        Set<UUID> segmentIds = new HashSet<>();
+        long nextOffset = segments.get(0).remoteLogStartOffset();
+        for (RemoteLogSegment segment : segments) {
+            if (!segmentIds.add(segment.remoteLogSegmentId())) {
+                throw new IllegalStateException("Ordinary Remote Log contains duplicate segments.");
+            }
+            if (segment.remoteLogStartOffset() != nextOffset
+                    || segment.remoteLogEndOffset() <= segment.remoteLogStartOffset()
+                    || segment.segmentSizeInBytes() < 0) {
+                throw new IllegalStateException("Ordinary Remote Log range is not contiguous.");
+            }
+            nextOffset = segment.remoteLogEndOffset();
+        }
+        if (nextOffset != handle.getRemoteLogEndOffset()) {
+            throw new IllegalStateException("Ordinary Remote Log boundary differs.");
+        }
+    }
+
+    private static List<RemoteLogSegment> sortedSegments(RemoteLogManifest manifest) {
+        List<RemoteLogSegment> segments = new ArrayList<>(manifest.getRemoteLogSegmentList());
+        segments.sort(Comparator.comparingLong(RemoteLogSegment::remoteLogStartOffset));
+        return segments;
     }
 
     /** Start the log tiering task for the given replica. */
     public void startLogTiering(Replica replica) {
+        if (remoteDisabled()) {
+            return;
+        }
         TableBucket tableBucket = replica.getTableBucket();
         RemoteLogTablet remoteLog = remoteLogs.get(tableBucket);
         if (remoteLog == null) {
@@ -190,9 +348,6 @@ public class RemoteLogManager implements Closeable {
 
     /** Stop the log tiering task for the given replica. */
     public void stopLogTiering(Replica replica) {
-        if (remoteDisabled()) {
-            return;
-        }
         TableBucket tb = replica.getTableBucket();
         RemoteLogTablet remoteLog = remoteLogs.remove(tb);
 
@@ -216,16 +371,40 @@ public class RemoteLogManager implements Closeable {
         LOG.debug("Removed the remote log tiering task for replica {}", tb);
     }
 
+    /** Pauses upload and expiry scheduling without deleting remote read state. */
+    public void pauseLogTiering(Replica replica) {
+        if (remoteDisabled()) {
+            return;
+        }
+        TableBucket tableBucket = replica.getTableBucket();
+        TaskWithFuture task = rlmTasks.remove(tableBucket);
+        if (task != null) {
+            LOG.info("Pausing the RLM task for table-bucket: {}", tableBucket);
+            task.cancel();
+        }
+    }
+
+    /** Resumes a previously paused leader task after BulkLoad ACTIVE convergence. */
+    public void resumeLogTiering(Replica replica) {
+        if (remoteDisabled()) {
+            return;
+        }
+        if (!replica.isLeader()) {
+            throw new IllegalStateException(
+                    "Remote log tiering can only resume for the current leader.");
+        }
+        if (!remoteLogs.containsKey(replica.getTableBucket())) {
+            throw new IllegalStateException(
+                    "Remote log tiering cannot resume before the replica is registered.");
+        }
+        startLogTiering(replica);
+    }
+
     /**
      * Stop the log tiering task for the given replica, and maybe delete remote logs of the replica
      * in remote storage.
      */
     public void stopReplica(Replica replica, boolean deleteRemote) {
-        // if the remote storage disabled, do nothing.
-        if (remoteDisabled()) {
-            return;
-        }
-
         PhysicalTablePath physicalTablePath = replica.getPhysicalTablePath();
         TableBucket tb = replica.getTableBucket();
         // stop the log tiering task for the table bucket.
@@ -249,10 +428,6 @@ public class RemoteLogManager implements Closeable {
      * return.
      */
     public long lookupOffsetForTimestamp(TableBucket tableBucket, long timestamp) {
-        if (remoteDisabled()) {
-            return -1L;
-        }
-
         RemoteLogTablet remoteLogTablet = remoteLogs.get(tableBucket);
         if (remoteLogTablet == null) {
             return -1L;
@@ -319,9 +494,12 @@ public class RemoteLogManager implements Closeable {
                 tableBucket,
                 (tb, prevTask) -> {
                     if (prevTask != null) {
-                        LOG.info(
-                                "Cancelling the remote log task for table-bucket: {}", tableBucket);
-                        prevTask.cancel();
+                        if (prevTask.isOwnedBy(replica)) {
+                            return prevTask;
+                        }
+                        throw new IllegalStateException(
+                                "Remote log tiering already has a different replica owner for "
+                                        + tableBucket);
                     }
                     LogTieringTask task =
                             new LogTieringTask(
@@ -342,7 +520,7 @@ public class RemoteLogManager implements Closeable {
                                     Math.abs(ThreadLocalRandom.current().nextLong(taskInterval)),
                                     taskInterval,
                                     TimeUnit.MILLISECONDS);
-                    return new TaskWithFuture(task, future);
+                    return new TaskWithFuture(replica, task, future);
                 });
     }
 
@@ -372,12 +550,18 @@ public class RemoteLogManager implements Closeable {
 
     static class TaskWithFuture {
 
+        private final Replica owner;
         private final LogTieringTask task;
         private final Future<?> future;
 
-        TaskWithFuture(LogTieringTask task, Future<?> future) {
+        TaskWithFuture(Replica owner, LogTieringTask task, Future<?> future) {
+            this.owner = owner;
             this.task = task;
             this.future = future;
+        }
+
+        boolean isOwnedBy(Replica replica) {
+            return owner == replica;
         }
 
         public void cancel() {

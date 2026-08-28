@@ -27,6 +27,8 @@ import org.apache.fluss.server.metadata.ServerMetadataCache;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
+
 import java.util.function.Supplier;
 
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeCommitKvSnapshotRequest;
@@ -62,6 +64,25 @@ public class DefaultCompletedKvSnapshotCommitter implements CompletedKvSnapshotC
         coordinatorGateway
                 .commitKvSnapshot(
                         makeCommitKvSnapshotRequest(snapshot, coordinatorEpoch, bucketLeaderEpoch))
+                .get();
+    }
+
+    @Override
+    public void commitKvSnapshot(
+            CompletedSnapshot snapshot,
+            int coordinatorEpoch,
+            int bucketLeaderEpoch,
+            @Nullable String sourceMetadataPath,
+            @Nullable Integer sourceMetadataVersion)
+            throws Exception {
+        coordinatorGateway
+                .commitKvSnapshot(
+                        makeCommitKvSnapshotRequest(
+                                snapshot,
+                                coordinatorEpoch,
+                                bucketLeaderEpoch,
+                                sourceMetadataPath,
+                                sourceMetadataVersion))
                 .get();
     }
 

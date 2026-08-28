@@ -19,15 +19,22 @@ package org.apache.fluss.server.coordinator;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.rpc.messages.ApiVersionsRequest;
+import org.apache.fluss.rpc.messages.ApiVersionsResponse;
+import org.apache.fluss.rpc.messages.PbApiVersion;
+import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.server.ServerBase;
 import org.apache.fluss.server.ServerTestBase;
 import org.apache.fluss.server.zk.data.CoordinatorAddress;
+import org.apache.fluss.server.zk.data.ServerApiVersion;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -76,6 +83,25 @@ class CoordinatorServerTest extends ServerTestBase {
         verifyEndpoint(
                 optCoordinatorAddr.get().getEndpoints(),
                 coordinatorServer.getRpcServer().getBindEndpoints());
+
+        List<ServerApiVersion> persistedApiVersions = optCoordinatorAddr.get().getApiVersions();
+        ApiVersionsResponse wireResponse =
+                coordinatorServer
+                        .getCoordinatorService()
+                        .apiVersions(new ApiVersionsRequest())
+                        .get();
+        assertThat(toVersionString(wireResponse)).isEqualTo(toVersionString(persistedApiVersions));
+        assertThat(persistedApiVersions)
+                .extracting(ServerApiVersion::getApiKey)
+                .contains(
+                        ApiKeys.BEGIN_BULK_LOAD.id,
+                        ApiKeys.COMMIT_BULK_LOAD.id,
+                        ApiKeys.ABORT_BULK_LOAD.id,
+                        ApiKeys.GET_BULK_LOAD_STATUS.id)
+                .doesNotContain(
+                        ApiKeys.UPDATE_METADATA.id,
+                        ApiKeys.NOTIFY_LEADER_AND_ISR.id,
+                        ApiKeys.STOP_REPLICA.id);
     }
 
     public void waitUntilCoordinatorServerElected() {
@@ -83,5 +109,27 @@ class CoordinatorServerTest extends ServerTestBase {
                 () -> zookeeperClient.getCoordinatorLeaderAddress().isPresent(),
                 Duration.ofSeconds(5),
                 "Fail to wait coordinator server elected");
+    }
+
+    private static String toVersionString(List<ServerApiVersion> versions) {
+        return versions.stream()
+                .map(
+                        version ->
+                                version.getApiKey()
+                                        + ":"
+                                        + version.getMinVersion()
+                                        + ":"
+                                        + version.getMaxVersion())
+                .collect(Collectors.joining(","));
+    }
+
+    private static String toVersionString(ApiVersionsResponse response) {
+        return response.getApiVersionsList().stream()
+                .map(CoordinatorServerTest::toVersionString)
+                .collect(Collectors.joining(","));
+    }
+
+    private static String toVersionString(PbApiVersion version) {
+        return version.getApiKey() + ":" + version.getMinVersion() + ":" + version.getMaxVersion();
     }
 }

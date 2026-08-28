@@ -140,6 +140,15 @@ public class FlinkConversions {
                         column.getName(), column.getAggFunction().get(), newOptions);
             }
         }
+        // Materialize the auto-increment declaration as the 'auto-increment.fields' option.
+        // Tables created through the Fluss Java API carry the declaration only in the schema,
+        // not in the custom properties; without this backfill the option would be lost when
+        // the table is materialized in the Flink catalog.
+        if (!schema.getAutoIncrementColumnNames().isEmpty()) {
+            newOptions.putIfAbsent(
+                    AUTO_INCREMENT_FIELDS.key(),
+                    String.join(",", schema.getAutoIncrementColumnNames()));
+        }
         List<String> physicalColumns = schema.getColumnNames();
         int columnCount =
                 physicalColumns.size()

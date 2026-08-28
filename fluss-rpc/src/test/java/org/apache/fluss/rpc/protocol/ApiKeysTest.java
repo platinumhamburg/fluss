@@ -22,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import java.util.HashSet;
 import java.util.Set;
 
+import static org.apache.fluss.rpc.protocol.ApiKeys.ApiVisibility.PUBLIC;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class ApiKeysTest {
@@ -37,5 +38,28 @@ class ApiKeysTest {
             assertThat(api.lowestSupportedVersion).isGreaterThanOrEqualTo((short) 0);
             assertThat(api.highestSupportedVersion).isGreaterThanOrEqualTo((short) 0);
         }
+    }
+
+    @Test
+    void testBulkLoadApiKeysAndVersionRanges() {
+        assertApi(ApiKeys.LIST_REMOTE_LOG_MANIFESTS, 1063, 0, 1, PUBLIC);
+        assertApi(ApiKeys.LIST_KV_SNAPSHOTS, 1064, 0, 1, PUBLIC);
+        assertApi(ApiKeys.BEGIN_BULK_LOAD, 1065, 0, 0, PUBLIC);
+        assertApi(ApiKeys.COMMIT_BULK_LOAD, 1066, 0, 0, PUBLIC);
+        assertApi(ApiKeys.ABORT_BULK_LOAD, 1067, 0, 0, PUBLIC);
+        assertApi(ApiKeys.GET_BULK_LOAD_STATUS, 1068, 0, 0, PUBLIC);
+    }
+
+    private static void assertApi(
+            ApiKeys api,
+            int id,
+            int lowestVersion,
+            int highestVersion,
+            ApiKeys.ApiVisibility visibility) {
+        assertThat(api.id).isEqualTo((short) id);
+        assertThat(api.lowestSupportedVersion).isEqualTo((short) lowestVersion);
+        assertThat(api.highestSupportedVersion).isEqualTo((short) highestVersion);
+        assertThat(api.visibility).isEqualTo(visibility);
+        assertThat(ApiKeys.forId(id)).isSameAs(api);
     }
 }

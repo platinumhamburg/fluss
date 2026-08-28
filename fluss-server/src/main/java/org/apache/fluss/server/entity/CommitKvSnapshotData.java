@@ -20,6 +20,8 @@ package org.apache.fluss.server.entity;
 import org.apache.fluss.rpc.messages.CommitKvSnapshotRequest;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 
+import javax.annotation.Nullable;
+
 /** The data for request {@link CommitKvSnapshotRequest}. */
 public class CommitKvSnapshotData {
 
@@ -32,11 +34,28 @@ public class CommitKvSnapshotData {
     /** The leader epoch of the bucket when the snapshot is triggered. */
     private final int bucketLeaderEpoch;
 
+    /** Canonical target registration path frozen when the snapshot started. */
+    private final @Nullable String sourceMetadataPath;
+
+    /** Target registration version frozen when the snapshot started. */
+    private final @Nullable Integer sourceMetadataVersion;
+
     public CommitKvSnapshotData(
             CompletedSnapshot completedSnapshot, int coordinatorEpoch, int bucketLeaderEpoch) {
+        this(completedSnapshot, coordinatorEpoch, bucketLeaderEpoch, null, null);
+    }
+
+    public CommitKvSnapshotData(
+            CompletedSnapshot completedSnapshot,
+            int coordinatorEpoch,
+            int bucketLeaderEpoch,
+            @Nullable String sourceMetadataPath,
+            @Nullable Integer sourceMetadataVersion) {
         this.completedSnapshot = completedSnapshot;
         this.coordinatorEpoch = coordinatorEpoch;
         this.bucketLeaderEpoch = bucketLeaderEpoch;
+        this.sourceMetadataPath = sourceMetadataPath;
+        this.sourceMetadataVersion = sourceMetadataVersion;
     }
 
     public CompletedSnapshot getCompletedSnapshot() {
@@ -49,5 +68,13 @@ public class CommitKvSnapshotData {
 
     public int getBucketLeaderEpoch() {
         return bucketLeaderEpoch;
+    }
+
+    public @Nullable String getSourceMetadataPath() {
+        return sourceMetadataPath;
+    }
+
+    public @Nullable Integer getSourceMetadataVersion() {
+        return sourceMetadataVersion;
     }
 }

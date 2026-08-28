@@ -24,9 +24,18 @@ import org.apache.fluss.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMap
 import org.apache.fluss.utils.json.JsonSerdeTestBase;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.stream.Stream;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link TabletServerRegistrationJsonSerde}. */
 public class TabletServerRegistrationJsonSerdeTest
@@ -43,20 +52,28 @@ public class TabletServerRegistrationJsonSerdeTest
                         null,
                         Endpoint.fromListenersString(
                                 "CLIENT://localhost:2345,FLUSS://127.0.0.1:2346"),
-                        10000);
+                        10000,
+                        TabletServerResource.unknown(),
+                        Collections.singletonList(
+                                new ServerApiVersion((short) 1000, (short) 0, (short) 0)));
         TabletServerRegistration tabletServerRegistration2 =
                 new TabletServerRegistration(
                         "cn-hangzhou-server10",
                         Endpoint.fromListenersString(
                                 "CLIENT://localhost:2345,FLUSS://127.0.0.1:2346"),
-                        10000);
+                        10000,
+                        TabletServerResource.unknown(),
+                        Collections.<ServerApiVersion>emptyList());
         TabletServerRegistration tabletServerRegistration3 =
                 new TabletServerRegistration(
                         "cn-hangzhou-server10",
                         Endpoint.fromListenersString(
                                 "CLIENT://localhost:2345,FLUSS://127.0.0.1:2346"),
                         10000,
-                        new TabletServerResource(8.0, 1024L));
+                        new TabletServerResource(8.0, 1024L),
+                        Arrays.asList(
+                                new ServerApiVersion((short) 1000, (short) 0, (short) 0),
+                                new ServerApiVersion((short) 1016, (short) 0, (short) 1)));
         return new TabletServerRegistration[] {
             tabletServerRegistration1, tabletServerRegistration2, tabletServerRegistration3
         };
@@ -65,9 +82,9 @@ public class TabletServerRegistrationJsonSerdeTest
     @Override
     protected String[] expectedJsons() {
         return new String[] {
-            "{\"version\":4,\"listeners\":\"CLIENT://localhost:2345,FLUSS://127.0.0.1:2346\",\"register_timestamp\":10000}",
-            "{\"version\":4,\"listeners\":\"CLIENT://localhost:2345,FLUSS://127.0.0.1:2346\",\"register_timestamp\":10000,\"rack\":\"cn-hangzhou-server10\"}",
-            "{\"version\":4,\"listeners\":\"CLIENT://localhost:2345,FLUSS://127.0.0.1:2346\",\"register_timestamp\":10000,\"rack\":\"cn-hangzhou-server10\",\"cpu_cores\":8.0,\"memory_bytes\":1024}"
+            "{\"version\":5,\"listeners\":\"CLIENT://localhost:2345,FLUSS://127.0.0.1:2346\",\"register_timestamp\":10000,\"api_versions\":[{\"api_key\":1000,\"min_version\":0,\"max_version\":0}]}",
+            "{\"version\":5,\"listeners\":\"CLIENT://localhost:2345,FLUSS://127.0.0.1:2346\",\"register_timestamp\":10000,\"rack\":\"cn-hangzhou-server10\",\"api_versions\":[]}",
+            "{\"version\":5,\"listeners\":\"CLIENT://localhost:2345,FLUSS://127.0.0.1:2346\",\"register_timestamp\":10000,\"rack\":\"cn-hangzhou-server10\",\"cpu_cores\":8.0,\"memory_bytes\":1024,\"api_versions\":[{\"api_key\":1000,\"min_version\":0,\"max_version\":0},{\"api_key\":1016,\"min_version\":0,\"max_version\":1}]}"
         };
     }
 
@@ -120,5 +137,76 @@ public class TabletServerRegistrationJsonSerdeTest
                                 "CLIENT://localhost:2345,FLUSS://127.0.0.1:2346"),
                         10000);
         assertEquals(tabletServerRegistration, expectedTabletServerRegistration);
+
+        // compatibility with version 4, before api_versions was persisted
+        JsonNode jsonInVersion4 =
+                new ObjectMapper()
+                        .readTree(
+                                ("{\"version\":4,\"listeners\":\"CLIENT://localhost:2345,FLUSS://127.0.0.1:2346\","
+                                                + "\"register_timestamp\":10000,\"rack\":\"cn-hangzhou-server10\","
+                                                + "\"cpu_cores\":8.0,\"memory_bytes\":1024}")
+                                        .getBytes(StandardCharsets.UTF_8));
+        assertThat(
+                        TabletServerRegistrationJsonSerde.INSTANCE
+                                .deserialize(jsonInVersion4)
+                                .getApiVersions())
+                .isEmpty();
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("malformedApiVersionLists")
+    void testDeserializeRejectsMalformedApiVersionList(String description, String apiVersions)
+            throws IOException {
+        JsonNode node =
+                new ObjectMapper()
+                        .readTree(
+                                ("{\"version\":5,\"listeners\":\"CLIENT://localhost:2345\","
+                                                + "\"register_timestamp\":10000,\"api_versions\":"
+                                                + apiVersions
+                                                + "}")
+                                        .getBytes(StandardCharsets.UTF_8));
+
+        assertThatThrownBy(() -> TabletServerRegistrationJsonSerde.INSTANCE.deserialize(node))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("invalidVersions")
+    void testDeserializeRejectsInvalidVersion(String json, String expectedMessage)
+            throws IOException {
+        JsonNode node = new ObjectMapper().readTree(json);
+
+        assertThatThrownBy(() -> TabletServerRegistrationJsonSerde.INSTANCE.deserialize(node))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage(expectedMessage);
+    }
+
+    private static Stream<Arguments> invalidVersions() {
+        int futureVersion = TabletServerRegistrationJsonSerde.VERSION + 1;
+        return Stream.of(
+                Arguments.of("{}", "TabletServerRegistration version must be an integer: missing."),
+                Arguments.of(
+                        "{\"version\":\"not-an-integer\"}",
+                        "TabletServerRegistration version must be an integer: \"not-an-integer\"."),
+                Arguments.of("{\"version\":0}", "Unsupported TabletServerRegistration version 0."),
+                Arguments.of(
+                        "{\"version\":-1}", "Unsupported TabletServerRegistration version -1."),
+                Arguments.of(
+                        "{\"version\":" + futureVersion + "}",
+                        "Unsupported TabletServerRegistration version " + futureVersion + "."));
+    }
+
+    private static Stream<Arguments> malformedApiVersionLists() {
+        return Stream.of(
+                Arguments.of("missing list", "null"),
+                Arguments.of(
+                        "duplicate key",
+                        "[{\"api_key\":1000,\"min_version\":0,\"max_version\":0},{\"api_key\":1000,\"min_version\":0,\"max_version\":0}]"),
+                Arguments.of(
+                        "descending key",
+                        "[{\"api_key\":1001,\"min_version\":0,\"max_version\":0},{\"api_key\":1000,\"min_version\":0,\"max_version\":0}]"),
+                Arguments.of(
+                        "invalid range",
+                        "[{\"api_key\":1000,\"min_version\":1,\"max_version\":0}]"));
     }
 }

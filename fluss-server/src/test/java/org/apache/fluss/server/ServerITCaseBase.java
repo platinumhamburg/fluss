@@ -26,12 +26,13 @@ import org.apache.fluss.rpc.messages.ApiVersionsRequest;
 import org.apache.fluss.rpc.messages.ApiVersionsResponse;
 import org.apache.fluss.rpc.metrics.TestingClientMetricGroup;
 import org.apache.fluss.rpc.netty.client.NettyClient;
-import org.apache.fluss.rpc.protocol.ApiManager;
 import org.apache.fluss.server.cli.CommandLineOptions;
 import org.apache.fluss.server.coordinator.CoordinatorServer;
 import org.apache.fluss.server.tablet.TabletServer;
 import org.apache.fluss.server.utils.TestProcessBuilder;
+import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
+import org.apache.fluss.server.zk.data.ServerApiVersion;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
 import org.apache.fluss.testutils.common.CommonTestUtils;
 
@@ -39,9 +40,11 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -136,9 +139,56 @@ public abstract class ServerITCaseBase {
                                             .setClientSoftwareVersion("1.0.0")
                                             .setClientSoftwareName("test"))
                             .get();
-            ApiManager apiManager = new ApiManager(getServerNode().serverType());
-            assertThat(response.getApiVersionsCount()).isEqualTo(apiManager.enabledApis().size());
+            List<ServerApiVersion> expectedApiVersions =
+                    ServerApiVersionSupport.apiVersions(getServerNode().serverType());
+            List<ServerApiVersion> wireApiVersions = new ArrayList<>();
+            response.getApiVersionsList()
+                    .forEach(
+                            version ->
+                                    wireApiVersions.add(
+                                            new ServerApiVersion(
+                                                    (short) version.getApiKey(),
+                                                    (short) version.getMinVersion(),
+                                                    (short) version.getMaxVersion())));
+            assertThat(wireApiVersions).containsExactlyElementsOf(expectedApiVersions);
+
+            ZooKeeperClient zkClient =
+                    ZOO_KEEPER_EXTENSION_WRAPPER
+                            .getCustomExtension()
+                            .getZooKeeperClient(exception -> {});
+            List<ServerApiVersion> persistedApiVersions;
+            if (getServerNode().serverType() == org.apache.fluss.cluster.ServerType.COORDINATOR) {
+                persistedApiVersions =
+                        CommonTestUtils.waitValue(
+                                        zkClient::getCoordinatorLeaderAddress,
+                                        Duration.ofMinutes(1),
+                                        "Coordinator registration was not published to ZooKeeper.")
+                                .getApiVersions();
+            } else {
+                persistedApiVersions =
+                        CommonTestUtils.waitValue(
+                                        () -> zkClient.getTabletServer(getServerNode().id()),
+                                        Duration.ofMinutes(1),
+                                        "Tablet server registration was not published to ZooKeeper.")
+                                .getApiVersions();
+            }
+            assertThat(toSortedBytes(wireApiVersions))
+                    .containsExactly(toSortedBytes(persistedApiVersions));
         }
+    }
+
+    private static byte[] toSortedBytes(List<ServerApiVersion> apiVersions) {
+        String value =
+                apiVersions.stream()
+                        .map(
+                                version ->
+                                        version.getApiKey()
+                                                + ":"
+                                                + version.getMinVersion()
+                                                + ":"
+                                                + version.getMaxVersion())
+                        .collect(Collectors.joining(","));
+        return value.getBytes(StandardCharsets.UTF_8);
     }
 
     private static void generateYamlFile(Path yamlFile, Configuration configuration)

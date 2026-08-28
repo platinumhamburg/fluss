@@ -213,7 +213,15 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions.get(FlinkConnectorOptions.BUCKET_NUMBER),
                 getBucketKeys(tableOptions),
                 distributionMode,
-                tableOptions.getOptional(FlinkConnectorOptions.SINK_PRODUCER_ID).orElse(null));
+                tableOptions.getOptional(FlinkConnectorOptions.SINK_PRODUCER_ID).orElse(null),
+                tableOptions.get(FlinkConnectorOptions.SINK_BULK_LOAD_ENABLED),
+                tableOptions
+                        .getOptional(FlinkConnectorOptions.SINK_BULK_LOAD_BUILD_TIMEOUT)
+                        .orElse(null),
+                tableOptions.get(FlinkConnectorOptions.SINK_BULK_LOAD_AWAIT_TIMEOUT),
+                // The auto-increment columns are declared by the 'auto-increment.fields'
+                // string option; the BulkLoad eligibility check only needs the presence.
+                tableOptions.getOptional(FlinkConnectorOptions.AUTO_INCREMENT_FIELDS).isPresent());
     }
 
     @Override
@@ -246,6 +254,9 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                                 FlinkConnectorOptions.SINK_BUCKET_SHUFFLE,
                                 FlinkConnectorOptions.SINK_DISTRIBUTION_MODE,
                                 FlinkConnectorOptions.SINK_PRODUCER_ID,
+                                FlinkConnectorOptions.SINK_BULK_LOAD_ENABLED,
+                                FlinkConnectorOptions.SINK_BULK_LOAD_BUILD_TIMEOUT,
+                                FlinkConnectorOptions.SINK_BULK_LOAD_AWAIT_TIMEOUT,
                                 LookupOptions.MAX_RETRIES,
                                 LookupOptions.CACHE_TYPE,
                                 LookupOptions.PARTIAL_CACHE_EXPIRE_AFTER_ACCESS,

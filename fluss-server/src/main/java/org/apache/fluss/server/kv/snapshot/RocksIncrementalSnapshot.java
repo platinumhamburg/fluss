@@ -131,7 +131,6 @@ public class RocksIncrementalSnapshot implements AutoCloseable {
         LOG.trace("Local RocksDB snapshot goes to backup path {}.", snapshotDirectory);
 
         PreviousSnapshot previousSnapshot = getPreviousSnapshot(snapshotId);
-
         takeDBNativeSnapshot(snapshotDirectory);
 
         return new NativeRocksDBSnapshotResources(snapshotDirectory, previousSnapshot);

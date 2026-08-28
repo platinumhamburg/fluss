@@ -27,8 +27,10 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.cluster.AlterConfig;
 import org.apache.fluss.config.cluster.AlterConfigOpType;
 import org.apache.fluss.exception.ApiException;
+import org.apache.fluss.exception.AuthorizationException;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.InvalidAlterTableException;
+import org.apache.fluss.exception.InvalidBulkLoadRequestException;
 import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.exception.InvalidCoordinatorException;
 import org.apache.fluss.exception.InvalidDatabaseException;
@@ -41,18 +43,21 @@ import org.apache.fluss.exception.SecurityDisabledException;
 import org.apache.fluss.exception.TableAlreadyExistException;
 import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.exception.TableNotPartitionedException;
+import org.apache.fluss.exception.TimeoutException;
 import org.apache.fluss.exception.UnknownServerException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.lake.committer.TieringStats;
 import org.apache.fluss.lake.lakestorage.LakeCatalog;
+import org.apache.fluss.metadata.BulkLoadHandle;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DatabaseChange;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.PartitionSpec;
+import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableChange;
@@ -60,6 +65,8 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
+import org.apache.fluss.rpc.messages.AbortBulkLoadRequest;
+import org.apache.fluss.rpc.messages.AbortBulkLoadResponse;
 import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseRequest;
 import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseResponse;
 import org.apache.fluss.rpc.messages.AddServerTagRequest;
@@ -72,8 +79,12 @@ import org.apache.fluss.rpc.messages.AlterDatabaseRequest;
 import org.apache.fluss.rpc.messages.AlterDatabaseResponse;
 import org.apache.fluss.rpc.messages.AlterTableRequest;
 import org.apache.fluss.rpc.messages.AlterTableResponse;
+import org.apache.fluss.rpc.messages.BeginBulkLoadRequest;
+import org.apache.fluss.rpc.messages.BeginBulkLoadResponse;
 import org.apache.fluss.rpc.messages.CancelRebalanceRequest;
 import org.apache.fluss.rpc.messages.CancelRebalanceResponse;
+import org.apache.fluss.rpc.messages.CommitBulkLoadRequest;
+import org.apache.fluss.rpc.messages.CommitBulkLoadResponse;
 import org.apache.fluss.rpc.messages.CommitKvSnapshotRequest;
 import org.apache.fluss.rpc.messages.CommitKvSnapshotResponse;
 import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
@@ -102,6 +113,8 @@ import org.apache.fluss.rpc.messages.DropPartitionRequest;
 import org.apache.fluss.rpc.messages.DropPartitionResponse;
 import org.apache.fluss.rpc.messages.DropTableRequest;
 import org.apache.fluss.rpc.messages.DropTableResponse;
+import org.apache.fluss.rpc.messages.GetBulkLoadStatusRequest;
+import org.apache.fluss.rpc.messages.GetBulkLoadStatusResponse;
 import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
 import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
 import org.apache.fluss.rpc.messages.GetProducerOffsetsRequest;
@@ -117,6 +130,7 @@ import org.apache.fluss.rpc.messages.ListRemoteLogManifestsResponse;
 import org.apache.fluss.rpc.messages.MetadataRequest;
 import org.apache.fluss.rpc.messages.MetadataResponse;
 import org.apache.fluss.rpc.messages.PbAlterConfig;
+import org.apache.fluss.rpc.messages.PbBulkLoadHandle;
 import org.apache.fluss.rpc.messages.PbHeartbeatReqForTable;
 import org.apache.fluss.rpc.messages.PbHeartbeatRespForTable;
 import org.apache.fluss.rpc.messages.PbKvSnapshotLeaseForTable;
@@ -148,10 +162,15 @@ import org.apache.fluss.server.RpcServiceBase;
 import org.apache.fluss.server.authorizer.AclCreateResult;
 import org.apache.fluss.server.authorizer.AclDeleteResult;
 import org.apache.fluss.server.authorizer.Authorizer;
+import org.apache.fluss.server.coordinator.bulkload.BulkLoadActiveReferenceReader;
+import org.apache.fluss.server.coordinator.bulkload.BulkLoadManager;
+import org.apache.fluss.server.coordinator.event.AbortBulkLoadEvent;
 import org.apache.fluss.server.coordinator.event.AccessContextEvent;
 import org.apache.fluss.server.coordinator.event.AddServerTagEvent;
 import org.apache.fluss.server.coordinator.event.AdjustIsrReceivedEvent;
+import org.apache.fluss.server.coordinator.event.BeginBulkLoadEvent;
 import org.apache.fluss.server.coordinator.event.CancelRebalanceEvent;
+import org.apache.fluss.server.coordinator.event.CommitBulkLoadEvent;
 import org.apache.fluss.server.coordinator.event.CommitKvSnapshotEvent;
 import org.apache.fluss.server.coordinator.event.CommitLakeTableSnapshotEvent;
 import org.apache.fluss.server.coordinator.event.CommitRemoteLogManifestEvent;
@@ -169,8 +188,6 @@ import org.apache.fluss.server.entity.CommitKvSnapshotData;
 import org.apache.fluss.server.entity.DatabasePropertyChanges;
 import org.apache.fluss.server.entity.LakeTieringTableInfo;
 import org.apache.fluss.server.entity.TablePropertyChanges;
-import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
-import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
 import org.apache.fluss.server.metadata.CoordinatorMetadataCache;
 import org.apache.fluss.server.metadata.CoordinatorMetadataProvider;
 import org.apache.fluss.server.utils.ServerRpcMessageUtils;
@@ -179,8 +196,11 @@ import org.apache.fluss.server.zk.ZooKeeperClient.TableBucketAndManifest;
 import org.apache.fluss.server.zk.data.BucketAssignment;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
+import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TableRegistration;
+import org.apache.fluss.server.zk.data.ZkData;
+import org.apache.fluss.server.zk.data.bulkload.BulkLoadTransaction;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableHelper;
 import org.apache.fluss.server.zk.data.producer.ProducerOffsets;
@@ -199,7 +219,6 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -218,6 +237,7 @@ import static org.apache.fluss.server.utils.ServerRpcMessageUtils.addTableOffset
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.fromTablePath;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getAcquireKvSnapshotLeaseData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getAdjustIsrData;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getCommitKvSnapshotData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getCommitLakeTableSnapshotData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getCommitRemoteLogManifestData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getPartitionSpec;
@@ -242,6 +262,9 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
 public final class CoordinatorService extends RpcServiceBase implements CoordinatorGateway {
 
     private static final Logger LOG = LoggerFactory.getLogger(CoordinatorService.class);
+
+    /** Bounded attempts to obtain a stable active-reference read for LIST_KV_SNAPSHOTS. */
+    private static final int ACTIVE_REFERENCE_MAX_READ_ATTEMPTS = 3;
 
     private final int defaultBucketNumber;
     private final int defaultReplicationFactor;
@@ -316,6 +339,222 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     @Override
     public String name() {
         return "coordinator";
+    }
+
+    @Override
+    public CompletableFuture<BeginBulkLoadResponse> beginBulkLoad(BeginBulkLoadRequest request) {
+        PhysicalTablePath target = validateTarget(request);
+        authorize(target, OperationType.WRITE);
+        FlussPrincipal sessionPrincipal = currentSession().getPrincipal();
+        FlussPrincipal creator =
+                new FlussPrincipal(sessionPrincipal.getName(), sessionPrincipal.getType());
+        CompletableFuture<BeginBulkLoadResponse> future = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(
+                        new BeginBulkLoadEvent(
+                                target,
+                                request.getCallerToken(),
+                                request.hasBuildTimeoutMs() ? request.getBuildTimeoutMs() : null,
+                                creator,
+                                future));
+        return future;
+    }
+
+    @Override
+    public CompletableFuture<CommitBulkLoadResponse> commitBulkLoad(CommitBulkLoadRequest request) {
+        BulkLoadHandle handle = validateCommitRequest(request);
+        authorizeCommit(handle);
+        CompletableFuture<CommitBulkLoadResponse> future = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(
+                        new CommitBulkLoadEvent(
+                                handle,
+                                request.hasManifestPath() ? request.getManifestPath() : null,
+                                request.hasManifestLength() ? request.getManifestLength() : null,
+                                request.hasManifestSha256() ? request.getManifestSha256() : null,
+                                future));
+        return future;
+    }
+
+    @Override
+    public CompletableFuture<AbortBulkLoadResponse> abortBulkLoad(AbortBulkLoadRequest request) {
+        BulkLoadHandle handle =
+                requireHandle(
+                        request.hasHandle(), request.hasHandle() ? request.getHandle() : null);
+        authorizeAbort(handle);
+        CompletableFuture<AbortBulkLoadResponse> future = new CompletableFuture<>();
+        eventManagerSupplier.get().put(new AbortBulkLoadEvent(handle, future));
+        return future;
+    }
+
+    @Override
+    public CompletableFuture<GetBulkLoadStatusResponse> getBulkLoadStatus(
+            GetBulkLoadStatusRequest request) {
+        BulkLoadHandle handle =
+                requireHandle(
+                        request.hasHandle(), request.hasHandle() ? request.getHandle() : null);
+        Session session = authorizer == null ? null : currentSession();
+        return CompletableFuture.supplyAsync(
+                () -> {
+                    BulkLoadTransaction transaction =
+                            BulkLoadManager.readTransaction(zkClient, handle);
+                    authorizeStatus(handle, transaction, session);
+                    return BulkLoadManager.readStatus(zkClient, transaction);
+                },
+                ioExecutor);
+    }
+
+    private PhysicalTablePath validateTarget(BeginBulkLoadRequest request) {
+        if (!request.hasTarget()
+                || !request.getTarget().hasDatabaseName()
+                || !request.getTarget().hasTableName()
+                || request.getTarget().getDatabaseName().trim().isEmpty()
+                || request.getTarget().getTableName().trim().isEmpty()
+                || (request.getTarget().hasPartitionName()
+                        && request.getTarget().getPartitionName().isEmpty())
+                || !request.hasCallerToken()
+                || request.getCallerToken().trim().isEmpty()
+                || (request.hasBuildTimeoutMs() && request.getBuildTimeoutMs() <= 0)) {
+            throw new InvalidBulkLoadRequestException("Invalid BulkLoad Begin request.");
+        }
+        PhysicalTablePath target =
+                PhysicalTablePath.of(
+                        TablePath.of(
+                                request.getTarget().getDatabaseName(),
+                                request.getTarget().getTableName()),
+                        request.getTarget().hasPartitionName()
+                                ? request.getTarget().getPartitionName()
+                                : null);
+        if (!target.isValid()) {
+            throw new InvalidBulkLoadRequestException("Invalid BulkLoad target.");
+        }
+        return target;
+    }
+
+    private BulkLoadHandle validateCommitRequest(CommitBulkLoadRequest request) {
+        BulkLoadHandle handle =
+                requireHandle(
+                        request.hasHandle(), request.hasHandle() ? request.getHandle() : null);
+        boolean hasManifest =
+                request.hasManifestPath()
+                        || request.hasManifestLength()
+                        || request.hasManifestSha256();
+        if (hasManifest
+                && (!request.hasManifestPath()
+                        || request.getManifestPath().isEmpty()
+                        || !request.hasManifestLength()
+                        || request.getManifestLength() <= 0
+                        || !request.hasManifestSha256()
+                        || !request.getManifestSha256().matches("[0-9a-f]{64}"))) {
+            throw new InvalidBulkLoadRequestException("Invalid BulkLoad Commit request.");
+        }
+        return handle;
+    }
+
+    private BulkLoadHandle requireHandle(boolean present, PbBulkLoadHandle handle) {
+        if (!present
+                || handle == null
+                || !handle.hasTarget()
+                || !handle.hasTableId()
+                || !handle.hasBulkLoadId()
+                || !handle.getTarget().hasDatabaseName()
+                || !handle.getTarget().hasTableName()) {
+            throw new InvalidBulkLoadRequestException("Malformed BulkLoad handle.");
+        }
+        try {
+            PhysicalTablePath target =
+                    PhysicalTablePath.of(
+                            TablePath.of(
+                                    handle.getTarget().getDatabaseName(),
+                                    handle.getTarget().getTableName()),
+                            handle.getTarget().hasPartitionName()
+                                    ? handle.getTarget().getPartitionName()
+                                    : null);
+            if (!target.isValid()
+                    || (handle.getTarget().hasPartitionName()
+                            && handle.getTarget().getPartitionName().isEmpty())) {
+                throw new InvalidBulkLoadRequestException("Malformed BulkLoad handle.");
+            }
+            return new BulkLoadHandle(
+                    target,
+                    handle.getTableId(),
+                    handle.hasPartitionId() ? handle.getPartitionId() : null,
+                    handle.getBulkLoadId());
+        } catch (RuntimeException e) {
+            throw new InvalidBulkLoadRequestException("Malformed BulkLoad handle.", e);
+        }
+    }
+
+    private void authorizeCommit(BulkLoadHandle handle) {
+        BulkLoadTransaction transaction = BulkLoadManager.readTransaction(zkClient, handle);
+        if (authorizer != null) {
+            authorizer.authorize(
+                    currentSession(),
+                    OperationType.WRITE,
+                    Resource.table(transaction.getHandle().getTarget().getTablePath()));
+        }
+    }
+
+    private void authorizeAbort(BulkLoadHandle handle) {
+        BulkLoadTransaction transaction = BulkLoadManager.readTransaction(zkClient, handle);
+        if (authorizer == null) {
+            return;
+        }
+        Session session = currentSession();
+        Resource resource = Resource.table(handle.getTarget().getTablePath());
+        if (!isCreator(transaction, session)
+                && !authorizer.isAuthorized(session, OperationType.ALTER, resource)) {
+            throw new AuthorizationException("Not authorized to abort this BulkLoad.");
+        }
+    }
+
+    private void authorizeStatus(
+            BulkLoadHandle handle, BulkLoadTransaction transaction, @Nullable Session session) {
+        if (authorizer == null) {
+            return;
+        }
+        Resource resource = Resource.table(handle.getTarget().getTablePath());
+        if (targetStillExists(handle)) {
+            authorizer.authorize(session, OperationType.DESCRIBE, resource);
+        } else if (!isCreator(transaction, session)
+                && !authorizer.isAuthorized(session, OperationType.ALTER, resource)) {
+            throw new AuthorizationException("Not authorized to read this retained BulkLoad.");
+        }
+    }
+
+    private boolean targetStillExists(BulkLoadHandle handle) {
+        try {
+            Optional<TableRegistration> table =
+                    zkClient.getTable(handle.getTarget().getTablePath());
+            if (!table.isPresent() || table.get().tableId != handle.getTableId()) {
+                return false;
+            }
+            if (handle.getPartitionId() == null) {
+                return true;
+            }
+            Optional<PartitionRegistration> partition =
+                    zkClient.getPartition(
+                            handle.getTarget().getTablePath(),
+                            handle.getTarget().getPartitionName());
+            return partition.isPresent()
+                    && partition.get().getPartitionId() == handle.getPartitionId();
+        } catch (Exception e) {
+            throw new UnknownServerException("Failed to resolve BulkLoad authorization target.", e);
+        }
+    }
+
+    private void authorize(PhysicalTablePath target, OperationType operation) {
+        if (authorizer != null) {
+            authorizer.authorize(
+                    currentSession(), operation, Resource.table(target.getTablePath()));
+        }
+    }
+
+    private static boolean isCreator(BulkLoadTransaction transaction, Session session) {
+        return transaction.getCreatorName().equals(session.getPrincipal().getName())
+                && transaction.getCreatorType().equals(session.getPrincipal().getType());
     }
 
     @Override
@@ -450,10 +689,24 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     @Override
     public CompletableFuture<DropDatabaseResponse> dropDatabase(DropDatabaseRequest request) {
         authorizeDatabase(OperationType.DROP, request.getDatabaseName());
-        DropDatabaseResponse response = new DropDatabaseResponse();
-        metadataManager.dropDatabase(
-                request.getDatabaseName(), request.isIgnoreIfNotExists(), request.isCascade());
-        return CompletableFuture.completedFuture(response);
+        CompletableFuture<DropDatabaseResponse> future = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(
+                        new AccessContextEvent<>(
+                                context -> {
+                                    try {
+                                        metadataManager.dropDatabase(
+                                                request.getDatabaseName(),
+                                                request.isIgnoreIfNotExists(),
+                                                request.isCascade());
+                                        future.complete(new DropDatabaseResponse());
+                                    } catch (Throwable failure) {
+                                        future.completeExceptionally(failure);
+                                    }
+                                    return null;
+                                }));
+        return future;
     }
 
     @Override
@@ -580,26 +833,31 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                             + "table properties or table schema.");
         }
 
-        if (!alterSchemaChanges.isEmpty()) {
-            metadataManager.alterTableSchema(
-                    tablePath,
-                    alterSchemaChanges,
-                    request.isIgnoreIfNotExists(),
-                    currentSession().getPrincipal());
-        }
-
-        if (!alterTableConfigChanges.isEmpty()) {
-            metadataManager.alterTableProperties(
-                    tablePath,
-                    alterTableConfigChanges,
-                    tablePropertyChanges,
-                    request.isIgnoreIfNotExists(),
-                    currentSession().getPrincipal(),
-                    this::beforeTablePropertiesUpdate,
-                    this::afterTablePropertiesUpdate);
-        }
-
-        return CompletableFuture.completedFuture(new AlterTableResponse());
+        FlussPrincipal principal = currentSession().getPrincipal();
+        AccessContextEvent<AlterTableResponse> event =
+                new AccessContextEvent<>(
+                        ignored -> {
+                            if (!alterSchemaChanges.isEmpty()) {
+                                metadataManager.alterTableSchema(
+                                        tablePath,
+                                        alterSchemaChanges,
+                                        request.isIgnoreIfNotExists(),
+                                        principal);
+                            }
+                            if (!alterTableConfigChanges.isEmpty()) {
+                                metadataManager.alterTableProperties(
+                                        tablePath,
+                                        alterTableConfigChanges,
+                                        tablePropertyChanges,
+                                        request.isIgnoreIfNotExists(),
+                                        principal,
+                                        this::beforeTablePropertiesUpdate,
+                                        this::afterTablePropertiesUpdate);
+                            }
+                            return new AlterTableResponse();
+                        });
+        eventManagerSupplier.get().put(event);
+        return event.getResultFuture();
     }
 
     private void beforeTablePropertiesUpdate(TableInfo currentTable, TableDescriptor updatedTable) {
@@ -851,9 +1109,14 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         TablePath tablePath = toTablePath(request.getTablePath());
         authorizeTable(OperationType.DROP, tablePath);
 
-        DropTableResponse response = new DropTableResponse();
-        metadataManager.dropTable(tablePath, request.isIgnoreIfNotExists());
-        return CompletableFuture.completedFuture(response);
+        AccessContextEvent<DropTableResponse> event =
+                new AccessContextEvent<>(
+                        ignored -> {
+                            metadataManager.dropTable(tablePath, request.isIgnoreIfNotExists());
+                            return new DropTableResponse();
+                        });
+        eventManagerSupplier.get().put(event);
+        return event.getResultFuture();
     }
 
     @Override
@@ -920,27 +1183,34 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         TablePath tablePath = toTablePath(request.getTablePath());
         authorizeTable(OperationType.WRITE, tablePath);
 
-        DropPartitionResponse response = new DropPartitionResponse();
-        TableRegistration table = metadataManager.getTableRegistration(tablePath);
-        if (!table.isPartitioned()) {
-            throw new TableNotPartitionedException(
-                    "Only partitioned table support drop partition.");
-        }
-
-        // first, validate the partition spec.
         PartitionSpec partitionSpec = getPartitionSpec(request.getPartitionSpec());
-        validatePartitionSpec(tablePath, table.partitionKeys, partitionSpec, false);
-        ResolvedPartitionSpec partitionToDrop =
-                ResolvedPartitionSpec.fromPartitionSpec(table.partitionKeys, partitionSpec);
-        if (table.getTableConfig().isHistoricalPartitionEnabled()
-                && HISTORICAL_PARTITION_VALUE.equals(partitionToDrop.getPartitionName())) {
-            throw new InvalidPartitionException(
-                    "Historical system partition is managed by the coordinator and cannot be "
-                            + "dropped manually.");
-        }
-
-        metadataManager.dropPartition(tablePath, partitionToDrop, request.isIgnoreIfNotExists());
-        return CompletableFuture.completedFuture(response);
+        AccessContextEvent<DropPartitionResponse> event =
+                new AccessContextEvent<>(
+                        ignored -> {
+                            TableRegistration table =
+                                    metadataManager.getTableRegistration(tablePath);
+                            if (!table.isPartitioned()) {
+                                throw new TableNotPartitionedException(
+                                        "Only partitioned table support drop partition.");
+                            }
+                            validatePartitionSpec(
+                                    tablePath, table.partitionKeys, partitionSpec, false);
+                            ResolvedPartitionSpec partitionToDrop =
+                                    ResolvedPartitionSpec.fromPartitionSpec(
+                                            table.partitionKeys, partitionSpec);
+                            if (table.getTableConfig().isHistoricalPartitionEnabled()
+                                    && HISTORICAL_PARTITION_VALUE.equals(
+                                            partitionToDrop.getPartitionName())) {
+                                throw new InvalidPartitionException(
+                                        "Historical system partition is managed by the coordinator "
+                                                + "and cannot be dropped manually.");
+                            }
+                            metadataManager.dropPartition(
+                                    tablePath, partitionToDrop, request.isIgnoreIfNotExists());
+                            return new DropPartitionResponse();
+                        });
+        eventManagerSupplier.get().put(event);
+        return event.getResultFuture();
     }
 
     @Override
@@ -966,6 +1236,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     @Override
     public CompletableFuture<ListRemoteLogManifestsResponse> listRemoteLogManifests(
             ListRemoteLogManifestsRequest request) {
+        boolean activeReferencesComplete = currentSession().getApiVersion() >= 1;
         long tableId = request.getTableId();
         if (authorizer != null) {
             authorizeTableWithSession(currentSession(), OperationType.DESCRIBE, tableId);
@@ -977,7 +1248,12 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                     try {
                         List<TableBucketAndManifest> entries =
                                 zkClient.listRemoteLogManifestHandles(tableId, partitionId);
-                        return makeListRemoteLogManifestsResponse(entries);
+                        ListRemoteLogManifestsResponse response =
+                                makeListRemoteLogManifestsResponse(entries);
+                        if (activeReferencesComplete) {
+                            response.setActiveReferencesComplete(true);
+                        }
+                        return response;
                     } catch (ApiException e) {
                         throw e;
                     } catch (Exception e) {
@@ -991,105 +1267,153 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     @Override
     public CompletableFuture<ListKvSnapshotsResponse> listKvSnapshots(
             ListKvSnapshotsRequest request) {
+        boolean activeReferencesComplete = currentSession().getApiVersion() >= 1;
         long tableId = request.getTableId();
         Long partitionId = request.hasPartitionId() ? request.getPartitionId() : null;
         if (authorizer != null) {
             authorizeTableWithSession(currentSession(), OperationType.DESCRIBE, tableId);
         }
 
-        // Resolve numBuckets via event thread (CoordinatorContext is @NotThreadSafe)
-        CompletableFuture<Integer> numBucketsFuture = resolveNumBuckets(tableId, partitionId);
+        return resolveBulkLoadReadTarget(tableId, partitionId)
+                .thenApplyAsync(
+                        target -> {
+                            validatePartitionOwnership(partitionId, tableId);
 
-        return numBucketsFuture.thenCompose(
-                numBuckets ->
-                        CompletableFuture.supplyAsync(
-                                () -> {
-                                    validatePartitionOwnership(partitionId, tableId);
+                            CompletedSnapshotStoreManager storeManager =
+                                    snapshotStoreManagerSupplier.get();
+                            BulkLoadActiveReferenceReader referenceReader =
+                                    new BulkLoadActiveReferenceReader(zkClient);
+                            // Recheck BulkLoad metadata around the ordinary-reference read. Retry
+                            // changed observations within a fixed bound, then fail retriably.
+                            Map<Integer, Set<Long>> references = null;
+                            Exception lastFailure = null;
+                            for (int attempt = 0;
+                                    attempt < ACTIVE_REFERENCE_MAX_READ_ATTEMPTS;
+                                    attempt++) {
+                                try {
+                                    references =
+                                            referenceReader.readSnapshotIds(
+                                                    tableId,
+                                                    partitionId,
+                                                    target.registrationPath,
+                                                    () -> {
+                                                        Map<Integer, Set<Long>> retained =
+                                                                storeManager
+                                                                        .getActiveSnapshotIdsByBucket(
+                                                                                tableId,
+                                                                                partitionId,
+                                                                                target.numBuckets);
+                                                        Map<Integer, Set<Long>> stillInUse =
+                                                                kvSnapshotLeaseManager
+                                                                        .getStillInUseSnapshotIds(
+                                                                                tableId,
+                                                                                partitionId);
+                                                        Map<Integer, Set<Long>> ordinary =
+                                                                new HashMap<>();
+                                                        Set<Integer> bucketIds =
+                                                                new HashSet<>(retained.keySet());
+                                                        bucketIds.addAll(stillInUse.keySet());
+                                                        for (int bucketId : bucketIds) {
+                                                            Set<Long> merged =
+                                                                    new HashSet<>(
+                                                                            retained.getOrDefault(
+                                                                                    bucketId,
+                                                                                    Collections
+                                                                                            .emptySet()));
+                                                            merged.addAll(
+                                                                    stillInUse.getOrDefault(
+                                                                            bucketId,
+                                                                            Collections
+                                                                                    .emptySet()));
+                                                            ordinary.put(bucketId, merged);
+                                                        }
+                                                        return ordinary;
+                                                    });
+                                    break;
+                                } catch (Exception e) {
+                                    lastFailure = e;
+                                }
+                            }
+                            if (references == null) {
+                                throw new TimeoutException(
+                                        String.format(
+                                                "Could not obtain a stable read of active"
+                                                        + " KV snapshot references for"
+                                                        + " tableId=%d partitionId=%s after"
+                                                        + " %d attempts.",
+                                                tableId,
+                                                partitionId,
+                                                ACTIVE_REFERENCE_MAX_READ_ATTEMPTS),
+                                        lastFailure);
+                            }
 
-                                    CompletedSnapshotStoreManager storeManager =
-                                            snapshotStoreManagerSupplier.get();
-                                    Map<Integer, Set<Long>> activeByBucket =
-                                            storeManager.getActiveSnapshotIdsByBucket(
-                                                    tableId, partitionId, numBuckets);
-                                    Map<Integer, Set<Long>> stillInUse =
-                                            kvSnapshotLeaseManager.getStillInUseSnapshotIds(
-                                                    tableId, partitionId);
+                            ListKvSnapshotsResponse response =
+                                    new ListKvSnapshotsResponse().setTableId(tableId);
+                            if (partitionId != null) {
+                                response.setPartitionId(partitionId);
+                            }
 
-                                    ListKvSnapshotsResponse response =
-                                            new ListKvSnapshotsResponse().setTableId(tableId);
-                                    if (partitionId != null) {
-                                        response.setPartitionId(partitionId);
-                                    }
-
-                                    Set<Integer> allBucketIds =
-                                            new HashSet<>(activeByBucket.keySet());
-                                    allBucketIds.addAll(stillInUse.keySet());
-                                    for (int bucketId : allBucketIds) {
-                                        Set<Long> merged =
-                                                new LinkedHashSet<>(
-                                                        activeByBucket.getOrDefault(
-                                                                bucketId, Collections.emptySet()));
-                                        merged.addAll(
-                                                stillInUse.getOrDefault(
-                                                        bucketId, Collections.emptySet()));
-                                        for (Long snapId : merged) {
-                                            response.addActiveSnapshot()
-                                                    .setBucketId(bucketId)
-                                                    .setSnapshotId(snapId);
-                                        }
-                                    }
-                                    return response;
-                                },
-                                ioExecutor));
+                            for (Map.Entry<Integer, Set<Long>> entry : references.entrySet()) {
+                                for (Long snapId : entry.getValue()) {
+                                    response.addActiveSnapshot()
+                                            .setBucketId(entry.getKey())
+                                            .setSnapshotId(snapId);
+                                }
+                            }
+                            if (activeReferencesComplete) {
+                                response.setActiveReferencesComplete(true);
+                            }
+                            return response;
+                        },
+                        ioExecutor);
     }
 
-    private CompletableFuture<Integer> resolveNumBuckets(long tableId, @Nullable Long partitionId) {
-        AccessContextEvent<Integer> event =
+    private CompletableFuture<BulkLoadReadTarget> resolveBulkLoadReadTarget(
+            long tableId, @Nullable Long partitionId) {
+        AccessContextEvent<BulkLoadReadTarget> event =
                 new AccessContextEvent<>(
                         ctx -> {
                             TablePath tablePath = ctx.getTablePathById(tableId);
-                            if (tablePath != null) {
-                                TableInfo tableInfo = ctx.getTableInfoById(tableId);
-                                if (tableInfo != null) {
-                                    return tableInfo.getNumBuckets();
-                                }
+                            TableInfo tableInfo = ctx.getTableInfoById(tableId);
+                            if (tablePath == null || tableInfo == null) {
+                                return null;
                             }
-                            return null;
+                            String registrationPath;
+                            if (partitionId == null) {
+                                registrationPath = ZkData.TableZNode.path(tablePath);
+                            } else {
+                                Optional<PhysicalTablePath> path =
+                                        ctx.getPhysicalTablePath(partitionId);
+                                if (!path.isPresent()) {
+                                    return null;
+                                }
+                                registrationPath =
+                                        ZkData.PartitionZNode.path(
+                                                path.get().getTablePath(),
+                                                path.get().getPartitionName());
+                            }
+                            return new BulkLoadReadTarget(
+                                    tableInfo.getNumBuckets(), registrationPath);
                         });
         eventManagerSupplier.get().put(event);
         return event.getResultFuture()
-                .thenCompose(
-                        numBuckets -> {
-                            if (numBuckets != null) {
-                                return CompletableFuture.completedFuture(numBuckets);
+                .thenApply(
+                        target -> {
+                            if (target == null) {
+                                throw new TableNotExistException(
+                                        "Physical table " + tableId + " does not exist");
                             }
-                            return CompletableFuture.supplyAsync(
-                                    () -> resolveNumBucketsFromZk(tableId, partitionId),
-                                    ioExecutor);
+                            return target;
                         });
     }
 
-    private int resolveNumBucketsFromZk(long tableId, @Nullable Long partitionId) {
-        try {
-            if (partitionId != null) {
-                Optional<PartitionAssignment> pAssignment =
-                        zkClient.getPartitionAssignment(partitionId);
-                if (!pAssignment.isPresent()) {
-                    throw new PartitionNotExistException(
-                            "Partition " + partitionId + " does not exist");
-                }
-                return pAssignment.get().getBuckets().size();
-            } else {
-                Optional<TableAssignment> assignment = zkClient.getTableAssignment(tableId);
-                if (!assignment.isPresent()) {
-                    throw new TableNotExistException("Table " + tableId + " does not exist");
-                }
-                return assignment.get().getBuckets().size();
-            }
-        } catch (ApiException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new ApiException("Failed to resolve table " + tableId + ": " + e.getMessage(), e);
+    private static final class BulkLoadReadTarget {
+        private final int numBuckets;
+        private final String registrationPath;
+
+        private BulkLoadReadTarget(int numBuckets, String registrationPath) {
+            this.numBuckets = numBuckets;
+            this.registrationPath = registrationPath;
         }
     }
 
@@ -1132,15 +1456,8 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     public CompletableFuture<CommitKvSnapshotResponse> commitKvSnapshot(
             CommitKvSnapshotRequest request) {
         CompletableFuture<CommitKvSnapshotResponse> response = new CompletableFuture<>();
-        // parse completed snapshot from request
-        byte[] completedSnapshotBytes = request.getCompletedSnapshot();
-        CompletedSnapshot completedSnapshot =
-                CompletedSnapshotJsonSerde.fromJson(completedSnapshotBytes);
         CommitKvSnapshotData commitKvSnapshotData =
-                new CommitKvSnapshotData(
-                        completedSnapshot,
-                        request.getCoordinatorEpoch(),
-                        request.getBucketLeaderEpoch());
+                getCommitKvSnapshotData(request, currentSession().getApiVersion());
         eventManagerSupplier.get().put(new CommitKvSnapshotEvent(commitKvSnapshotData, response));
         return response;
     }
@@ -1153,7 +1470,9 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 .get()
                 .put(
                         new CommitRemoteLogManifestEvent(
-                                getCommitRemoteLogManifestData(request), response));
+                                getCommitRemoteLogManifestData(
+                                        request, currentSession().getApiVersion()),
+                                response));
         return response;
     }
 

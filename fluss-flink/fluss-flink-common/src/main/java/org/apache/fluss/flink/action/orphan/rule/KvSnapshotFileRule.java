@@ -24,6 +24,7 @@ import org.apache.fluss.utils.FlussPaths;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
  * Rule for files under a {@code snap-<id>/} KV snapshot directory.
@@ -44,6 +45,9 @@ public final class KvSnapshotFileRule implements FileRule {
 
     private static final Set<String> KNOWN_FIXED_NAMES =
             new HashSet<String>(Arrays.asList("_METADATA", "CURRENT", "LOG", "IDENTITY"));
+
+    private static final Pattern CONTENT_ADDRESSED_PRIVATE_FILE =
+            Pattern.compile("private-[0-9a-f]{64}-[0-9a-f]{64}");
 
     @Override
     public RuleId id() {
@@ -91,6 +95,8 @@ public final class KvSnapshotFileRule implements FileRule {
         if (fileName.startsWith("MANIFEST-") || fileName.startsWith("OPTIONS-")) {
             return true;
         }
-        return fileName.endsWith(".sst") || fileName.endsWith(".log");
+        return fileName.endsWith(".sst")
+                || fileName.endsWith(".log")
+                || CONTENT_ADDRESSED_PRIVATE_FILE.matcher(fileName).matches();
     }
 }

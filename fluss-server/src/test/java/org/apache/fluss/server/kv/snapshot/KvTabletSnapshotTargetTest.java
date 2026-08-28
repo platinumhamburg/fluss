@@ -39,6 +39,7 @@ import org.apache.fluss.testutils.common.ManuallyTriggeredScheduledExecutorServi
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.concurrent.Executors;
+import org.apache.fluss.utils.types.Tuple2;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -65,6 +66,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
@@ -192,6 +194,50 @@ class KvTabletSnapshotTargetTest {
             assertThat(rocksDBKv.get("key1".getBytes())).isEqualTo("val1".getBytes());
             assertThat(rocksDBKv.get("key2".getBytes())).isEqualTo("val2".getBytes());
         }
+    }
+
+    @Test
+    void testSnapshotCommitUsesMetadataIdentityFrozenAtInitialization(@TempDir Path kvTabletDir)
+            throws Throwable {
+        Tuple2<String, Integer> initial = Tuple2.of("/metadata/databases/db/tables/table", 3);
+        Tuple2<String, Integer> newer = Tuple2.of("/metadata/databases/db/tables/table", 4);
+        AtomicReference<Tuple2<String, Integer>> applied = new AtomicReference<>(initial);
+        AtomicReference<Tuple2<String, Integer>> committed = new AtomicReference<>();
+        CompletedKvSnapshotCommitter committer =
+                new CompletedKvSnapshotCommitter() {
+                    @Override
+                    public void commitKvSnapshot(
+                            CompletedSnapshot snapshot,
+                            int coordinatorEpoch,
+                            int bucketLeaderEpoch) {
+                        throw new AssertionError("The identity-aware commit overload is required.");
+                    }
+
+                    @Override
+                    public void commitKvSnapshot(
+                            CompletedSnapshot snapshot,
+                            int coordinatorEpoch,
+                            int bucketLeaderEpoch,
+                            String sourceMetadataPath,
+                            Integer sourceMetadataVersion) {
+                        committed.set(Tuple2.of(sourceMetadataPath, sourceMetadataVersion));
+                    }
+                };
+        KvTabletSnapshotTarget target =
+                createSnapshotTargetWithIdentitySupplier(
+                        FsPath.fromLocalFile(kvTabletDir.toFile()), committer, applied::get);
+
+        PeriodicSnapshotManager.SnapshotRunnable snapshot = target.initSnapshot().get();
+        applied.set(newer);
+        snapshot.getSnapshotRunnable().run();
+        target.handleSnapshotResult(
+                snapshot.getSnapshotId(),
+                snapshot.getCoordinatorEpoch(),
+                snapshot.getBucketLeaderEpoch(),
+                snapshot.getSnapshotLocation(),
+                snapshot.getSnapshotRunnable().get());
+
+        assertThat(committed.get()).isEqualTo(initial);
     }
 
     @Test
@@ -513,6 +559,31 @@ class KvTabletSnapshotTargetTest {
             throws IOException {
         return createSnapshotTargetWithCustomZkAndCommitter(
                 remoteKvTabletDir, zooKeeperClient, customCommitter);
+    }
+
+    private KvTabletSnapshotTarget createSnapshotTargetWithIdentitySupplier(
+            FsPath remoteKvTabletDir,
+            CompletedKvSnapshotCommitter committer,
+            Supplier<Tuple2<String, Integer>> appliedTargetSupplier)
+            throws IOException {
+        Executor executor = Executors.directExecutor();
+        return new KvTabletSnapshotTarget(
+                tableBucket,
+                committer,
+                zooKeeperClient,
+                createIncrementalSnapshot(SnapshotFailType.NONE),
+                remoteKvTabletDir,
+                (int) ConfigOptions.REMOTE_FS_WRITE_BUFFER_SIZE.defaultValue().getBytes(),
+                executor,
+                closeableRegistry,
+                new TestingSnapshotIDCounter(),
+                this::getCurrentTabletState,
+                updateMinRetainOffsetConsumer::set,
+                () -> 0,
+                () -> 0,
+                0,
+                0L,
+                appliedTargetSupplier);
     }
 
     private KvTabletSnapshotTarget createSnapshotTargetWithCustomZkAndCommitter(

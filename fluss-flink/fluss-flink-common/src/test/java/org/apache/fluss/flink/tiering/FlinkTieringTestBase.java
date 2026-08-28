@@ -188,7 +188,15 @@ class FlinkTieringTestBase {
 
     protected JobClient buildTieringJob(
             StreamExecutionEnvironment execEnv, Configuration lakeTieringConfig) throws Exception {
-        Configuration flussConfig = new Configuration(clientConf);
+        return buildTieringJob(execEnv, clientConf, lakeTieringConfig);
+    }
+
+    protected JobClient buildTieringJob(
+            StreamExecutionEnvironment execEnv,
+            Configuration connectionConfig,
+            Configuration lakeTieringConfig)
+            throws Exception {
+        Configuration flussConfig = new Configuration(connectionConfig);
         flussConfig.set(POLL_TIERING_TABLE_INTERVAL, Duration.ofMillis(500L));
 
         return LakeTieringJobBuilder.newBuilder(

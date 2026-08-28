@@ -53,6 +53,7 @@ import java.util.Map;
 
 import static org.apache.flink.table.api.DataTypes.VARBINARY;
 import static org.apache.flink.table.api.DataTypes.VARCHAR;
+import static org.apache.fluss.flink.FlinkConnectorOptions.AUTO_INCREMENT_FIELDS;
 import static org.apache.fluss.flink.FlinkConnectorOptions.BUCKET_KEY;
 import static org.apache.fluss.flink.FlinkConnectorOptions.BUCKET_NUMBER;
 import static org.apache.fluss.flink.utils.CatalogTableTestUtils.addOptions;
@@ -527,6 +528,39 @@ public class FlinkConversionsTest {
 
         // Verify aggregation functions are preserved
         assertThat(convertedFlinkTable.getOptions()).containsAllEntriesOf(options);
+    }
+
+    @Test
+    void testToFlinkTableBackfillsAutoIncrementFieldsOption() {
+        // A table created through the Fluss Java API carries the auto-increment declaration
+        // only in the schema, not in the custom properties.
+        TableDescriptor flussTable =
+                TableDescriptor.builder()
+                        .schema(
+                                org.apache.fluss.metadata.Schema.newBuilder()
+                                        .column("id", DataTypes.BIGINT())
+                                        .column("uid", DataTypes.INT())
+                                        .primaryKey("id")
+                                        .enableAutoIncrement("uid")
+                                        .build())
+                        .distributedBy(1, Collections.singletonList("id"))
+                        .build();
+        long currentMillis = System.currentTimeMillis();
+        TableInfo tableInfo =
+                TableInfo.of(
+                        TablePath.of("db", "table"),
+                        1L,
+                        1,
+                        flussTable,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        currentMillis,
+                        currentMillis);
+
+        CatalogTable flinkTable = (CatalogTable) FlinkConversions.toFlinkTable(tableInfo);
+
+        // The catalog materialization backfills the option, so the BulkLoad eligibility check
+        // (which keys on the option presence) also rejects Java-API-created tables.
+        assertThat(flinkTable.getOptions()).containsEntry(AUTO_INCREMENT_FIELDS.key(), "uid");
     }
 
     /** Test refresh handler for testing purpose. */

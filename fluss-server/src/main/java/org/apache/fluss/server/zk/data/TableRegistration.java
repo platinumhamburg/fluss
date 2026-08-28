@@ -26,6 +26,7 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableDescriptor.TableDistribution;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.server.zk.data.bulkload.BulkLoadDataState;
 
 import javax.annotation.Nullable;
 
@@ -65,6 +66,8 @@ public class TableRegistration {
 
     public final long createdTime;
     public final long modifiedTime;
+    public final BulkLoadDataState dataState;
+    public final @Nullable String bulkLoadId;
 
     public TableRegistration(
             long tableId,
@@ -76,9 +79,36 @@ public class TableRegistration {
             @Nullable String remoteDataDir,
             long createdTime,
             long modifiedTime) {
+        this(
+                tableId,
+                comment,
+                partitionKeys,
+                tableDistribution,
+                properties,
+                customProperties,
+                remoteDataDir,
+                createdTime,
+                modifiedTime,
+                BulkLoadDataState.ACTIVE,
+                null);
+    }
+
+    TableRegistration(
+            long tableId,
+            @Nullable String comment,
+            List<String> partitionKeys,
+            TableDistribution tableDistribution,
+            Map<String, String> properties,
+            Map<String, String> customProperties,
+            @Nullable String remoteDataDir,
+            long createdTime,
+            long modifiedTime,
+            BulkLoadDataState dataState,
+            @Nullable String bulkLoadId) {
         checkArgument(
                 tableDistribution.getBucketCount().isPresent(),
                 "Bucket count is required for table registration.");
+        validateDataState(dataState, bulkLoadId);
         this.tableId = tableId;
         this.comment = comment;
         this.partitionKeys = partitionKeys;
@@ -89,6 +119,8 @@ public class TableRegistration {
         this.remoteDataDir = remoteDataDir;
         this.createdTime = createdTime;
         this.modifiedTime = modifiedTime;
+        this.dataState = dataState;
+        this.bulkLoadId = bulkLoadId;
     }
 
     public boolean isPartitioned() {
@@ -160,7 +192,9 @@ public class TableRegistration {
                 newCustomProperties,
                 remoteDataDir,
                 createdTime,
-                currentMillis);
+                currentMillis,
+                dataState,
+                bulkLoadId);
     }
 
     /**
@@ -181,7 +215,26 @@ public class TableRegistration {
                 customProperties,
                 remoteDataDir,
                 createdTime,
-                modifiedTime);
+                modifiedTime,
+                dataState,
+                bulkLoadId);
+    }
+
+    /** Returns a copy with the validated BulkLoad access state and transaction UUID. */
+    public TableRegistration withDataState(
+            BulkLoadDataState dataState, @Nullable String bulkLoadId) {
+        return new TableRegistration(
+                tableId,
+                comment,
+                partitionKeys,
+                new TableDistribution(bucketCount, bucketKeys),
+                properties,
+                customProperties,
+                remoteDataDir,
+                createdTime,
+                modifiedTime,
+                dataState,
+                bulkLoadId);
     }
 
     @Override
@@ -203,7 +256,9 @@ public class TableRegistration {
                 && Objects.equals(bucketKeys, that.bucketKeys)
                 && Objects.equals(properties, that.properties)
                 && Objects.equals(customProperties, that.customProperties)
-                && Objects.equals(remoteDataDir, that.remoteDataDir);
+                && Objects.equals(remoteDataDir, that.remoteDataDir)
+                && dataState == that.dataState
+                && Objects.equals(bulkLoadId, that.bulkLoadId);
     }
 
     @Override
@@ -218,7 +273,9 @@ public class TableRegistration {
                 customProperties,
                 remoteDataDir,
                 createdTime,
-                modifiedTime);
+                modifiedTime,
+                dataState,
+                bulkLoadId);
     }
 
     @Override
@@ -245,6 +302,17 @@ public class TableRegistration {
                 + createdTime
                 + ", modifiedTime="
                 + modifiedTime
+                + ", dataState="
+                + dataState
+                + ", bulkLoadId='"
+                + bulkLoadId
+                + '\''
                 + '}';
+    }
+
+    private static void validateDataState(
+            BulkLoadDataState dataState, @Nullable String bulkLoadId) {
+        checkArgument(dataState != null, "BulkLoad data state must not be null.");
+        dataState.validateBulkLoadId(bulkLoadId);
     }
 }

@@ -20,6 +20,7 @@ package org.apache.fluss.rpc.protocol;
 import org.apache.fluss.exception.ApiException;
 import org.apache.fluss.exception.AuthenticationException;
 import org.apache.fluss.exception.AuthorizationException;
+import org.apache.fluss.exception.BulkLoadNotFoundException;
 import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.exception.CorruptMessageException;
 import org.apache.fluss.exception.CorruptRecordException;
@@ -35,6 +36,7 @@ import org.apache.fluss.exception.HistoricalPartitionThrottledException;
 import org.apache.fluss.exception.IneligibleReplicaException;
 import org.apache.fluss.exception.InsufficientKvLeaderReplicaCapacityException;
 import org.apache.fluss.exception.InvalidAlterTableException;
+import org.apache.fluss.exception.InvalidBulkLoadRequestException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.exception.InvalidCoordinatorException;
@@ -285,7 +287,11 @@ public enum Errors {
     HISTORICAL_PARTITION_THROTTLED(
             73,
             "Historical partition request is throttled because too many historical requests are in flight.",
-            HistoricalPartitionThrottledException::new);
+            HistoricalPartitionThrottledException::new),
+    BULK_LOAD_NOT_FOUND(
+            74, "The BulkLoad transaction does not exist.", BulkLoadNotFoundException::new),
+    INVALID_BULK_LOAD_REQUEST(
+            75, "The BulkLoad request is invalid.", InvalidBulkLoadRequestException::new);
 
     private static final Logger LOG = LoggerFactory.getLogger(Errors.class);
 

@@ -20,6 +20,7 @@ package org.apache.fluss.utils;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.metadata.BulkLoadHandle;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePartition;
@@ -94,6 +95,9 @@ public class FlussPaths {
 
     /** The name of the directory for shared remote snapshot kv files. */
     public static final String REMOTE_KV_SNAPSHOT_SHARED_DIR = "shared";
+
+    private static final String BULK_LOAD_DIR_NAME = "_bulkload";
+    private static final String BULK_LOAD_MANIFEST_FILE_NAME = "manifest";
 
     private static final String REMOTE_LAKE_DIR_NAME = "lake";
 
@@ -628,6 +632,18 @@ public class FlussPaths {
     }
 
     /**
+     * Returns the fixed manifest path for a BulkLoad transaction.
+     *
+     * @param remoteDataDir the remote data root frozen by Begin
+     * @param handle the BulkLoad transaction identity
+     * @return the transaction manifest path
+     */
+    public static FsPath bulkLoadManifestPath(String remoteDataDir, BulkLoadHandle handle) {
+        return new FsPath(
+                bulkLoadTransactionDir(remoteDataDir, handle), BULK_LOAD_MANIFEST_FILE_NAME);
+    }
+
+    /**
      * Returns the remote directory path for storing kv snapshot files for a kv tablet.
      *
      * <p>The path contract:
@@ -888,5 +904,23 @@ public class FlussPaths {
                     physicalPath,
                     new TablePartition(tableBucket.getTableId(), tableBucket.getPartitionId()));
         }
+    }
+
+    private static FsPath bulkLoadTransactionDir(String remoteDataDir, BulkLoadHandle handle) {
+        checkNotNull(handle, "BulkLoad handle must not be null.");
+        FsPath remoteKvRoot = new FsPath(new FsPath(remoteDataDir), REMOTE_KV_DIR_NAME);
+        FsPath targetRoot =
+                remoteTableDir(
+                        remoteKvRoot, handle.getTarget().getTablePath(), handle.getTableId());
+        if (handle.getPartitionId() != null) {
+            targetRoot =
+                    new FsPath(
+                            targetRoot,
+                            handle.getTarget().getPartitionName()
+                                    + "-"
+                                    + PARTITION_DIR_PREFIX
+                                    + handle.getPartitionId());
+        }
+        return new FsPath(new FsPath(targetRoot, BULK_LOAD_DIR_NAME), handle.getBulkLoadId());
     }
 }

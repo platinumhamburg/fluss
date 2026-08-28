@@ -25,11 +25,15 @@ import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrResultForBucket;
+import org.apache.fluss.server.metadata.ClusterMetadata;
+import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaManager;
 import org.apache.fluss.server.replica.ReplicaTestBase;
 import org.apache.fluss.server.replica.fetcher.ReplicaFetcherManager.ServerIdAndFetcherId;
 import org.apache.fluss.server.tablet.TestTabletServerGateway;
+import org.apache.fluss.server.tablet.bulkload.BulkLoadTargetMetadata;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.server.zk.data.bulkload.BulkLoadDataState;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -40,6 +44,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
@@ -149,6 +154,176 @@ class ReplicaFetcherManagerTest extends ReplicaTestBase {
         assertThat(result.get()).hasSize(1);
         assertThat(result.get().get(0).succeeded()).isTrue();
         assertThat(replicaManager.getReplicaFetcherManager().getFetcherThreadMap()).isEmpty();
+    }
+
+    @Test
+    void testOrdinaryFollowerReplayRestoresFetcherAtUnchangedLeaderEpoch() throws Exception {
+        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 1);
+        List<Integer> replicas = Arrays.asList(TABLET_SERVER_ID, TABLET_SERVER_ID + 1);
+        LeaderAndIsr remoteLeader =
+                new LeaderAndIsr(
+                        TABLET_SERVER_ID + 1,
+                        1,
+                        replicas,
+                        Collections.emptyList(),
+                        INITIAL_COORDINATOR_EPOCH,
+                        LeaderAndIsr.INITIAL_BUCKET_EPOCH);
+        CompletableFuture<List<NotifyLeaderAndIsrResultForBucket>> roleResult =
+                new CompletableFuture<>();
+        replicaManager.becomeLeaderOrFollower(
+                INITIAL_COORDINATOR_EPOCH,
+                Collections.singletonList(
+                        new NotifyLeaderAndIsrData(
+                                PhysicalTablePath.of(DATA1_TABLE_PATH),
+                                tb,
+                                replicas,
+                                remoteLeader)),
+                roleResult::complete);
+        assertThat(roleResult.get()).containsOnly(new NotifyLeaderAndIsrResultForBucket(tb));
+        assertThat(replicaManager.getReplicaFetcherManager().hasFetcherForBucket(tb)).isTrue();
+        replicaManager
+                .getReplicaFetcherManager()
+                .removeFetcherForBuckets(Collections.singleton(tb));
+        assertThat(replicaManager.getReplicaFetcherManager().hasFetcherForBucket(tb)).isFalse();
+
+        roleResult = new CompletableFuture<>();
+        replicaManager.becomeLeaderOrFollower(
+                INITIAL_COORDINATOR_EPOCH,
+                Collections.singletonList(
+                        new NotifyLeaderAndIsrData(
+                                PhysicalTablePath.of(DATA1_TABLE_PATH),
+                                tb,
+                                replicas,
+                                remoteLeader)),
+                roleResult::complete);
+
+        assertThat(roleResult.get()).containsOnly(new NotifyLeaderAndIsrResultForBucket(tb));
+        Replica follower = replicaManager.getReplicaOrException(tb);
+        assertThat(follower.getBulkLoadTargetMetadata()).isNull();
+        assertThat(follower.isLeader()).isFalse();
+        assertThat(follower.getLeaderId()).isEqualTo(TABLET_SERVER_ID + 1);
+        assertThat(replicaManager.getReplicaFetcherManager().hasFetcherForBucket(tb))
+                .as("an exact ordinary follower replay must restore missing fetch ownership")
+                .isTrue();
+    }
+
+    @Test
+    void testLoadingFollowerRecoveryDoesNotStartOrdinaryFetcher() throws Exception {
+        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 2);
+        List<Integer> replicas = Arrays.asList(TABLET_SERVER_ID, TABLET_SERVER_ID + 1);
+        LeaderAndIsr followerRole =
+                new LeaderAndIsr(
+                        TABLET_SERVER_ID + 1,
+                        1,
+                        replicas,
+                        Collections.emptyList(),
+                        INITIAL_COORDINATOR_EPOCH,
+                        LeaderAndIsr.INITIAL_BUCKET_EPOCH);
+        BulkLoadTargetMetadata loadingTarget =
+                new BulkLoadTargetMetadata(
+                        "/registration",
+                        tb,
+                        1,
+                        BulkLoadDataState.LOADING,
+                        "550e8400-e29b-41d4-a716-446655440000");
+        CompletableFuture<List<NotifyLeaderAndIsrResultForBucket>> roleResult =
+                new CompletableFuture<>();
+        replicaManager.becomeLeaderOrFollower(
+                INITIAL_COORDINATOR_EPOCH,
+                Collections.singletonList(
+                        new NotifyLeaderAndIsrData(
+                                PhysicalTablePath.of(DATA1_TABLE_PATH),
+                                tb,
+                                replicas,
+                                followerRole)),
+                roleResult::complete);
+        assertThat(roleResult.get()).containsOnly(new NotifyLeaderAndIsrResultForBucket(tb));
+        assertThat(replicaManager.getReplicaFetcherManager().hasFetcherForBucket(tb)).isTrue();
+
+        roleResult = new CompletableFuture<>();
+        replicaManager.becomeLeaderOrFollower(
+                INITIAL_COORDINATOR_EPOCH,
+                Collections.singletonList(
+                        new NotifyLeaderAndIsrData(
+                                PhysicalTablePath.of(DATA1_TABLE_PATH),
+                                tb,
+                                replicas,
+                                followerRole,
+                                loadingTarget)),
+                roleResult::complete);
+
+        assertThat(roleResult.get()).containsOnly(new NotifyLeaderAndIsrResultForBucket(tb));
+        assertThat(replicaManager.getReplicaOrException(tb).getBulkLoadTargetMetadata())
+                .isEqualTo(loadingTarget);
+        assertThat(replicaManager.getReplicaFetcherManager().hasFetcherForBucket(tb))
+                .as("LOADING recovery must not start ordinary follower replication")
+                .isFalse();
+
+        BulkLoadTargetMetadata activeTarget =
+                new BulkLoadTargetMetadata("/registration", tb, 2, BulkLoadDataState.ACTIVE, null);
+        replicaManager.maybeUpdateMetadataCache(
+                INITIAL_COORDINATOR_EPOCH,
+                new ClusterMetadata(null, Collections.emptySet()),
+                Collections.singletonList(activeTarget));
+
+        assertThat(replicaManager.getReplicaOrException(tb).getBulkLoadTargetMetadata())
+                .isEqualTo(activeTarget);
+        assertThat(replicaManager.getReplicaFetcherManager().hasFetcherForBucket(tb))
+                .as("successful ACTIVE publication must restore ordinary follower replication")
+                .isTrue();
+    }
+
+    @Test
+    void testEqualEpochFollowerReplayMovesFetcherToChangedLeader() throws Exception {
+        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 3);
+        List<Integer> replicas =
+                Arrays.asList(TABLET_SERVER_ID, TABLET_SERVER_ID + 1, TABLET_SERVER_ID + 2);
+        int initialLeader = TABLET_SERVER_ID + 1;
+        int changedLeader = TABLET_SERVER_ID + 2;
+        int fetcherId = tb.hashCode() % conf.getInt(ConfigOptions.LOG_REPLICA_FETCHER_NUMBER);
+        CompletableFuture<List<NotifyLeaderAndIsrResultForBucket>> roleResult =
+                new CompletableFuture<>();
+        replicaManager.becomeLeaderOrFollower(
+                INITIAL_COORDINATOR_EPOCH,
+                Collections.singletonList(
+                        new NotifyLeaderAndIsrData(
+                                PhysicalTablePath.of(DATA1_TABLE_PATH),
+                                tb,
+                                replicas,
+                                new LeaderAndIsr(
+                                        initialLeader,
+                                        1,
+                                        replicas,
+                                        Collections.emptyList(),
+                                        INITIAL_COORDINATOR_EPOCH,
+                                        LeaderAndIsr.INITIAL_BUCKET_EPOCH))),
+                roleResult::complete);
+        assertThat(roleResult.get()).containsOnly(new NotifyLeaderAndIsrResultForBucket(tb));
+        assertThat(replicaManager.getReplicaFetcherManager().getFetcherThreadMap())
+                .containsOnlyKeys(new ServerIdAndFetcherId(initialLeader, fetcherId));
+
+        roleResult = new CompletableFuture<>();
+        replicaManager.becomeLeaderOrFollower(
+                INITIAL_COORDINATOR_EPOCH,
+                Collections.singletonList(
+                        new NotifyLeaderAndIsrData(
+                                PhysicalTablePath.of(DATA1_TABLE_PATH),
+                                tb,
+                                replicas,
+                                new LeaderAndIsr(
+                                        changedLeader,
+                                        1,
+                                        replicas,
+                                        Collections.emptyList(),
+                                        INITIAL_COORDINATOR_EPOCH,
+                                        LeaderAndIsr.INITIAL_BUCKET_EPOCH))),
+                roleResult::complete);
+
+        assertThat(roleResult.get()).containsOnly(new NotifyLeaderAndIsrResultForBucket(tb));
+        assertThat(replicaManager.getReplicaOrException(tb).getLeaderId()).isEqualTo(changedLeader);
+        assertThat(replicaManager.getReplicaFetcherManager().getFetcherThreadMap())
+                .as("an accepted leader change must leave exactly one fetch owner")
+                .containsOnlyKeys(new ServerIdAndFetcherId(changedLeader, fetcherId));
     }
 
     private class TestingReplicaFetcherManager extends ReplicaFetcherManager {

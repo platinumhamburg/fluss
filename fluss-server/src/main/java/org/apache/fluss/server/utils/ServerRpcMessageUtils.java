@@ -178,6 +178,7 @@ import org.apache.fluss.security.acl.AclBinding;
 import org.apache.fluss.server.authorizer.AclCreateResult;
 import org.apache.fluss.server.authorizer.AclDeleteResult;
 import org.apache.fluss.server.entity.AdjustIsrResultForBucket;
+import org.apache.fluss.server.entity.CommitKvSnapshotData;
 import org.apache.fluss.server.entity.CommitLakeTableSnapshotsData;
 import org.apache.fluss.server.entity.CommitRemoteLogManifestData;
 import org.apache.fluss.server.entity.FetchReqInfo;
@@ -199,10 +200,13 @@ import org.apache.fluss.server.metadata.ClusterMetadata;
 import org.apache.fluss.server.metadata.PartitionMetadata;
 import org.apache.fluss.server.metadata.ServerInfo;
 import org.apache.fluss.server.metadata.TableMetadata;
+import org.apache.fluss.server.tablet.bulkload.BulkLoadTargetMetadata;
 import org.apache.fluss.server.zk.ZooKeeperClient.TableBucketAndManifest;
 import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionRegistration;
+import org.apache.fluss.server.zk.data.ZkData;
+import org.apache.fluss.server.zk.data.bulkload.BulkLoadDataState;
 import org.apache.fluss.server.zk.data.lake.LakeTable;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
 import org.apache.fluss.utils.json.DataTypeJsonSerde;
@@ -597,6 +601,78 @@ public class ServerRpcMessageUtils {
                 coordinatorServer, aliveTabletServers, tableMetadataList, partitionMetadataList);
     }
 
+    /** Decodes every v1 BulkLoad target bucket carried by UpdateMetadata. */
+    public static List<BulkLoadTargetMetadata> getUpdateMetadataTargets(
+            UpdateMetadataRequest request) {
+        Map<Long, TablePath> tablePaths = new HashMap<>();
+        List<BulkLoadTargetMetadata> targets = new ArrayList<>();
+        for (PbTableMetadata table : request.getTableMetadatasList()) {
+            TablePath tablePath = toTablePath(table.getTablePath());
+            tablePaths.put(table.getTableId(), tablePath);
+            addUpdateTargets(
+                    targets,
+                    table.getTableId(),
+                    null,
+                    table.getBucketMetadatasList(),
+                    ZkData.TableZNode.path(tablePath),
+                    table.hasMetadataPath() ? table.getMetadataPath() : null,
+                    table.hasMetadataVersion() ? table.getMetadataVersion() : null,
+                    table.hasDataState() ? table.getDataState() : null,
+                    table.hasBulkLoadId() ? table.getBulkLoadId() : null);
+        }
+        for (PbPartitionMetadata partition : request.getPartitionMetadatasList()) {
+            TablePath tablePath = tablePaths.get(partition.getTableId());
+            if (tablePath == null) {
+                throw new IllegalArgumentException(
+                        "BulkLoad partition metadata has no matching table metadata.");
+            }
+            addUpdateTargets(
+                    targets,
+                    partition.getTableId(),
+                    partition.getPartitionId(),
+                    partition.getBucketMetadatasList(),
+                    ZkData.PartitionZNode.path(tablePath, partition.getPartitionName()),
+                    partition.hasMetadataPath() ? partition.getMetadataPath() : null,
+                    partition.hasMetadataVersion() ? partition.getMetadataVersion() : null,
+                    partition.hasDataState() ? partition.getDataState() : null,
+                    partition.hasBulkLoadId() ? partition.getBulkLoadId() : null);
+        }
+        return targets;
+    }
+
+    private static void addUpdateTargets(
+            List<BulkLoadTargetMetadata> targets,
+            long tableId,
+            @Nullable Long partitionId,
+            List<PbBucketMetadata> buckets,
+            String canonicalMetadataPath,
+            @Nullable String metadataPath,
+            @Nullable Integer metadataVersion,
+            @Nullable Integer dataState,
+            @Nullable String bulkLoadId) {
+        boolean present = metadataPath != null;
+        if (!present && metadataVersion == null && dataState == null && bulkLoadId == null) {
+            return;
+        }
+        if (!present
+                || metadataVersion == null
+                || dataState == null
+                || !canonicalMetadataPath.equals(metadataPath)) {
+            throw new IllegalArgumentException(
+                    "BulkLoad UpdateMetadata identity is incomplete or noncanonical.");
+        }
+        BulkLoadDataState state = BulkLoadDataState.fromCode(dataState);
+        for (PbBucketMetadata bucket : buckets) {
+            targets.add(
+                    new BulkLoadTargetMetadata(
+                            metadataPath,
+                            new TableBucket(tableId, partitionId, bucket.getBucketId()),
+                            metadataVersion,
+                            state,
+                            bulkLoadId));
+        }
+    }
+
     private static PbTableMetadata toPbTableMetadata(TableMetadata tableMetadata) {
         TableInfo tableInfo = tableMetadata.getTableInfo();
         PbTableMetadata pbTableMetadata =
@@ -734,6 +810,17 @@ public class ServerRpcMessageUtils {
                 .setReplicas(notifyLeaderAndIsrData.getReplicasArray())
                 .setIsrs(notifyLeaderAndIsrData.getIsrArray());
 
+        BulkLoadTargetMetadata bulkLoadMetadata = notifyLeaderAndIsrData.getBulkLoadMetadata();
+        if (bulkLoadMetadata != null) {
+            reqForBucket
+                    .setMetadataPath(bulkLoadMetadata.getMetadataPath())
+                    .setMetadataVersion(bulkLoadMetadata.getMetadataVersion())
+                    .setDataState(bulkLoadMetadata.getDataState().getCode());
+            if (bulkLoadMetadata.getBulkLoadId() != null) {
+                reqForBucket.setBulkLoadId(bulkLoadMetadata.getBulkLoadId());
+            }
+        }
+
         return reqForBucket;
     }
 
@@ -758,10 +845,48 @@ public class ServerRpcMessageUtils {
             }
 
             PbTableBucket pbTableBucket = reqForBucket.getTableBucket();
+            TableBucket tableBucket = toTableBucket(pbTableBucket);
+            boolean hasTargetFields =
+                    reqForBucket.hasMetadataPath()
+                            || reqForBucket.hasMetadataVersion()
+                            || reqForBucket.hasDataState()
+                            || reqForBucket.hasBulkLoadId();
+            if (hasTargetFields
+                    && (!reqForBucket.hasMetadataPath()
+                            || !reqForBucket.hasMetadataVersion()
+                            || !reqForBucket.hasDataState())) {
+                throw new IllegalArgumentException(
+                        "Notify BulkLoad target identity is incomplete.");
+            }
+            PhysicalTablePath physicalTablePath =
+                    toPhysicalTablePath(reqForBucket.getPhysicalTablePath());
+            if (hasTargetFields) {
+                String canonicalMetadataPath =
+                        physicalTablePath.getPartitionName() == null
+                                ? ZkData.TableZNode.path(physicalTablePath.getTablePath())
+                                : ZkData.PartitionZNode.path(
+                                        physicalTablePath.getTablePath(),
+                                        physicalTablePath.getPartitionName());
+                if (!canonicalMetadataPath.equals(reqForBucket.getMetadataPath())) {
+                    throw new IllegalArgumentException(
+                            "Notify BulkLoad target metadata path is noncanonical.");
+                }
+            }
+            BulkLoadTargetMetadata target =
+                    hasTargetFields
+                            ? new BulkLoadTargetMetadata(
+                                    reqForBucket.getMetadataPath(),
+                                    tableBucket,
+                                    reqForBucket.getMetadataVersion(),
+                                    BulkLoadDataState.fromCode(reqForBucket.getDataState()),
+                                    reqForBucket.hasBulkLoadId()
+                                            ? reqForBucket.getBulkLoadId()
+                                            : null)
+                            : null;
             notifyLeaderAndIsrDataList.add(
                     new NotifyLeaderAndIsrData(
-                            toPhysicalTablePath(reqForBucket.getPhysicalTablePath()),
-                            toTableBucket(pbTableBucket),
+                            physicalTablePath,
+                            tableBucket,
                             replicas,
                             new LeaderAndIsr(
                                     reqForBucket.getLeader(),
@@ -769,7 +894,8 @@ public class ServerRpcMessageUtils {
                                     isr,
                                     standbyReplicas,
                                     request.getCoordinatorEpoch(),
-                                    reqForBucket.getBucketEpoch())));
+                                    reqForBucket.getBucketEpoch()),
+                            target));
         }
         return notifyLeaderAndIsrDataList;
     }
@@ -1586,11 +1712,40 @@ public class ServerRpcMessageUtils {
 
     public static CommitKvSnapshotRequest makeCommitKvSnapshotRequest(
             CompletedSnapshot completedSnapshot, int coordinatorEpoch, int bucketLeaderEpoch) {
+        return makeCommitKvSnapshotRequest(
+                completedSnapshot, coordinatorEpoch, bucketLeaderEpoch, null, null);
+    }
+
+    public static CommitKvSnapshotData getCommitKvSnapshotData(
+            CommitKvSnapshotRequest request, short apiVersion) {
+        requireSourceMetadata(
+                apiVersion,
+                request.hasMetadataPath(),
+                request.hasMetadataVersion(),
+                "CommitKvSnapshot");
+        return new CommitKvSnapshotData(
+                CompletedSnapshotJsonSerde.fromJson(request.getCompletedSnapshot()),
+                request.getCoordinatorEpoch(),
+                request.getBucketLeaderEpoch(),
+                request.hasMetadataPath() ? request.getMetadataPath() : null,
+                request.hasMetadataVersion() ? request.getMetadataVersion() : null);
+    }
+
+    public static CommitKvSnapshotRequest makeCommitKvSnapshotRequest(
+            CompletedSnapshot completedSnapshot,
+            int coordinatorEpoch,
+            int bucketLeaderEpoch,
+            @Nullable String sourceMetadataPath,
+            @Nullable Integer sourceMetadataVersion) {
+        requireSourceMetadataPair(sourceMetadataPath, sourceMetadataVersion, "CommitKvSnapshot");
         CommitKvSnapshotRequest request = new CommitKvSnapshotRequest();
         byte[] completedSnapshotBytes = CompletedSnapshotJsonSerde.toJson(completedSnapshot);
         request.setCompletedSnapshot(completedSnapshotBytes)
                 .setCoordinatorEpoch(coordinatorEpoch)
                 .setBucketLeaderEpoch(bucketLeaderEpoch);
+        if (sourceMetadataPath != null) {
+            request.setMetadataPath(sourceMetadataPath).setMetadataVersion(sourceMetadataVersion);
+        }
         return request;
     }
 
@@ -1680,6 +1835,16 @@ public class ServerRpcMessageUtils {
 
     public static CommitRemoteLogManifestData getCommitRemoteLogManifestData(
             CommitRemoteLogManifestRequest request) {
+        return getCommitRemoteLogManifestData(request, (short) 0);
+    }
+
+    public static CommitRemoteLogManifestData getCommitRemoteLogManifestData(
+            CommitRemoteLogManifestRequest request, short apiVersion) {
+        requireSourceMetadata(
+                apiVersion,
+                request.hasMetadataPath(),
+                request.hasMetadataVersion(),
+                "CommitRemoteLogManifest");
         return new CommitRemoteLogManifestData(
                 new TableBucket(
                         request.getTableId(),
@@ -1692,7 +1857,9 @@ public class ServerRpcMessageUtils {
                         ? request.getHighestCopiedEndOffset()
                         : request.getRemoteLogEndOffset(),
                 request.getCoordinatorEpoch(),
-                request.getBucketLeaderEpoch());
+                request.getBucketLeaderEpoch(),
+                request.hasMetadataPath() ? request.getMetadataPath() : null,
+                request.hasMetadataVersion() ? request.getMetadataVersion() : null);
     }
 
     public static CommitRemoteLogManifestRequest makeCommitRemoteLogManifestRequest(
@@ -1711,7 +1878,34 @@ public class ServerRpcMessageUtils {
                 .setHighestCopiedEndOffset(commitRemoteLogManifestData.getHighestCopiedEndOffset())
                 .setCoordinatorEpoch(commitRemoteLogManifestData.getCoordinatorEpoch())
                 .setBucketLeaderEpoch(commitRemoteLogManifestData.getBucketLeaderEpoch());
+        requireSourceMetadataPair(
+                commitRemoteLogManifestData.getSourceMetadataPath(),
+                commitRemoteLogManifestData.getSourceMetadataVersion(),
+                "CommitRemoteLogManifest");
+        if (commitRemoteLogManifestData.getSourceMetadataPath() != null) {
+            request.setMetadataPath(commitRemoteLogManifestData.getSourceMetadataPath())
+                    .setMetadataVersion(commitRemoteLogManifestData.getSourceMetadataVersion());
+        }
         return request;
+    }
+
+    private static void requireSourceMetadata(
+            short apiVersion,
+            boolean hasMetadataPath,
+            boolean hasMetadataVersion,
+            String requestName) {
+        if (hasMetadataPath != hasMetadataVersion || (apiVersion >= 1 && !hasMetadataPath)) {
+            throw new IllegalArgumentException(
+                    requestName + " requires a complete source metadata identity.");
+        }
+    }
+
+    private static void requireSourceMetadataPair(
+            @Nullable String path, @Nullable Integer version, String requestName) {
+        if ((path == null) != (version == null)) {
+            throw new IllegalArgumentException(
+                    requestName + " source metadata path/version must appear together.");
+        }
     }
 
     public static NotifyRemoteLogOffsetsRequest makeNotifyRemoteLogOffsetsRequest(

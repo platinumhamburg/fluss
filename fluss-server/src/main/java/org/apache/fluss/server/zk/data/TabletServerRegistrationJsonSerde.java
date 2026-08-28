@@ -26,10 +26,12 @@ import org.apache.fluss.utils.json.JsonDeserializer;
 import org.apache.fluss.utils.json.JsonSerializer;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
 import static org.apache.fluss.config.ConfigOptions.DEFAULT_LISTENER_NAME;
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /** Json serializer and deserializer for {@link TabletServerRegistration}. */
 @Internal
@@ -41,7 +43,7 @@ public class TabletServerRegistrationJsonSerde
             new TabletServerRegistrationJsonSerde();
 
     private static final String VERSION_KEY = "version";
-    private static final int VERSION = 4;
+    static final int VERSION = 5;
 
     @Deprecated private static final String HOST = "host";
     @Deprecated private static final String PORT = "port";
@@ -50,6 +52,10 @@ public class TabletServerRegistrationJsonSerde
     private static final String RACK = "rack";
     private static final String CPU_CORES = "cpu_cores";
     private static final String MEMORY_BYTES = "memory_bytes";
+    private static final String API_VERSIONS = "api_versions";
+    private static final String API_KEY = "api_key";
+    private static final String MIN_VERSION = "min_version";
+    private static final String MAX_VERSION = "max_version";
 
     @Override
     public void serialize(
@@ -71,12 +77,13 @@ public class TabletServerRegistrationJsonSerde
         if (resource.getMemoryBytes() != null) {
             generator.writeNumberField(MEMORY_BYTES, resource.getMemoryBytes());
         }
+        writeApiVersions(generator, tabletServerRegistration.getApiVersions());
         generator.writeEndObject();
     }
 
     @Override
     public TabletServerRegistration deserialize(JsonNode node) {
-        int version = node.get(VERSION_KEY).asInt();
+        int version = readVersion(node);
         List<Endpoint> endpoints;
         String rack = null;
         TabletServerResource resource = TabletServerResource.unknown();
@@ -91,7 +98,7 @@ public class TabletServerRegistrationJsonSerde
             if (node.has(RACK)) {
                 rack = node.get(RACK).asText();
             }
-            if (version >= VERSION) {
+            if (version >= 4) {
                 Double cpuCores = node.has(CPU_CORES) ? node.get(CPU_CORES).asDouble() : null;
                 Long memoryBytes = node.has(MEMORY_BYTES) ? node.get(MEMORY_BYTES).asLong() : null;
                 resource = new TabletServerResource(cpuCores, memoryBytes);
@@ -99,6 +106,73 @@ public class TabletServerRegistrationJsonSerde
         }
 
         long registerTimestamp = node.get(REGISTER_TIMESTAMP).asLong();
-        return new TabletServerRegistration(rack, endpoints, registerTimestamp, resource);
+        List<ServerApiVersion> apiVersions =
+                version >= 5 ? readApiVersions(node) : Collections.emptyList();
+        return new TabletServerRegistration(
+                rack, endpoints, registerTimestamp, resource, apiVersions);
+    }
+
+    private static int readVersion(JsonNode node) {
+        JsonNode versionNode = node.get(VERSION_KEY);
+        String version = versionNode == null ? "missing" : versionNode.toString();
+        checkArgument(
+                node.has(VERSION_KEY)
+                        && versionNode.isIntegralNumber()
+                        && versionNode.canConvertToInt(),
+                "TabletServerRegistration version must be an integer: %s.",
+                version);
+        int versionValue = versionNode.intValue();
+        checkArgument(
+                versionValue > 0 && versionValue <= VERSION,
+                "Unsupported TabletServerRegistration version %s.",
+                versionValue);
+        return versionValue;
+    }
+
+    private static void writeApiVersions(
+            JsonGenerator generator, List<ServerApiVersion> apiVersions) throws IOException {
+        generator.writeArrayFieldStart(API_VERSIONS);
+        for (ServerApiVersion apiVersion : apiVersions) {
+            generator.writeStartObject();
+            generator.writeNumberField(API_KEY, apiVersion.getApiKey());
+            generator.writeNumberField(MIN_VERSION, apiVersion.getMinVersion());
+            generator.writeNumberField(MAX_VERSION, apiVersion.getMaxVersion());
+            generator.writeEndObject();
+        }
+        generator.writeEndArray();
+    }
+
+    private static List<ServerApiVersion> readApiVersions(JsonNode node) {
+        JsonNode apiVersionsNode = node.get(API_VERSIONS);
+        checkArgument(
+                apiVersionsNode != null && apiVersionsNode.isArray(),
+                "TabletServerRegistration api_versions must be an array.");
+        List<ServerApiVersion> apiVersions = new ArrayList<>(apiVersionsNode.size());
+        for (JsonNode apiVersionNode : apiVersionsNode) {
+            int apiKey = readInt(apiVersionNode, API_KEY);
+            int minVersion = readInt(apiVersionNode, MIN_VERSION);
+            int maxVersion = readInt(apiVersionNode, MAX_VERSION);
+            checkArgument(
+                    apiKey >= 0 && apiKey <= Short.MAX_VALUE,
+                    "API key must be in range 0..32767: %s.",
+                    apiKey);
+            checkArgument(
+                    minVersion >= 0 && minVersion <= maxVersion && maxVersion <= Short.MAX_VALUE,
+                    "API version range must satisfy 0 <= min <= max <= 32767: %s..%s.",
+                    minVersion,
+                    maxVersion);
+            apiVersions.add(
+                    new ServerApiVersion((short) apiKey, (short) minVersion, (short) maxVersion));
+        }
+        return apiVersions;
+    }
+
+    private static int readInt(JsonNode node, String field) {
+        JsonNode value = node.get(field);
+        checkArgument(
+                value != null && value.isIntegralNumber() && value.canConvertToInt(),
+                "API version field %s must be an integer.",
+                field);
+        return value.intValue();
     }
 }

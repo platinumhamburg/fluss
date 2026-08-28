@@ -19,8 +19,12 @@ package org.apache.fluss.server.tablet;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.rpc.messages.ApiVersionsRequest;
+import org.apache.fluss.rpc.messages.ApiVersionsResponse;
+import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.server.ServerBase;
 import org.apache.fluss.server.ServerTestBase;
+import org.apache.fluss.server.zk.data.ServerApiVersion;
 import org.apache.fluss.server.zk.data.TabletServerRegistration;
 
 import org.junit.jupiter.api.AfterEach;
@@ -28,7 +32,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
+import java.util.List;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -37,7 +43,6 @@ class TabletServerTest extends ServerTestBase {
 
     private static final int SERVER_ID = 0;
     private static final String RACK = "cn-hangzhou-server10";
-
     private static @TempDir File tempDirForLog;
 
     private TabletServer server;
@@ -88,5 +93,46 @@ class TabletServerTest extends ServerTestBase {
         assertThat(tabletServerRegistration.getRack()).isEqualTo(RACK);
         verifyEndpoint(
                 tabletServerRegistration.getEndpoints(), server.getRpcServer().getBindEndpoints());
+        ApiVersionsResponse wireResponse =
+                server.getTabletService().apiVersions(new ApiVersionsRequest()).get();
+        assertThat(toVersionString(wireResponse))
+                .isEqualTo(toVersionString(tabletServerRegistration.getApiVersions()));
+        assertThat(tabletServerRegistration.getApiVersions())
+                .extracting(ServerApiVersion::getApiKey)
+                .contains(
+                        ApiKeys.UPDATE_METADATA.id,
+                        ApiKeys.NOTIFY_LEADER_AND_ISR.id,
+                        ApiKeys.STOP_REPLICA.id)
+                .doesNotContain(
+                        ApiKeys.BEGIN_BULK_LOAD.id,
+                        ApiKeys.COMMIT_BULK_LOAD.id,
+                        ApiKeys.ABORT_BULK_LOAD.id,
+                        ApiKeys.GET_BULK_LOAD_STATUS.id,
+                        ApiKeys.COMMIT_KV_SNAPSHOT.id,
+                        ApiKeys.COMMIT_REMOTE_LOG_MANIFEST.id);
+    }
+
+    private static String toVersionString(List<ServerApiVersion> versions) {
+        return versions.stream()
+                .map(
+                        version ->
+                                version.getApiKey()
+                                        + ":"
+                                        + version.getMinVersion()
+                                        + ":"
+                                        + version.getMaxVersion())
+                .collect(Collectors.joining(","));
+    }
+
+    private static String toVersionString(ApiVersionsResponse response) {
+        return response.getApiVersionsList().stream()
+                .map(
+                        version ->
+                                version.getApiKey()
+                                        + ":"
+                                        + version.getMinVersion()
+                                        + ":"
+                                        + version.getMaxVersion())
+                .collect(Collectors.joining(","));
     }
 }

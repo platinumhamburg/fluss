@@ -38,6 +38,7 @@ import org.apache.fluss.cluster.rebalance.RebalanceStatus;
 import org.apache.fluss.config.cluster.AlterConfigOpType;
 import org.apache.fluss.config.cluster.ColumnPositionType;
 import org.apache.fluss.config.cluster.ConfigEntry;
+import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.fs.FsPathAndFileName;
 import org.apache.fluss.fs.token.ObtainedSecurityToken;
@@ -549,6 +550,10 @@ public class ClientRpcMessageUtils {
 
     public static List<RemoteLogManifestInfo> toRemoteLogManifestInfos(
             ListRemoteLogManifestsResponse response) {
+        if (!response.hasActiveReferencesComplete() || !response.isActiveReferencesComplete()) {
+            throw new UnsupportedVersionException(
+                    "The Coordinator did not provide a complete active-reference response.");
+        }
         List<RemoteLogManifestInfo> result = new ArrayList<>(response.getManifestsCount());
         for (PbRemoteLogManifestEntry entry : response.getManifestsList()) {
             PbTableBucket pb = entry.getTableBucket();
@@ -565,6 +570,10 @@ public class ClientRpcMessageUtils {
     }
 
     public static ActiveKvSnapshots toActiveKvSnapshots(ListKvSnapshotsResponse response) {
+        if (!response.hasActiveReferencesComplete() || !response.isActiveReferencesComplete()) {
+            throw new UnsupportedVersionException(
+                    "The Coordinator did not provide a complete active-reference response.");
+        }
         Map<Integer, Set<Long>> snapshotIdsByBucket = new HashMap<>();
         for (PbKvSnapshot snapshot : response.getActiveSnapshotsList()) {
             snapshotIdsByBucket
