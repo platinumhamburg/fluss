@@ -1753,6 +1753,36 @@ mod tests {
         assert!(config.warnings().is_empty());
     }
 
+    // conf/gateway.yaml ships in the binary distribution and the container image, so it is
+    // a release artifact rather than a sample: it has to parse, it has to document every
+    // option, and its values must not drift away from the compiled defaults.
+    #[test]
+    fn distribution_configuration_is_loadable_and_complete() {
+        let template = include_str!("../conf/gateway.yaml");
+        let config = load_file(template).unwrap();
+        let defaults = load(None, &no_env(), &CliOverrides::default()).unwrap();
+
+        assert_eq!(config, defaults);
+
+        // Cluster IDs are resolved before the typed entries, so this key is not in
+        // CONFIG_ENTRIES and would otherwise go undocumented unnoticed.
+        assert!(template.contains(&format!("{CLUSTERS_KEY}:")));
+        for entry in CONFIG_ENTRIES {
+            assert!(
+                template.contains(&format!("{}:", entry.key)),
+                "distribution configuration does not document {}",
+                entry.key
+            );
+        }
+        for entry in CLUSTER_ENTRIES {
+            let key = cluster_key(DEFAULT_CLUSTER_ID, entry.key);
+            assert!(
+                template.contains(&format!("{key}:")),
+                "distribution configuration does not document {key}"
+            );
+        }
+    }
+
     #[test]
     fn public_yaml_options_are_loaded() {
         let config = load_file(
