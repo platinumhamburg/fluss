@@ -35,7 +35,6 @@ import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
-import java.lang.reflect.Field;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -244,15 +243,6 @@ public class RocksDBKvBuilder {
                         lastException = t;
                         LOG.debug("RocksDB JNI library loading attempt {} failed", attempt, t);
 
-                        // try to force RocksDB to attempt reloading the library
-                        try {
-                            resetRocksDBLoadedFlag();
-                        } catch (Throwable tt) {
-                            LOG.debug(
-                                    "Failed to reset 'initialized' flag in RocksDB native code loader",
-                                    tt);
-                        }
-
                         FileUtils.deleteDirectoryQuietly(rocksLibFolder);
                     }
                 }
@@ -260,14 +250,6 @@ public class RocksDBKvBuilder {
                 throw new IOException("Could not load the native RocksDB library", lastException);
             }
         }
-    }
-
-    @VisibleForTesting
-    static void resetRocksDBLoadedFlag() throws Exception {
-        final Field initField =
-                org.fluss.rocksdb.NativeLibraryLoader.class.getDeclaredField("initialized");
-        initField.setAccessible(true);
-        initField.setBoolean(null, false);
     }
 
     @VisibleForTesting
