@@ -24,12 +24,12 @@ import org.apache.fluss.server.utils.ResourceGuard;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.IOUtils;
 
-import org.rocksdb.AbstractCompactionFilter;
-import org.rocksdb.AbstractCompactionFilterFactory;
-import org.rocksdb.ColumnFamilyHandle;
-import org.rocksdb.ColumnFamilyOptions;
-import org.rocksdb.NativeLibraryLoader;
-import org.rocksdb.RocksDB;
+import org.fluss.rocksdb.AbstractCompactionFilter;
+import org.fluss.rocksdb.AbstractCompactionFilterFactory;
+import org.fluss.rocksdb.ColumnFamilyHandle;
+import org.fluss.rocksdb.ColumnFamilyOptions;
+import org.fluss.rocksdb.NativeLibraryLoader;
+import org.fluss.rocksdb.RocksDB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -265,7 +265,7 @@ public class RocksDBKvBuilder {
     @VisibleForTesting
     static void resetRocksDBLoadedFlag() throws Exception {
         final Field initField =
-                org.rocksdb.NativeLibraryLoader.class.getDeclaredField("initialized");
+                org.fluss.rocksdb.NativeLibraryLoader.class.getDeclaredField("initialized");
         initField.setAccessible(true);
         initField.setBoolean(null, false);
     }

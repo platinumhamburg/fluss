@@ -67,12 +67,12 @@ import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.clock.SystemClock;
 
-import org.rocksdb.AbstractCompactionFilter;
-import org.rocksdb.AbstractCompactionFilterFactory;
-import org.rocksdb.RateLimiter;
-import org.rocksdb.ReadOptions;
-import org.rocksdb.RocksIterator;
-import org.rocksdb.Snapshot;
+import org.fluss.rocksdb.AbstractCompactionFilter;
+import org.fluss.rocksdb.AbstractCompactionFilterFactory;
+import org.fluss.rocksdb.RateLimiter;
+import org.fluss.rocksdb.ReadOptions;
+import org.fluss.rocksdb.RocksIterator;
+import org.fluss.rocksdb.Snapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

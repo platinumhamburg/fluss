@@ -24,9 +24,9 @@ import org.apache.fluss.server.exception.KvBuildingException;
 import org.apache.fluss.server.kv.RowTtlCompactionFilterFactory;
 import org.apache.fluss.utils.clock.ManualClock;
 
+import org.fluss.rocksdb.FlussTtlCompactionFilter;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.rocksdb.FlinkCompactionFilter;
 
 import java.io.File;
 import java.io.IOException;
@@ -66,7 +66,7 @@ class RocksDBKvBuilderTest {
 
     @Test
     void testCompactionFilterFactoryClosedWithKv(@TempDir Path tempDir) throws Exception {
-        FlinkCompactionFilter.FlinkCompactionFilterFactory filterFactory =
+        FlussTtlCompactionFilter.FlussTtlCompactionFilterFactory filterFactory =
                 RowTtlCompactionFilterFactory.create(
                         KvValueLayout.TAGGED, Duration.ofHours(1L), new ManualClock(0L));
         RocksDBResourceContainer rocksDBResourceContainer =
@@ -90,7 +90,7 @@ class RocksDBKvBuilderTest {
 
     @Test
     void testCompactionFilterFactoryClosedWhenBuildFails() {
-        FlinkCompactionFilter.FlinkCompactionFilterFactory filterFactory =
+        FlussTtlCompactionFilter.FlussTtlCompactionFilterFactory filterFactory =
                 RowTtlCompactionFilterFactory.create(
                         KvValueLayout.TAGGED, Duration.ofHours(1L), new ManualClock(0L));
         RocksDBResourceContainer rocksDBResourceContainer = new RocksDBResourceContainer();
