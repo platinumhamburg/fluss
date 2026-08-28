@@ -18,7 +18,7 @@
 
 package org.apache.fluss.server.kv.rocksdb;
 
-import org.rocksdb.RocksDBException;
+import org.fluss.rocksdb.RocksDBException;
 
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.spy;
