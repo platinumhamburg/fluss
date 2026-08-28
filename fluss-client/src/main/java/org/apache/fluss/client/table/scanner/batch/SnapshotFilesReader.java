@@ -34,12 +34,12 @@ import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.SchemaUtil;
 
-import org.rocksdb.ColumnFamilyOptions;
-import org.rocksdb.DBOptions;
-import org.rocksdb.ReadOptions;
-import org.rocksdb.RocksDB;
-import org.rocksdb.RocksIterator;
-import org.rocksdb.Snapshot;
+import org.fluss.rocksdb.ColumnFamilyOptions;
+import org.fluss.rocksdb.DBOptions;
+import org.fluss.rocksdb.ReadOptions;
+import org.fluss.rocksdb.RocksDB;
+import org.fluss.rocksdb.RocksIterator;
+import org.fluss.rocksdb.Snapshot;
 
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;

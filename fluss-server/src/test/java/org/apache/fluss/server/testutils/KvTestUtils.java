@@ -39,8 +39,8 @@ import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.types.Tuple2;
 
-import org.rocksdb.RocksDB;
-import org.rocksdb.RocksIterator;
+import org.fluss.rocksdb.RocksDB;
+import org.fluss.rocksdb.RocksIterator;
 
 import javax.annotation.Nullable;
 
