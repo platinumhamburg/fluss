@@ -261,11 +261,9 @@ public final class BulkLoadResultGc {
         String registrationPath = transaction.getMetadataPath();
         Optional<DataWithStat> registrationData =
                 zkClient.getDataWithStatIfExists(registrationPath);
-        if (registrationData.isPresent()) {
-            String activeBulkLoadId = candidate.decodeBulkLoadId(registrationData.get().getData());
-            if (candidate.bulkLoadId.equals(activeBulkLoadId)) {
-                return null;
-            }
+        if (registrationData.isPresent()
+                && candidate.ownsRegistration(registrationData.get().getData())) {
+            return null;
         }
         return new Eligibility(
                 transaction,
@@ -500,20 +498,14 @@ public final class BulkLoadResultGc {
                     + (bulkLoadId == null ? "" : bulkLoadId);
         }
 
-        private @Nullable String decodeBulkLoadId(byte[] data) {
+        private boolean ownsRegistration(byte[] data) {
             if (partition) {
                 PartitionRegistration registration = ZkData.PartitionZNode.decode(data);
-                if (registration.getPartitionId() != physicalId) {
-                    throw new IllegalStateException(
-                            "BulkLoad partition registration identity differs.");
-                }
-                return registration.getBulkLoadId();
+                return registration.getPartitionId() == physicalId
+                        && bulkLoadId.equals(registration.getBulkLoadId());
             }
             TableRegistration registration = ZkData.TableZNode.decode(data);
-            if (registration.tableId != physicalId) {
-                throw new IllegalStateException("BulkLoad table registration identity differs.");
-            }
-            return registration.bulkLoadId;
+            return registration.tableId == physicalId && bulkLoadId.equals(registration.bulkLoadId);
         }
 
         private BulkLoadTransaction decodeTransaction(byte[] data) {

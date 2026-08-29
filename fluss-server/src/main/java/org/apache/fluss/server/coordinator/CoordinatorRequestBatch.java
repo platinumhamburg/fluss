@@ -1045,7 +1045,8 @@ public class CoordinatorRequestBatch {
             target.setMetadataPath(metadataPath(path))
                     .setMetadataVersion(metadata.getStat().getVersion())
                     .setDataState(registration.dataState.getCode());
-            if (registration.bulkLoadId != null) {
+            if (registration.dataState == BulkLoadDataState.LOADING
+                    && registration.bulkLoadId != null) {
                 target.setBulkLoadId(registration.bulkLoadId);
             }
         } catch (KeeperException.NoNodeException e) {
@@ -1085,7 +1086,8 @@ public class CoordinatorRequestBatch {
             target.setMetadataPath(metadataPath(path))
                     .setMetadataVersion(metadata.getStat().getVersion())
                     .setDataState(registration.getDataState().getCode());
-            if (registration.getBulkLoadId() != null) {
+            if (registration.getDataState() == BulkLoadDataState.LOADING
+                    && registration.getBulkLoadId() != null) {
                 target.setBulkLoadId(registration.getBulkLoadId());
             }
         } catch (Exception e) {

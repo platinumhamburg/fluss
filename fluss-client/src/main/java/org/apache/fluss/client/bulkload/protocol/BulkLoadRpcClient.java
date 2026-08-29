@@ -34,7 +34,6 @@ import org.apache.fluss.rpc.messages.AbortBulkLoadRequest;
 import org.apache.fluss.rpc.messages.BeginBulkLoadRequest;
 import org.apache.fluss.rpc.messages.BeginBulkLoadResponse;
 import org.apache.fluss.rpc.messages.CommitBulkLoadRequest;
-import org.apache.fluss.rpc.messages.GetBulkLoadStatusRequest;
 import org.apache.fluss.rpc.messages.PbBulkLoadStatus;
 
 import java.time.Duration;
@@ -150,21 +149,6 @@ final class BulkLoadRpcClient {
                         response ->
                                 convertBulkLoadResponse(
                                         "Abort",
-                                        () ->
-                                                toMatchingBulkLoadStatus(
-                                                        response.getStatus(), validatedHandle)));
-    }
-
-    /** Returns the persisted status of a BulkLoad transaction. */
-    CompletableFuture<BulkLoadStatus> getBulkLoadStatus(BulkLoadHandle handle) {
-        BulkLoadHandle validatedHandle = validateBulkLoadHandle(handle);
-        GetBulkLoadStatusRequest request =
-                new GetBulkLoadStatusRequest().setHandle(toPbBulkLoadHandle(validatedHandle));
-        return gateway.getBulkLoadStatus(request)
-                .thenApply(
-                        response ->
-                                convertBulkLoadResponse(
-                                        "Status",
                                         () ->
                                                 toMatchingBulkLoadStatus(
                                                         response.getStatus(), validatedHandle)));

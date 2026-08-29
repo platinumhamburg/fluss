@@ -107,7 +107,6 @@ class TabletServerTest extends ServerTestBase {
                         ApiKeys.BEGIN_BULK_LOAD.id,
                         ApiKeys.COMMIT_BULK_LOAD.id,
                         ApiKeys.ABORT_BULK_LOAD.id,
-                        ApiKeys.GET_BULK_LOAD_STATUS.id,
                         ApiKeys.COMMIT_KV_SNAPSHOT.id,
                         ApiKeys.COMMIT_REMOTE_LOG_MANIFEST.id);
     }

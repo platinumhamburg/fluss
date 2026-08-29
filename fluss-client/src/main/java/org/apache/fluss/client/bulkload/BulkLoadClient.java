@@ -24,6 +24,7 @@ import org.apache.fluss.client.bulkload.protocol.BeginBulkLoadResult;
 import org.apache.fluss.client.bulkload.protocol.BulkLoadTransactionDriver;
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.metadata.BulkLoadHandle;
+import org.apache.fluss.metadata.BulkLoadState;
 import org.apache.fluss.metadata.BulkLoadStatus;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.rpc.RpcClient;
@@ -86,6 +87,9 @@ public final class BulkLoadClient {
         if (result.getTargetInfo() != null) {
             return new BulkLoadBeginResult(
                     result.getStatus(), new BulkLoadBuildContext(result.getTargetInfo()));
+        }
+        if (result.getStatus().getState() == BulkLoadState.COMMITTED) {
+            return new BulkLoadBeginResult(result.getStatus(), null);
         }
         BulkLoadStatus status =
                 driver.commitUntilReady(result.getStatus().getHandle(), awaitTimeout);

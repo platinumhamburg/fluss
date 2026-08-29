@@ -20,7 +20,6 @@ package org.apache.fluss.server.coordinator.bulkload;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
-import org.apache.fluss.config.cluster.ServerReconfigurable;
 import org.apache.fluss.exception.BulkLoadNotFoundException;
 import org.apache.fluss.exception.CorruptMessageException;
 import org.apache.fluss.exception.FlussRuntimeException;
@@ -37,7 +36,6 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.messages.AbortBulkLoadResponse;
 import org.apache.fluss.rpc.messages.BeginBulkLoadResponse;
 import org.apache.fluss.rpc.messages.CommitBulkLoadResponse;
-import org.apache.fluss.rpc.messages.GetBulkLoadStatusResponse;
 import org.apache.fluss.rpc.messages.PbBulkLoadHandle;
 import org.apache.fluss.rpc.messages.PbBulkLoadStatus;
 import org.apache.fluss.rpc.messages.PbBulkLoadTargetInfo;
@@ -92,12 +90,12 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /** Coordinator event-thread owner of the metadata-only BulkLoad lifecycle. */
 @Internal
-public final class BulkLoadManager implements ServerReconfigurable {
+public final class BulkLoadManager {
 
     private static final Logger LOG = LoggerFactory.getLogger(BulkLoadManager.class);
 
     private final ZooKeeperClient zkClient;
-    private volatile Configuration configuration;
+    private final Configuration configuration;
     private final CoordinatorContext coordinatorContext;
     private final MetadataManager metadataManager;
     private final ExecutorService ioExecutor;
@@ -233,24 +231,6 @@ public final class BulkLoadManager implements ServerReconfigurable {
         readyRegistrations.remove(serverId);
     }
 
-    @Override
-    public void validate(Configuration newConfig) {
-        checkPositive(newConfig.get(ConfigOptions.BULKLOAD_MAX_ACTIVE_TRANSACTIONS));
-    }
-
-    @Override
-    public void reconfigure(Configuration newConfig) {
-        validate(newConfig);
-        BulkLoadMaintenanceEvent event =
-                new BulkLoadMaintenanceEvent(
-                        BulkLoadMaintenanceEvent.Reason.CONFIG_CHANGE, newConfig);
-        if (!eventManager.isEventThread()) {
-            eventManager.put(event);
-        } else {
-            process(event);
-        }
-    }
-
     /** Handles Begin on the Coordinator event thread. */
     public void process(BeginBulkLoadEvent event) {
         try {
@@ -263,7 +243,12 @@ public final class BulkLoadManager implements ServerReconfigurable {
             BulkLoadMetadataStore.Versioned<BulkLoadTransaction> retained =
                     findRetainedSubmission(event);
             if (retained != null) {
-                completeBegin(event, false, retained.getValue());
+                recordActiveTransaction(retained);
+                beginWaiters
+                        .computeIfAbsent(
+                                retained.getValue().getBulkLoadId(), ignored -> new ArrayList<>())
+                        .add(new BeginWaiter(event, false, true));
+                startFinalActive(retained);
                 return;
             }
 
@@ -302,7 +287,7 @@ public final class BulkLoadManager implements ServerReconfigurable {
             beginWaiters
                     .computeIfAbsent(
                             admission.transaction.getBulkLoadId(), ignored -> new ArrayList<>())
-                    .add(new BeginWaiter(event, true));
+                    .add(new BeginWaiter(event, true, false));
             try {
                 startLoading(created);
             } catch (Throwable failure) {
@@ -340,7 +325,7 @@ public final class BulkLoadManager implements ServerReconfigurable {
                 && !transaction.getValue().isFenceReady()) {
             beginWaiters
                     .computeIfAbsent(existing.handle.getBulkLoadId(), ignored -> new ArrayList<>())
-                    .add(new BeginWaiter(event, false));
+                    .add(new BeginWaiter(event, false, false));
             try {
                 startLoading(transaction);
             } catch (Throwable failure) {
@@ -361,7 +346,12 @@ public final class BulkLoadManager implements ServerReconfigurable {
                 if (hasManifest(event)) {
                     requireSameManifest(transaction.getValue(), event);
                 }
-                completeCommit(event, transaction.getValue());
+                recordActiveTransaction(transaction);
+                commitWaiters
+                        .computeIfAbsent(
+                                event.getHandle().getBulkLoadId(), ignored -> new ArrayList<>())
+                        .add(event);
+                startFinalActive(transaction);
                 return;
             }
             if (transaction.getValue().getState() == BulkLoadState.BEGUN) {
@@ -428,7 +418,12 @@ public final class BulkLoadManager implements ServerReconfigurable {
             BulkLoadMetadataStore.Versioned<BulkLoadTransaction> transaction =
                     readTransactionVersioned(event.getHandle());
             if (transaction.getValue().getState() == BulkLoadState.ABORTED) {
-                completeAbort(event, transaction.getValue());
+                recordActiveTransaction(transaction);
+                abortWaiters
+                        .computeIfAbsent(
+                                event.getHandle().getBulkLoadId(), ignored -> new ArrayList<>())
+                        .add(event);
+                startFinalActive(transaction);
                 return;
             }
             if (transaction.getValue().getState() != BulkLoadState.BEGUN) {
@@ -484,6 +479,9 @@ public final class BulkLoadManager implements ServerReconfigurable {
                 case ABORT_ACTIVE:
                     finishAbortActive(result);
                     break;
+                case FINAL_ACTIVE:
+                    finishFinalActive(result);
+                    break;
                 default:
                     throw new IllegalStateException("Unsupported BulkLoad async phase.");
             }
@@ -492,11 +490,8 @@ public final class BulkLoadManager implements ServerReconfigurable {
         }
     }
 
-    /** Processes dynamic configuration and fact-driven deadline recovery. */
+    /** Processes fact-driven deadline recovery and retained-result cleanup. */
     public void process(BulkLoadMaintenanceEvent event) {
-        if (event.getReason() == BulkLoadMaintenanceEvent.Reason.CONFIG_CHANGE) {
-            configuration = event.getConfiguration();
-        }
         resumeActiveTransactions();
         resultGc.runMaintenance(
                 System.currentTimeMillis(), coordinatorContext.getCoordinatorZkVersion());
@@ -823,6 +818,12 @@ public final class BulkLoadManager implements ServerReconfigurable {
         startActive(transaction, Phase.PUBLISH_ACTIVE);
     }
 
+    void startFinalActive(BulkLoadMetadataStore.Versioned<BulkLoadTransaction> transaction)
+            throws Exception {
+        requireReleasedControl(transaction);
+        startActive(transaction, Phase.FINAL_ACTIVE);
+    }
+
     private void startActive(
             BulkLoadMetadataStore.Versioned<BulkLoadTransaction> transaction, Phase phase)
             throws Exception {
@@ -885,8 +886,8 @@ public final class BulkLoadManager implements ServerReconfigurable {
                                         .get(ConfigOptions.BULKLOAD_RESULT_RETENTION)
                                         .toMillis(),
                                 coordinatorEpochVersion());
-        activeTransactions.remove(result.handle);
-        completeCommitWaiters(result.handle.getBulkLoadId(), finished.getValue(), null);
+        recordActiveTransaction(finished);
+        startFinalActive(finished);
     }
 
     void resumeAbort(
@@ -960,7 +961,6 @@ public final class BulkLoadManager implements ServerReconfigurable {
             return;
         }
         requireActiveControl(transaction, transaction.getValue().getState());
-        BulkLoadAbortReason reason = checkNotNull(transaction.getValue().getAbortReason());
         BulkLoadMetadataStore.Versioned<BulkLoadTransaction> finished =
                 metadataStore()
                         .finishAbort(
@@ -973,20 +973,58 @@ public final class BulkLoadManager implements ServerReconfigurable {
                                         .get(ConfigOptions.BULKLOAD_RESULT_RETENTION)
                                         .toMillis(),
                                 coordinatorEpochVersion());
+        recordActiveTransaction(finished);
+        startFinalActive(finished);
+    }
+
+    private void finishFinalActive(AsyncResult result) throws Exception {
+        BulkLoadMetadataStore.Versioned<BulkLoadTransaction> transaction =
+                readTransactionVersioned(result.handle);
+        BulkLoadMetadataStore.Versioned<? extends TableAssignment> assignment =
+                readAssignment(result.handle);
+        BulkLoadReplicaConvergence.Confirmation confirmation =
+                (BulkLoadReplicaConvergence.Confirmation) result.value;
+        if (!confirmation.matches(
+                transaction.getValue(),
+                assignment,
+                coordinatorContext,
+                readRegisteredServers(),
+                readyRegistrations)) {
+            startFinalActive(transaction);
+            return;
+        }
+        requireReleasedControl(transaction);
         activeTransactions.remove(result.handle);
-        completeAbortWaiters(result.handle.getBulkLoadId(), finished.getValue(), null);
+        BulkLoadTransaction finished = transaction.getValue();
+        if (finished.getState() == BulkLoadState.COMMITTED) {
+            completeBeginWaiters(finished);
+            completeCommitWaiters(result.handle.getBulkLoadId(), finished, null);
+            return;
+        }
+        completeAbortWaiters(result.handle.getBulkLoadId(), finished, null);
         Throwable abortedFailure =
                 new InvalidBulkLoadRequestException(
-                        "BulkLoad aborted while the request was pending: " + reason);
-        if (reason == BulkLoadAbortReason.TARGET_NOT_EMPTY) {
-            completeBeginWaiters(finished.getValue());
-        } else {
-            completeBeginWaitersExceptionally(result.handle.getBulkLoadId(), abortedFailure);
-        }
+                        "BulkLoad aborted while the request was pending: "
+                                + finished.getAbortReason());
+        completeAbortedBeginWaiters(finished, abortedFailure);
         completeCommitWaiters(result.handle.getBulkLoadId(), null, abortedFailure);
     }
 
     private void handleAsyncFailure(AsyncResult result, Throwable failure) {
+        if (result.phase == Phase.PUBLISH_ACTIVE || result.phase == Phase.ABORT_ACTIVE) {
+            try {
+                BulkLoadMetadataStore.Versioned<BulkLoadTransaction> transaction =
+                        readTransactionVersioned(result.handle);
+                if (transaction.getValue().getState() == BulkLoadState.COMMITTED
+                        || transaction.getValue().getState() == BulkLoadState.ABORTED) {
+                    recordActiveTransaction(transaction);
+                    startFinalActive(transaction);
+                    return;
+                }
+            } catch (Throwable reconciliationFailure) {
+                failure.addSuppressed(reconciliationFailure);
+            }
+        }
         try {
             if (restartChangedConvergenceRound(result)) {
                 return;
@@ -1018,7 +1056,8 @@ public final class BulkLoadManager implements ServerReconfigurable {
             confirmation = ((LoadingResult) result.value).confirmation;
         } else if (result.phase == Phase.RESTORE_REPLICAS
                 || result.phase == Phase.PUBLISH_ACTIVE
-                || result.phase == Phase.ABORT_ACTIVE) {
+                || result.phase == Phase.ABORT_ACTIVE
+                || result.phase == Phase.FINAL_ACTIVE) {
             confirmation = (BulkLoadReplicaConvergence.Confirmation) result.value;
         } else {
             return false;
@@ -1037,6 +1076,8 @@ public final class BulkLoadManager implements ServerReconfigurable {
             startRestoreReplicas(transaction);
         } else if (result.phase == Phase.PUBLISH_ACTIVE) {
             startPublishActive(transaction);
+        } else if (result.phase == Phase.FINAL_ACTIVE) {
+            startFinalActive(transaction);
         } else {
             startActive(transaction, Phase.ABORT_ACTIVE);
         }
@@ -1313,6 +1354,21 @@ public final class BulkLoadManager implements ServerReconfigurable {
         }
     }
 
+    private void requireReleasedControl(
+            BulkLoadMetadataStore.Versioned<BulkLoadTransaction> transaction) {
+        BulkLoadTransaction value = transaction.getValue();
+        RegistrationState registration = registrationState(readRegistration(value.getHandle()));
+        if ((value.getState() != BulkLoadState.COMMITTED
+                        && value.getState() != BulkLoadState.ABORTED)
+                || registration.state != BulkLoadDataState.ACTIVE
+                || registration.bulkLoadId != null
+                || !value.getMetadataPath().equals(registration.path)
+                || value.getMetadataVersion() != registration.version) {
+            throw new InvalidBulkLoadRequestException(
+                    "BulkLoad released metadata identity changed.");
+        }
+    }
+
     BulkLoadMetadataStore.Versioned<BulkLoadTransaction> readTransactionVersioned(
             BulkLoadHandle handle) {
         return requireFoundRead(readTransaction(handle), "transaction");
@@ -1567,6 +1623,22 @@ public final class BulkLoadManager implements ServerReconfigurable {
         }
     }
 
+    private void completeAbortedBeginWaiters(
+            BulkLoadTransaction transaction, Throwable abortedFailure) {
+        List<BeginWaiter> waiters = beginWaiters.remove(transaction.getBulkLoadId());
+        if (waiters == null) {
+            return;
+        }
+        for (BeginWaiter waiter : waiters) {
+            if (waiter.terminalResult
+                    || transaction.getAbortReason() == BulkLoadAbortReason.TARGET_NOT_EMPTY) {
+                completeBegin(waiter.event, waiter.created, transaction);
+            } else {
+                waiter.event.getResultFuture().completeExceptionally(abortedFailure);
+            }
+        }
+    }
+
     private static void completeCommit(CommitBulkLoadEvent event, BulkLoadTransaction transaction) {
         event.getResultFuture()
                 .complete(new CommitBulkLoadResponse().setStatus(toStatus(transaction)));
@@ -1726,28 +1798,6 @@ public final class BulkLoadManager implements ServerReconfigurable {
         return result;
     }
 
-    private static void checkPositive(long value) {
-        if (value <= 0) {
-            throw new IllegalArgumentException("BulkLoad configuration must be positive.");
-        }
-    }
-
-    public static GetBulkLoadStatusResponse readStatus(
-            ZooKeeperClient zkClient, BulkLoadHandle handle) {
-        return readStatus(zkClient, readTransaction(zkClient, handle));
-    }
-
-    public static GetBulkLoadStatusResponse readStatus(
-            ZooKeeperClient zkClient, BulkLoadTransaction transaction) {
-        try {
-            return new GetBulkLoadStatusResponse().setStatus(toStatus(transaction));
-        } catch (CorruptMessageException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new FlussRuntimeException("Failed to read BulkLoad status.", e);
-        }
-    }
-
     public static BulkLoadTransaction readTransaction(
             ZooKeeperClient zkClient, BulkLoadHandle handle) {
         try {
@@ -1829,16 +1879,19 @@ public final class BulkLoadManager implements ServerReconfigurable {
         VALIDATE_MANIFEST,
         RESTORE_REPLICAS,
         PUBLISH_ACTIVE,
-        ABORT_ACTIVE
+        ABORT_ACTIVE,
+        FINAL_ACTIVE
     }
 
     private static final class BeginWaiter {
         private final BeginBulkLoadEvent event;
         private final boolean created;
+        private final boolean terminalResult;
 
-        private BeginWaiter(BeginBulkLoadEvent event, boolean created) {
+        private BeginWaiter(BeginBulkLoadEvent event, boolean created, boolean terminalResult) {
             this.event = event;
             this.created = created;
+            this.terminalResult = terminalResult;
         }
     }
 

@@ -366,19 +366,15 @@ public class CoordinatorServer extends ServerBase {
                             kvSnapshotLeaseManager,
                             scheduler,
                             clock);
-            dynamicConfigManager.registerAndReplay(coordinatorEventProcessor.getBulkLoadManager());
             coordinatorEventProcessor.startup();
             coordinatorEventProcessor
                     .getCoordinatorEventManager()
-                    .put(new BulkLoadMaintenanceEvent(BulkLoadMaintenanceEvent.Reason.STARTUP));
+                    .put(new BulkLoadMaintenanceEvent());
             EventManager bulkLoadEvents = coordinatorEventProcessor.getCoordinatorEventManager();
             bulkLoadMaintenanceTask =
                     scheduler.schedule(
                             "bulkload-maintenance",
-                            () ->
-                                    bulkLoadEvents.put(
-                                            new BulkLoadMaintenanceEvent(
-                                                    BulkLoadMaintenanceEvent.Reason.PERIODIC)),
+                            () -> bulkLoadEvents.put(new BulkLoadMaintenanceEvent()),
                             1000L,
                             1000L);
 
@@ -418,7 +414,6 @@ public class CoordinatorServer extends ServerBase {
             }
             try {
                 if (coordinatorEventProcessor != null) {
-                    dynamicConfigManager.unregister(coordinatorEventProcessor.getBulkLoadManager());
                     coordinatorEventProcessor.shutdown();
                     coordinatorEventProcessor = null;
                 }

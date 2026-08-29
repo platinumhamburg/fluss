@@ -860,14 +860,6 @@ message AbortBulkLoadResponse {
   required PbBulkLoadStatus status = 1;
 }
 
-message GetBulkLoadStatusRequest {
-  required PbBulkLoadHandle handle = 1;
-}
-
-message GetBulkLoadStatusResponse {
-  required PbBulkLoadStatus status = 1;
-}
-
 message PbBulkLoadStatus {
   required PbBulkLoadHandle handle = 1;
   required int32 state = 2;

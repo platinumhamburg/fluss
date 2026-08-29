@@ -25,9 +25,12 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableDescriptor.TableDistribution;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.AbortBulkLoadResponse;
 import org.apache.fluss.rpc.messages.BeginBulkLoadResponse;
 import org.apache.fluss.rpc.messages.CommitBulkLoadResponse;
+import org.apache.fluss.rpc.messages.UpdateMetadataRequest;
+import org.apache.fluss.rpc.messages.UpdateMetadataResponse;
 import org.apache.fluss.security.acl.FlussPrincipal;
 import org.apache.fluss.server.ServerApiVersionSupport;
 import org.apache.fluss.server.coordinator.CompletedSnapshotStoreManager;
@@ -46,6 +49,7 @@ import org.apache.fluss.server.coordinator.event.TestingEventManager;
 import org.apache.fluss.server.metadata.ServerInfo;
 import org.apache.fluss.server.metadata.TabletServerResource;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
+import org.apache.fluss.server.tablet.TestTabletServerGateway;
 import org.apache.fluss.server.zk.CuratorFrameworkWithUnhandledErrorListener;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.ZkEpoch;
@@ -433,6 +437,7 @@ class BulkLoadMetadataStoreTest {
                     .isEqualTo(BulkLoadAbortReason.ABORTED_BY_CALLER);
 
             manager.process((BulkLoadAsyncResultEvent) eventManager.getEvents().get(2));
+            manager.process((BulkLoadAsyncResultEvent) eventManager.getEvents().get(3));
             assertThat(abortFuture.get(10, TimeUnit.SECONDS).getStatus().getState())
                     .isEqualTo(BulkLoadState.ABORTED.getCode());
             assertThat(commitFuture).isCompletedExceptionally();
@@ -562,7 +567,31 @@ class BulkLoadMetadataStoreTest {
 
             UncertainMultiZooKeeperClient uncertainZkClient =
                     new UncertainMultiZooKeeperClient(zkClient, configuration);
+            Map<Integer, TabletServerGateway> gateways = new HashMap<>();
+            gateways.put(
+                    serverId,
+                    new TestTabletServerGateway(false, Collections.emptySet()) {
+                        @Override
+                        public CompletableFuture<UpdateMetadataResponse> updateMetadata(
+                                UpdateMetadataRequest request) {
+                            return CompletableFuture.completedFuture(new UpdateMetadataResponse());
+                        }
+                    });
+            channelManager.setGateways(gateways);
             CoordinatorContext context = new CoordinatorContext(epoch);
+            ServerInfo liveServer =
+                    new ServerInfo(
+                            serverId,
+                            "rack",
+                            Collections.singletonList(
+                                    new Endpoint("localhost", 20000 + serverId, "INTERNAL")),
+                            ServerType.TABLET_SERVER);
+            context.setLiveTabletServers(Collections.singletonList(liveServer));
+            context.putTableInfo(metadataManager.getTable(firstPath));
+            context.putTablePath(firstTableId, firstPath);
+            context.putBucketLeaderAndIsr(
+                    new TableBucket(firstTableId, 0),
+                    new LeaderAndIsr(serverId, context.getCoordinatorEpoch()));
             TestingEventManager eventManager = new TestingEventManager();
             ManuallyTriggeredScheduledExecutorService ioExecutor =
                     new ManuallyTriggeredScheduledExecutorService();
@@ -581,6 +610,7 @@ class BulkLoadMetadataStoreTest {
                                     uncertainZkClient,
                                     TestingMetricGroups.COORDINATOR_METRICS,
                                     bucket -> false));
+            manager.bindTabletServerGateway(liveServer, true);
 
             uncertainZkClient.failNextCheckedMultiAndReadAfterCommit();
             BeginBulkLoadEvent uncertainBegin = beginEvent(firstPath, "first-caller");
@@ -665,7 +695,10 @@ class BulkLoadMetadataStoreTest {
                                     .bulkLoadId)
                     .isNull();
 
-            manager.process(new BulkLoadMaintenanceEvent(BulkLoadMaintenanceEvent.Reason.PERIODIC));
+            manager.process(new BulkLoadMaintenanceEvent());
+            manager.process(
+                    (BulkLoadAsyncResultEvent)
+                            eventManager.getEvents().get(eventManager.getEvents().size() - 1));
             manager.process(beginEvent(secondPath, "admitted-caller"));
             Versioned<TableRegistration> admitted =
                     observed(ZkData.TableZNode.path(secondPath), ZkData.TableZNode::decode);
@@ -746,7 +779,7 @@ class BulkLoadMetadataStoreTest {
                                             null,
                                             0L)));
 
-            manager.process(new BulkLoadMaintenanceEvent(BulkLoadMaintenanceEvent.Reason.PERIODIC));
+            manager.process(new BulkLoadMaintenanceEvent());
 
             assertThat(healthy.transaction().getValue().getAbortReason())
                     .isEqualTo(BulkLoadAbortReason.BUILD_DEADLINE_EXCEEDED);

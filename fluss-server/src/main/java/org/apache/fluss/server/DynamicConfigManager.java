@@ -99,16 +99,6 @@ public class DynamicConfigManager {
         dynamicServerConfig.register(serverReconfigurable);
     }
 
-    /** Atomically registers a listener and replays the same effective snapshot. */
-    public void registerAndReplay(ServerReconfigurable serverReconfigurable) {
-        dynamicServerConfig.registerAndReplay(serverReconfigurable);
-    }
-
-    /** Unregister a leader-scoped reconfigurable before its event thread is stopped. */
-    public void unregister(ServerReconfigurable serverReconfigurable) {
-        dynamicServerConfig.unregister(serverReconfigurable);
-    }
-
     /**
      * Register a ConfigValidator for stateless validation.
      *

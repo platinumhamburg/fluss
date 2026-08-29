@@ -47,7 +47,6 @@ class ApiKeysTest {
         assertApi(ApiKeys.BEGIN_BULK_LOAD, 1065, 0, 0, PUBLIC);
         assertApi(ApiKeys.COMMIT_BULK_LOAD, 1066, 0, 0, PUBLIC);
         assertApi(ApiKeys.ABORT_BULK_LOAD, 1067, 0, 0, PUBLIC);
-        assertApi(ApiKeys.GET_BULK_LOAD_STATUS, 1068, 0, 0, PUBLIC);
     }
 
     private static void assertApi(

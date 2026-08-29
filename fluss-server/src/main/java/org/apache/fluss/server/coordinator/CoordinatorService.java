@@ -113,8 +113,6 @@ import org.apache.fluss.rpc.messages.DropPartitionRequest;
 import org.apache.fluss.rpc.messages.DropPartitionResponse;
 import org.apache.fluss.rpc.messages.DropTableRequest;
 import org.apache.fluss.rpc.messages.DropTableResponse;
-import org.apache.fluss.rpc.messages.GetBulkLoadStatusRequest;
-import org.apache.fluss.rpc.messages.GetBulkLoadStatusResponse;
 import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
 import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
 import org.apache.fluss.rpc.messages.GetProducerOffsetsRequest;
@@ -196,7 +194,6 @@ import org.apache.fluss.server.zk.ZooKeeperClient.TableBucketAndManifest;
 import org.apache.fluss.server.zk.data.BucketAssignment;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
-import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.server.zk.data.ZkData;
@@ -389,23 +386,6 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         return future;
     }
 
-    @Override
-    public CompletableFuture<GetBulkLoadStatusResponse> getBulkLoadStatus(
-            GetBulkLoadStatusRequest request) {
-        BulkLoadHandle handle =
-                requireHandle(
-                        request.hasHandle(), request.hasHandle() ? request.getHandle() : null);
-        Session session = authorizer == null ? null : currentSession();
-        return CompletableFuture.supplyAsync(
-                () -> {
-                    BulkLoadTransaction transaction =
-                            BulkLoadManager.readTransaction(zkClient, handle);
-                    authorizeStatus(handle, transaction, session);
-                    return BulkLoadManager.readStatus(zkClient, transaction);
-                },
-                ioExecutor);
-    }
-
     private PhysicalTablePath validateTarget(BeginBulkLoadRequest request) {
         if (!request.hasTarget()
                 || !request.getTarget().hasDatabaseName()
@@ -507,41 +487,6 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         if (!isCreator(transaction, session)
                 && !authorizer.isAuthorized(session, OperationType.ALTER, resource)) {
             throw new AuthorizationException("Not authorized to abort this BulkLoad.");
-        }
-    }
-
-    private void authorizeStatus(
-            BulkLoadHandle handle, BulkLoadTransaction transaction, @Nullable Session session) {
-        if (authorizer == null) {
-            return;
-        }
-        Resource resource = Resource.table(handle.getTarget().getTablePath());
-        if (targetStillExists(handle)) {
-            authorizer.authorize(session, OperationType.DESCRIBE, resource);
-        } else if (!isCreator(transaction, session)
-                && !authorizer.isAuthorized(session, OperationType.ALTER, resource)) {
-            throw new AuthorizationException("Not authorized to read this retained BulkLoad.");
-        }
-    }
-
-    private boolean targetStillExists(BulkLoadHandle handle) {
-        try {
-            Optional<TableRegistration> table =
-                    zkClient.getTable(handle.getTarget().getTablePath());
-            if (!table.isPresent() || table.get().tableId != handle.getTableId()) {
-                return false;
-            }
-            if (handle.getPartitionId() == null) {
-                return true;
-            }
-            Optional<PartitionRegistration> partition =
-                    zkClient.getPartition(
-                            handle.getTarget().getTablePath(),
-                            handle.getTarget().getPartitionName());
-            return partition.isPresent()
-                    && partition.get().getPartitionId() == handle.getPartitionId();
-        } catch (Exception e) {
-            throw new UnknownServerException("Failed to resolve BulkLoad authorization target.", e);
         }
     }
 

@@ -100,7 +100,7 @@ public final class BulkLoadStartupRecovery {
         if (value.getState() == BulkLoadState.COMMITTED
                 || value.getState() == BulkLoadState.ABORTED) {
             validateReleasedRegistration(transaction, registration);
-            manager.removeActiveTransaction(handle);
+            manager.startFinalActive(transaction);
             return;
         }
         resume(transaction, registration);

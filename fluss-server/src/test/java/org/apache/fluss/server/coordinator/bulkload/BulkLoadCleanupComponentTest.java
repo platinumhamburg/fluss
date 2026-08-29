@@ -183,6 +183,24 @@ class BulkLoadCleanupComponentTest {
         }
     }
 
+    @Test
+    void testResultGcTreatsRecreatedTableAsReleasedOwnership() throws Exception {
+        BulkLoadTransaction transaction = abortedTransaction(9406L, "file:///missing-manifest");
+        try (ZooKeeperClient zkClient = client()) {
+            persistActiveTransaction(zkClient, transaction);
+            zkClient.getCuratorClient()
+                    .setData()
+                    .forPath(
+                            registrationPath(transaction),
+                            ZkData.TableZNode.encode(registration(transaction.getTableId() + 1)));
+
+            BulkLoadResultGc resultGc = resultGc(zkClient);
+            runMaintenance(resultGc, zkClient, 100L, 20);
+
+            assertThat(zkClient.pathExists(transactionPath(transaction))).isFalse();
+        }
+    }
+
     private static ZooKeeperClient client() {
         return ZOOKEEPER.getCustomExtension().createZooKeeperClient(NOPErrorHandler.INSTANCE);
     }
@@ -247,8 +265,12 @@ class BulkLoadCleanupComponentTest {
     }
 
     private static TableRegistration registration(BulkLoadTransaction transaction) {
+        return registration(transaction.getTableId());
+    }
+
+    private static TableRegistration registration(long tableId) {
         return new TableRegistration(
-                transaction.getTableId(),
+                tableId,
                 null,
                 Collections.emptyList(),
                 new TableDistribution(1, Collections.singletonList("id")),

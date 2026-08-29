@@ -76,8 +76,6 @@ import org.apache.fluss.rpc.messages.DropPartitionRequest;
 import org.apache.fluss.rpc.messages.DropPartitionResponse;
 import org.apache.fluss.rpc.messages.DropTableRequest;
 import org.apache.fluss.rpc.messages.DropTableResponse;
-import org.apache.fluss.rpc.messages.GetBulkLoadStatusRequest;
-import org.apache.fluss.rpc.messages.GetBulkLoadStatusResponse;
 import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
 import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
 import org.apache.fluss.rpc.messages.GetDatabaseInfoRequest;
@@ -185,13 +183,6 @@ public class TestCoordinatorGateway implements CoordinatorGateway {
 
     @Override
     public CompletableFuture<AbortBulkLoadResponse> abortBulkLoad(AbortBulkLoadRequest request) {
-        return FutureUtils.completedExceptionally(
-                new UnsupportedOperationException("BulkLoad RPC is not implemented."));
-    }
-
-    @Override
-    public CompletableFuture<GetBulkLoadStatusResponse> getBulkLoadStatus(
-            GetBulkLoadStatusRequest request) {
         return FutureUtils.completedExceptionally(
                 new UnsupportedOperationException("BulkLoad RPC is not implemented."));
     }

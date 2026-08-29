@@ -30,8 +30,6 @@ import org.apache.fluss.rpc.messages.BeginBulkLoadRequest;
 import org.apache.fluss.rpc.messages.BeginBulkLoadResponse;
 import org.apache.fluss.rpc.messages.CommitBulkLoadRequest;
 import org.apache.fluss.rpc.messages.CommitBulkLoadResponse;
-import org.apache.fluss.rpc.messages.GetBulkLoadStatusRequest;
-import org.apache.fluss.rpc.messages.GetBulkLoadStatusResponse;
 import org.apache.fluss.rpc.messages.PbApiVersion;
 import org.apache.fluss.rpc.messages.PbBulkLoadHandle;
 import org.apache.fluss.rpc.messages.PbBulkLoadStatus;
@@ -179,10 +177,7 @@ class MessageCodecTest {
         assertThat(messages)
                 .extracting(message -> message.api)
                 .containsExactly(
-                        ApiKeys.BEGIN_BULK_LOAD,
-                        ApiKeys.COMMIT_BULK_LOAD,
-                        ApiKeys.ABORT_BULK_LOAD,
-                        ApiKeys.GET_BULK_LOAD_STATUS);
+                        ApiKeys.BEGIN_BULK_LOAD, ApiKeys.COMMIT_BULK_LOAD, ApiKeys.ABORT_BULK_LOAD);
 
         int requestId = 2000;
         for (MessagePair message : messages) {
@@ -263,11 +258,7 @@ class MessageCodecTest {
                 new MessagePair(
                         ApiKeys.ABORT_BULK_LOAD,
                         new AbortBulkLoadRequest().setHandle(handle()),
-                        new AbortBulkLoadResponse().setStatus(status())),
-                new MessagePair(
-                        ApiKeys.GET_BULK_LOAD_STATUS,
-                        new GetBulkLoadStatusRequest().setHandle(handle()),
-                        new GetBulkLoadStatusResponse().setStatus(status())));
+                        new AbortBulkLoadResponse().setStatus(status())));
     }
 
     private static PbPhysicalTablePath physicalPath() {

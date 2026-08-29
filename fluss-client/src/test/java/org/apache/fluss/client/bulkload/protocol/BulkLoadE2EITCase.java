@@ -758,14 +758,6 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
                                 .hasCauseInstanceOf(InvalidBulkLoadRequestException.class)
                                 .hasMessageNotContaining(
                                         firstBegin.getStatus().getHandle().getBulkLoadId());
-                        assertThat(
-                                        bulkLoadRpc(admin)
-                                                .getBulkLoadStatus(
-                                                        firstBegin.getStatus().getHandle())
-                                                .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
-                                                .getState())
-                                .isEqualTo(BulkLoadState.BEGUN);
-
                         try (BuiltBulkLoadInput input =
                                 buildInput(
                                         firstBegin,
@@ -1644,12 +1636,6 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
                                                 manifestHandle(input),
                                                 E2E_TIMEOUT));
                 recoveredCommit.get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-                BulkLoadStatus terminal =
-                        bulkLoadRpc(recoveredAdmin)
-                                .getBulkLoadStatus(input.getHandle())
-                                .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-                assertThat(terminal.getState()).isEqualTo(BulkLoadState.COMMITTED);
-
                 verifyPartitionedPublicState(
                         recoveredAdmin,
                         recoveredTable,
@@ -1685,6 +1671,7 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
                                     + cluster.describeReplicaStateForTimeout(controlledTableBucket),
                             timeout);
                 }
+                assertThat(cluster.triggerAndWaitSnapshot(controlledTableBucket)).isNotNull();
                 writeAndAwaitPartitionRow(
                         recoveredTable,
                         tableInfo.getRowType(),

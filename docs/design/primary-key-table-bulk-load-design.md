@@ -224,7 +224,6 @@ BulkLoad 线协议复用 `AdminGateway`，API key 从版本 0 开始：
 | `BeginBulkLoad` | 1065 | physical target、caller token、可选 build timeout | `created`、持久 status；fence 完成时携带 target info |
 | `CommitBulkLoad` | 1066 | handle；首次提交携带 manifest path、length、SHA-256 | 当前持久 status |
 | `AbortBulkLoad` | 1067 | handle | `ABORTED` status |
-| `GetBulkLoadStatus` | 1068 | handle | 当前持久 status 与可选 Abort 原因 |
 
 Begin target info 向 Client 提供 handle、冻结的表定义与文件目录，以及按 bucket 排列的 Snapshot
 ID。Commit 的 manifest path、length 和 SHA-256 构成一个 identity：第一次 Commit 完整提供，
@@ -264,6 +263,8 @@ sequenceDiagram
     Coordinator->>TS: 发布 ACTIVE metadata
     TS-->>Coordinator: active confirmation
     Coordinator->>ZK: 持久化 COMMITTED 并清除 registration.bulkLoadId
+    Coordinator->>TS: 发布最终普通 ACTIVE metadata
+    TS-->>Coordinator: final metadata confirmation
     Coordinator-->>Client: status
     Client-->>Caller: BulkLoadStatus
 
@@ -292,7 +293,6 @@ Coordinator 按 caller identity 和 token 恢复同一持久 transaction。
 
 `commit` 在 Client 内部实现有界 retry loop。遇到 retriable failure 或未知结果时，它使用相同
 handle 和 manifest identity 重发 `CommitBulkLoad`，直到 RPC 返回终态或 await timeout 用尽。
-`GetBulkLoadStatus` 提供显式状态查询能力，不参与该内部 Commit retry loop。
 
 ## 6. ZooKeeper 元数据与 manifest
 
@@ -347,9 +347,9 @@ transaction 使用严格、确定性的版本化 JSON，保存以下持久事实
 manifest 验证、普通元数据注册和活跃文件保护提供 Snapshot identity。
 
 registration 的 `bulk_load_id` 是物理目标当前 BulkLoad 所有权的唯一事实。`LOADING + id` 表示
-目标已关闭外部访问，`ACTIVE + id` 表示数据已经恢复服务但 transaction 仍在完成终态确认，
+目标已关闭外部访问，`ACTIVE + id` 表示数据已经恢复服务但 transaction 尚未持久化终态，
 `ACTIVE + null` 表示目标没有被 BulkLoad 占用。`LOADING + null` 是非法组合。transaction 在终态
-后继续保留一段时间，以回答 Begin/Commit 重试和状态查询。
+后继续保留一段时间，以回答 Begin、Commit 和 Abort 重试。
 
 ### 6.3 Outer manifest
 
@@ -404,8 +404,8 @@ stateDiagram-v2
     BegunFencing --> Aborting: target not empty / build deadline / caller Abort
     BegunReady --> Aborting: build deadline / caller Abort
     BegunManifest --> Aborting: commit-decision deadline / caller Abort
-    Aborting --> ABORTED: ACTIVE metadata confirmed, persist result and clear ownership
-    COMMITTING --> COMMITTED: Snapshot 注册与副本收敛完成
+    Aborting --> ABORTED: ACTIVE confirmed, persist result and clear ownership
+    COMMITTING --> COMMITTED: Snapshot 恢复与 ACTIVE 确认完成
     COMMITTED --> [*]
     ABORTED --> [*]
 ```
@@ -457,14 +457,17 @@ Coordinator 按 bucket 通过 create-or-exact-reuse 注册普通 Completed Snaps
 `CompletedSnapshot` 放入运行时 Snapshot store。普通副本协议驱动 leader 和 follower 恢复
 Snapshot，并把本地 Log tail 初始化到 Snapshot 的 `E`。全部副本确认后，Coordinator 将
 registration 切换为 `ACTIVE + bulkLoadId`、发布 ACTIVE metadata 并等待确认，最后在同一个
-checked-multi 中写入 `COMMITTED`，同时将 registration 释放为 `ACTIVE + null`。
+checked-multi 中写入 `COMMITTED`，同时将 registration 释放为 `ACTIVE + null`。Coordinator
+随后按普通元数据协议发布释放所有权后的最新 registration version；当前 TabletServer 实例确认后，
+Commit 才返回终态。
 
 ### 7.4 Abort
 
 Abort 适用于 `BEGUN`。Coordinator 先在一个 checked-multi 中将 registration 切换为
 `ACTIVE + bulkLoadId`，并在 transaction 中持久化 Abort reason。任一新 Coordinator 都能从这两项
 持久事实恢复同一 Abort 决定。TabletServer 确认 ACTIVE metadata 后，Coordinator 在同一个
-checked-multi 中将 transaction 写为 `ABORTED`，同时将 registration 释放为 `ACTIVE + null`。
+checked-multi 中将 transaction 写为 `ABORTED`，同时将 registration 释放为 `ACTIVE + null`，
+再发布并确认该最新普通 ACTIVE metadata，随后返回 Abort 结果。
 调用方在明确的构建失败或主动取消时发起 Abort；Commit RPC 结果未知时由 Client 继续读取和
 推进持久决定。
 
@@ -505,6 +508,10 @@ transaction：
 - `COMMITTING` transaction 根据持久 manifest identity 重新解析 Snapshot metadata，确认已注册的
   bucket 并继续其余 bucket，然后恢复副本；
 - registration 已为 `ACTIVE` 的 transaction 完成最后的 terminal state 写入。
+
+terminal state 与 `ACTIVE + null` 已经原子持久化时，Coordinator 的普通启动元数据广播会发布
+当前 registration version；Begin、Commit 或 Abort 重试也会等待当前 TabletServer 实例确认该
+version 后再返回持久结果。
 
 TabletServer 的 ZooKeeper 连接在同一 session 内短暂中断时，进程内的 replica、角色和 BulkLoad
 fence 状态仍然连续。`SUSPENDED` 期间 TabletServer 关闭外部访问并使旧的在途请求失效；
