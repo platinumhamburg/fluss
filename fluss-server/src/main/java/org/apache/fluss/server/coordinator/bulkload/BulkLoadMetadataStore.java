@@ -666,7 +666,6 @@ public final class BulkLoadMetadataStore {
         return new BulkLoadTransaction(
                 current.getHandle(),
                 state,
-                current.getCallerToken(),
                 current.getCreatorName(),
                 current.getCreatorType(),
                 current.getRemoteDataDir(),

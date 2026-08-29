@@ -1199,13 +1199,6 @@ public class ConfigOptions {
                     .defaultValue(64)
                     .withDescription("The maximum number of active BulkLoad transactions.");
 
-    public static final ConfigOption<Integer> BULKLOAD_MAX_TRANSACTIONS_PER_TARGET =
-            key("bulkload.max-transactions-per-target")
-                    .intType()
-                    .defaultValue(32)
-                    .withDescription(
-                            "The maximum number of retained BulkLoad transactions for one physical target.");
-
     public static final ConfigOption<MemorySize> BULKLOAD_MANIFEST_MAX_SIZE =
             key("bulkload.manifest.max-size")
                     .memoryType()

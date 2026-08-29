@@ -27,12 +27,10 @@
  * BulkLoadClient client = connection.getBulkLoadClient();
  * }</pre>
  *
- * <p>The package contains five public concepts:
+ * <p>The package contains four public concepts:
  *
  * <ul>
  *   <li>{@link org.apache.fluss.client.bulkload.BulkLoadClient} begins, commits, and aborts a load;
- *   <li>{@link org.apache.fluss.client.bulkload.BulkLoadBeginResult} describes a recovered or new
- *       Begin result;
  *   <li>{@link org.apache.fluss.client.bulkload.BulkLoadBuildContext} is the immutable,
  *       serializable build contract returned by Begin;
  *   <li>{@link org.apache.fluss.client.bulkload.BulkLoadBucketWriter} builds the final files for
@@ -50,19 +48,7 @@
  *
  * <pre>{@code
  * BulkLoadClient client = connection.getBulkLoadClient();
- * BulkLoadBeginResult result =
- *         client.begin(
- *                 target,
- *                 submissionId,
- *                 buildTimeout,
- *                 awaitTimeout);
- *
- * if (!result.isBuildRequired()) {
- *     // This submission's previously decided Commit was recovered to completion.
- *     return;
- * }
- *
- * BulkLoadBuildContext context = result.getBuildContext();
+ * BulkLoadBuildContext context = client.begin(target, buildTimeout, awaitTimeout);
  * List<BulkLoadBucketFiles> buckets = new ArrayList<>();
  * try {
  *     for (int bucketId = 0;
@@ -87,27 +73,19 @@
  * BulkLoadStatus status = client.commit(context, buckets, awaitTimeout);
  * }</pre>
  *
- * <p>{@code submissionId} must identify the logical submission and remain stable across retries.
- * Begin uses it to recover only that submission's existing transaction. Commit already handles an
- * unknown or retriable Commit result by joining the durable decision; callers must not abort merely
- * because an individual Commit RPC outcome was unknown.
+ * <p>Begin is a one-shot operation. When its outcome is uncertain, call {@link
+ * org.apache.fluss.client.bulkload.BulkLoadClient#getInProgressBulkLoad} before starting another
+ * transaction. A visible {@code BEGUN} transaction may be aborted with its exact handle before a
+ * fresh Begin. A visible {@code COMMITTING} transaction has a durable Commit decision and must not
+ * be aborted. Commit already handles an unknown or retriable Commit result by joining that durable
+ * decision.
  *
  * <p>When an upstream system supplies each bucket's non-negative log end boundary {@code E_b}, the
  * same public lifecycle uses {@link
  * org.apache.fluss.client.bulkload.BulkLoadBucketWriter#finishAtLogEndOffset(long)}:
  *
  * <pre>{@code
- * BulkLoadBeginResult result =
- *         client.begin(
- *                 target,
- *                 submissionId,
- *                 buildTimeout,
- *                 awaitTimeout);
- * if (!result.isBuildRequired()) {
- *     return;
- * }
- *
- * BulkLoadBuildContext context = result.getBuildContext();
+ * BulkLoadBuildContext context = client.begin(target, buildTimeout, awaitTimeout);
  * List<BulkLoadBucketFiles> buckets = new ArrayList<>();
  * for (int bucketId = 0; bucketId < context.getTableInfo().getNumBuckets(); bucketId++) {
  *     try (BulkLoadBucketWriter writer =
@@ -145,8 +123,9 @@
  * SELECT * FROM source_table;
  * }</pre>
  *
- * <p>The Flink submission ID is created once with the job topology and is serialized with the Begin
- * operator, so task recovery rejoins the same transaction instead of occupying the target with a
- * second one.
+ * <p>The Flink Begin operator first queries the target. It starts a transaction when none is in
+ * progress, or aborts a visible {@code BEGUN} transaction before starting a fresh one. It fails on
+ * a visible {@code COMMITTING} transaction because that durable decision cannot be aborted. Every
+ * successful Begin operator invocation broadcasts exactly one build context.
  */
 package org.apache.fluss.client.bulkload;

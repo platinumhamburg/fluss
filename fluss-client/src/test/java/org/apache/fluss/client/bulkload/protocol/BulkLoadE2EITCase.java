@@ -24,13 +24,13 @@ import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.admin.ClientToServerITCaseBase;
 import org.apache.fluss.client.admin.FlussAdmin;
 import org.apache.fluss.client.admin.OffsetSpec;
-import org.apache.fluss.client.bulkload.BulkLoadBeginResult;
 import org.apache.fluss.client.bulkload.BulkLoadBucketFiles;
 import org.apache.fluss.client.bulkload.BulkLoadBucketWriter;
 import org.apache.fluss.client.bulkload.BulkLoadBuildContext;
 import org.apache.fluss.client.bulkload.BulkLoadClient;
 import org.apache.fluss.client.bulkload.BulkLoadTestDataBuilder;
 import org.apache.fluss.client.bulkload.file.BulkLoadFileHandle;
+import org.apache.fluss.client.lookup.LookupResult;
 import org.apache.fluss.client.lookup.Lookuper;
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.client.table.scanner.ScanRecord;
@@ -51,6 +51,7 @@ import org.apache.fluss.metadata.BulkLoadAbortReason;
 import org.apache.fluss.metadata.BulkLoadHandle;
 import org.apache.fluss.metadata.BulkLoadState;
 import org.apache.fluss.metadata.BulkLoadStatus;
+import org.apache.fluss.metadata.BulkLoadTargetInfo;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.PartitionInfo;
@@ -104,7 +105,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
@@ -120,7 +120,6 @@ import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObje
 import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.apache.fluss.testutils.InternalRowAssert.assertThatRow;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitValue;
-import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -329,10 +328,8 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
                         }
 
                         BulkLoadClient bulkLoadClient = connection.getBulkLoadClient();
-                        BulkLoadBeginResult result =
-                                bulkLoadClient.begin(
-                                        target, UUID.randomUUID().toString(), null, E2E_TIMEOUT);
-                        BulkLoadBuildContext context = result.getBuildContext();
+                        BulkLoadBuildContext context =
+                                bulkLoadClient.begin(target, null, E2E_TIMEOUT);
                         List<BulkLoadBucketFiles> bucketFiles = new ArrayList<>();
                         java.nio.file.Path workDirectory =
                                 Files.createTempDirectory("fluss-bulkload-snapshot-only-");
@@ -483,10 +480,8 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
                         cluster.waitUntilTableReady(tableInfo.getTableId());
 
                         BulkLoadClient bulkLoadClient = connection.getBulkLoadClient();
-                        BulkLoadBeginResult begin =
-                                bulkLoadClient.begin(
-                                        target, UUID.randomUUID().toString(), null, E2E_TIMEOUT);
-                        BulkLoadBuildContext context = begin.getBuildContext();
+                        BulkLoadBuildContext context =
+                                bulkLoadClient.begin(target, null, E2E_TIMEOUT);
                         java.nio.file.Path workDirectory =
                                 Files.createTempDirectory("fluss-bulkload-active-refresh-");
                         BulkLoadBucketFiles bucketFiles;
@@ -634,10 +629,7 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
                                 Duration.ofSeconds(30),
                                 "stopped holder registration disappears before Begin");
 
-                        bulkLoadRpc(admin)
-                                .beginBulkLoad(
-                                        PhysicalTablePath.of(tablePath),
-                                        UUID.randomUUID().toString());
+                        bulkLoadRpc(admin).beginBulkLoad(PhysicalTablePath.of(tablePath));
                         TableRegistration registration =
                                 waitValue(
                                         () -> {
@@ -732,32 +724,30 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
                         }
 
                         PhysicalTablePath idempotentTarget = PhysicalTablePath.of(idempotent);
-                        String callerToken = UUID.randomUUID().toString();
-                        BeginBulkLoadResult firstBegin =
+                        BulkLoadTargetInfo firstBegin =
                                 bulkLoadRpc(admin)
-                                        .beginBulkLoad(idempotentTarget, callerToken)
+                                        .beginBulkLoad(idempotentTarget)
                                         .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-                        BeginBulkLoadResult repeatedBegin =
-                                bulkLoadRpc(admin)
-                                        .beginBulkLoad(idempotentTarget, callerToken)
-                                        .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-                        assertThat(firstBegin.isCreated()).isTrue();
-                        assertThat(repeatedBegin.isCreated()).isFalse();
-                        assertThat(repeatedBegin.getStatus()).isEqualTo(firstBegin.getStatus());
-                        assertThat(repeatedBegin.getTargetInfo())
-                                .isEqualTo(firstBegin.getTargetInfo());
+                        assertThat(
+                                        connection
+                                                .getBulkLoadClient()
+                                                .getInProgressBulkLoad(idempotentTarget))
+                                .hasValueSatisfying(
+                                        status -> {
+                                            assertThat(status.getHandle())
+                                                    .isEqualTo(firstBegin.getHandle());
+                                            assertThat(status.getState())
+                                                    .isEqualTo(BulkLoadState.BEGUN);
+                                        });
                         assertThatThrownBy(
                                         () ->
                                                 bulkLoadRpc(admin)
-                                                        .beginBulkLoad(
-                                                                idempotentTarget,
-                                                                UUID.randomUUID().toString())
+                                                        .beginBulkLoad(idempotentTarget)
                                                         .get(
                                                                 E2E_TIMEOUT.toMillis(),
                                                                 TimeUnit.MILLISECONDS))
                                 .hasCauseInstanceOf(InvalidBulkLoadRequestException.class)
-                                .hasMessageNotContaining(
-                                        firstBegin.getStatus().getHandle().getBulkLoadId());
+                                .hasMessageNotContaining(firstBegin.getHandle().getBulkLoadId());
                         try (BuiltBulkLoadInput input =
                                 buildInput(
                                         firstBegin,
@@ -773,6 +763,11 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
                             assertThat(repeatedCommit).isEqualTo(firstCommit);
                             assertThat(firstCommit.getState()).isEqualTo(BulkLoadState.COMMITTED);
                         }
+                        assertThat(
+                                        connection
+                                                .getBulkLoadClient()
+                                                .getInProgressBulkLoad(idempotentTarget))
+                                .isEmpty();
 
                         TableInfo localTableInfo = tables.get(localNonEmpty);
                         try (Table localTable = connection.getTable(localNonEmpty)) {
@@ -812,22 +807,19 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
     }
 
     @Test
-    void testRetainedTerminalSubmissionIsIdempotentAcrossConnections() throws Exception {
+    void testRetainedTerminalHandleIsIdempotentAcrossConnections() throws Exception {
         withFeatureCluster(
                 cluster -> {
                     Configuration clientConfiguration = cluster.getClientConfig();
                     TablePath committedTable =
-                            TablePath.of("bulkload_e2e", "retained_committed_submission");
+                            TablePath.of("bulkload_e2e", "retained_committed_handle");
                     TablePath abortedTable =
-                            TablePath.of("bulkload_e2e", "retained_aborted_submission");
+                            TablePath.of("bulkload_e2e", "retained_aborted_handle");
                     PhysicalTablePath committedTarget = PhysicalTablePath.of(committedTable);
                     PhysicalTablePath abortedTarget = PhysicalTablePath.of(abortedTable);
-                    String committedSubmission = UUID.randomUUID().toString();
-                    String abortedSubmission = UUID.randomUUID().toString();
-                    BulkLoadHandle committedHandle;
-                    BulkLoadHandle abortedHandle;
                     TableInfo committedTableInfo;
                     TableInfo abortedTableInfo;
+                    BulkLoadTargetInfo committedTargetInfo;
                     Object[] committedOrdinaryRow =
                             new Object[] {Integer.MAX_VALUE - 1, "ordinary-after-commit"};
                     Object[] abortedOrdinaryRow =
@@ -859,163 +851,130 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
                                         .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
                         cluster.waitUntilTableReady(committedTableInfo.getTableId());
                         cluster.waitUntilTableReady(abortedTableInfo.getTableId());
-
-                        BulkLoadClient bulkLoadClient = connection.getBulkLoadClient();
-                        BulkLoadBuildContext committedContext =
-                                bulkLoadClient
-                                        .begin(
-                                                committedTarget,
-                                                committedSubmission,
-                                                null,
-                                                E2E_TIMEOUT)
-                                        .getBuildContext();
-                        committedHandle = committedContext.getHandle();
-                        Set<Integer> usedIds = new HashSet<>();
-                        List<Object[]> committedRows = new ArrayList<>();
-                        for (int bucket = 0; bucket < BUCKET_COUNT; bucket++) {
-                            committedRows.add(
-                                    rowForBucket(
-                                            committedTableInfo,
-                                            bucket,
-                                            bucket * 100_000,
-                                            usedIds,
-                                            "retained-committed"));
-                        }
-                        assertThat(
-                                        bulkLoadClient
-                                                .commit(
-                                                        committedContext,
-                                                        buildPublicBucketFiles(
-                                                                committedContext, committedRows),
-                                                        E2E_TIMEOUT)
-                                                .getState())
-                                .isEqualTo(BulkLoadState.COMMITTED);
-                        try (Table table = connection.getTable(committedTable)) {
-                            writeAndAwaitOrdinaryRow(
-                                    table,
-                                    committedTableInfo,
-                                    committedOrdinaryRow,
-                                    "ordinary lookup succeeds before committed recovery");
-                        }
-
-                        BulkLoadBuildContext abortedContext =
-                                bulkLoadClient
-                                        .begin(abortedTarget, abortedSubmission, null, E2E_TIMEOUT)
-                                        .getBuildContext();
-                        abortedHandle = abortedContext.getHandle();
-                        assertThat(bulkLoadClient.abort(abortedHandle).getState())
-                                .isEqualTo(BulkLoadState.ABORTED);
-                        try (Table table = connection.getTable(abortedTable)) {
-                            writeAndAwaitOrdinaryRow(
-                                    table,
-                                    abortedTableInfo,
-                                    abortedOrdinaryRow,
-                                    "ordinary lookup succeeds before aborted recovery");
-                        }
+                        committedTargetInfo =
+                                bulkLoadRpc(admin)
+                                        .beginBulkLoad(committedTarget)
+                                        .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
                     }
 
-                    ZooKeeperClient zkClient = cluster.getZooKeeperClient();
-                    String committedRegistrationPath = ZkData.TableZNode.path(committedTable);
-                    String abortedRegistrationPath = ZkData.TableZNode.path(abortedTable);
-                    int committedMetadataVersion =
-                            zkClient.getDataWithStat(committedRegistrationPath)
-                                    .getStat()
-                                    .getVersion();
-                    int abortedMetadataVersion =
-                            zkClient.getDataWithStat(abortedRegistrationPath)
-                                    .getStat()
-                                    .getVersion();
-                    assertThat(
-                                    ZkData.TableZNode.decode(
-                                                    zkClient.getDataWithStat(
-                                                                    committedRegistrationPath)
-                                                            .getData())
-                                            .bulkLoadId)
-                            .isNull();
-                    assertThat(
-                                    ZkData.TableZNode.decode(
-                                                    zkClient.getDataWithStat(
-                                                                    abortedRegistrationPath)
-                                                            .getData())
-                                            .bulkLoadId)
-                            .isNull();
+                    Set<Integer> usedIds = new HashSet<>();
+                    List<Object[]> committedRows = new ArrayList<>();
+                    for (int bucket = 0; bucket < BUCKET_COUNT; bucket++) {
+                        committedRows.add(
+                                rowForBucket(
+                                        committedTableInfo,
+                                        bucket,
+                                        bucket * 100_000,
+                                        usedIds,
+                                        "retained-committed"));
+                    }
+                    try (BuiltBulkLoadInput input =
+                            buildInput(committedTargetInfo, committedRows, ChangelogImage.FULL)) {
+                        BulkLoadStatus committedStatus;
+                        BulkLoadStatus abortedStatus;
+                        BulkLoadHandle abortedHandle;
+                        try (Connection connection =
+                                        ConnectionFactory.createConnection(clientConfiguration);
+                                FlussAdmin admin = (FlussAdmin) connection.getAdmin()) {
+                            committedStatus =
+                                    commit(admin, input)
+                                            .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                            assertThat(committedStatus.getState())
+                                    .isEqualTo(BulkLoadState.COMMITTED);
 
-                    try (Connection recoveredConnection =
-                                    ConnectionFactory.createConnection(clientConfiguration);
-                            FlussAdmin recoveredAdmin =
-                                    (FlussAdmin) recoveredConnection.getAdmin();
-                            Table committedAccess = recoveredConnection.getTable(committedTable);
-                            Table abortedAccess = recoveredConnection.getTable(abortedTable)) {
-                        awaitPublicRow(
-                                committedAccess,
-                                committedTableInfo.getRowType(),
-                                committedOrdinaryRow,
-                                "ordinary lookup succeeds immediately after reconnect");
-                        BeginBulkLoadResult recoveredCommitted =
-                                bulkLoadRpc(recoveredAdmin)
-                                        .beginBulkLoad(committedTarget, committedSubmission)
-                                        .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-                        assertThat(recoveredCommitted.isCreated()).isFalse();
-                        assertThat(recoveredCommitted.getStatus().getHandle())
-                                .isEqualTo(committedHandle);
-                        assertThat(recoveredCommitted.getStatus().getState())
-                                .isEqualTo(BulkLoadState.COMMITTED);
-                        BulkLoadBeginResult recoveredResult =
-                                recoveredConnection
-                                        .getBulkLoadClient()
-                                        .begin(
-                                                committedTarget,
-                                                committedSubmission,
-                                                null,
-                                                E2E_TIMEOUT);
-                        assertThat(recoveredResult.isBuildRequired()).isFalse();
-                        assertThat(recoveredResult.getStatus().getHandle())
-                                .isEqualTo(committedHandle);
-                        assertThat(recoveredResult.getStatus().getState())
-                                .isEqualTo(BulkLoadState.COMMITTED);
-                        assertThat(
-                                        zkClient.getDataWithStat(committedRegistrationPath)
-                                                .getStat()
-                                                .getVersion())
-                                .isEqualTo(committedMetadataVersion);
-                        awaitPublicRow(
-                                committedAccess,
-                                committedTableInfo.getRowType(),
-                                committedOrdinaryRow,
-                                "ordinary lookup succeeds after committed recovery");
+                            BulkLoadTargetInfo abortedTargetInfo =
+                                    bulkLoadRpc(admin)
+                                            .beginBulkLoad(abortedTarget)
+                                            .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                            abortedHandle = abortedTargetInfo.getHandle();
+                            abortedStatus =
+                                    bulkLoadRpc(admin)
+                                            .abortBulkLoad(abortedHandle)
+                                            .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                            assertThat(abortedStatus.getState()).isEqualTo(BulkLoadState.ABORTED);
 
-                        BeginBulkLoadResult recoveredAborted =
-                                bulkLoadRpc(recoveredAdmin)
-                                        .beginBulkLoad(abortedTarget, abortedSubmission)
-                                        .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-                        assertThat(recoveredAborted.isCreated()).isFalse();
-                        assertThat(recoveredAborted.getStatus().getHandle())
-                                .isEqualTo(abortedHandle);
-                        assertThat(recoveredAborted.getStatus().getState())
-                                .isEqualTo(BulkLoadState.ABORTED);
-                        assertThatThrownBy(
-                                        () ->
-                                                recoveredConnection
-                                                        .getBulkLoadClient()
-                                                        .begin(
-                                                                abortedTarget,
-                                                                abortedSubmission,
-                                                                null,
-                                                                E2E_TIMEOUT))
-                                .isInstanceOf(IllegalStateException.class)
-                                .hasMessageContaining("state=ABORTED")
-                                .hasMessageContaining(abortedHandle.getBulkLoadId())
-                                .hasMessageContaining("abortReason=ABORTED_BY_CALLER");
-                        assertThat(
-                                        zkClient.getDataWithStat(abortedRegistrationPath)
-                                                .getStat()
-                                                .getVersion())
-                                .isEqualTo(abortedMetadataVersion);
-                        awaitPublicRow(
-                                abortedAccess,
-                                abortedTableInfo.getRowType(),
-                                abortedOrdinaryRow,
-                                "ordinary lookup succeeds after aborted recovery");
+                            BulkLoadHandle freshAbortedHandle =
+                                    bulkLoadRpc(admin)
+                                            .beginBulkLoad(abortedTarget)
+                                            .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                                            .getHandle();
+                            assertThat(freshAbortedHandle).isNotEqualTo(abortedHandle);
+                            assertThat(
+                                            bulkLoadRpc(admin)
+                                                    .abortBulkLoad(freshAbortedHandle)
+                                                    .get(
+                                                            E2E_TIMEOUT.toMillis(),
+                                                            TimeUnit.MILLISECONDS)
+                                                    .getState())
+                                    .isEqualTo(BulkLoadState.ABORTED);
+
+                            try (Table table = connection.getTable(committedTable)) {
+                                writeAndAwaitOrdinaryRow(
+                                        table,
+                                        committedTableInfo,
+                                        committedOrdinaryRow,
+                                        "ordinary lookup succeeds after Commit");
+                            }
+                            try (Table table = connection.getTable(abortedTable)) {
+                                writeAndAwaitOrdinaryRow(
+                                        table,
+                                        abortedTableInfo,
+                                        abortedOrdinaryRow,
+                                        "ordinary lookup succeeds after Abort");
+                            }
+                        }
+
+                        try (Connection recoveredConnection =
+                                        ConnectionFactory.createConnection(clientConfiguration);
+                                FlussAdmin recoveredAdmin =
+                                        (FlussAdmin) recoveredConnection.getAdmin();
+                                Table committedAccess =
+                                        recoveredConnection.getTable(committedTable);
+                                Table abortedAccess = recoveredConnection.getTable(abortedTable)) {
+                            BulkLoadStatus repeatedCommit =
+                                    commit(recoveredAdmin, input)
+                                            .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                            assertThat(repeatedCommit).isEqualTo(committedStatus);
+                            BulkLoadStatus repeatedAbort =
+                                    bulkLoadRpc(recoveredAdmin)
+                                            .abortBulkLoad(abortedHandle)
+                                            .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                            assertThat(repeatedAbort).isEqualTo(abortedStatus);
+                            assertThat(
+                                            recoveredConnection
+                                                    .getBulkLoadClient()
+                                                    .getInProgressBulkLoad(committedTarget))
+                                    .isEmpty();
+                            assertThat(
+                                            recoveredConnection
+                                                    .getBulkLoadClient()
+                                                    .getInProgressBulkLoad(abortedTarget))
+                                    .isEmpty();
+                            awaitPublicRow(
+                                    committedAccess,
+                                    committedTableInfo.getRowType(),
+                                    committedOrdinaryRow,
+                                    "ordinary lookup succeeds after repeated Commit");
+                            awaitPublicRow(
+                                    abortedAccess,
+                                    abortedTableInfo.getRowType(),
+                                    abortedOrdinaryRow,
+                                    "ordinary lookup succeeds after repeated Abort");
+                        }
+
+                        try (Connection droppedTargetConnection =
+                                        ConnectionFactory.createConnection(clientConfiguration);
+                                FlussAdmin droppedTargetAdmin =
+                                        (FlussAdmin) droppedTargetConnection.getAdmin()) {
+                            droppedTargetAdmin
+                                    .dropTable(abortedTable, false)
+                                    .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                            BulkLoadStatus repeatedAbortAfterDrop =
+                                    bulkLoadRpc(droppedTargetAdmin)
+                                            .abortBulkLoad(abortedHandle)
+                                            .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                            assertThat(repeatedAbortAfterDrop).isEqualTo(abortedStatus);
+                        }
                     }
                 });
     }
@@ -1073,19 +1032,10 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
                         cluster.stopTabletServer(unavailableHolder);
                         cluster.assertHasTabletServerNumber(1);
 
-                        String callerToken = UUID.randomUUID().toString();
-                        CompletableFuture<BeginBulkLoadResult> beginFuture =
-                                bulkLoadRpc(admin)
-                                        .beginBulkLoad(
-                                                PhysicalTablePath.of(tablePath), callerToken);
-                        try {
-                            beginFuture.get(5, TimeUnit.SECONDS);
-                        } catch (TimeoutException pendingUntilAllHoldersReturn) {
-                            // A missing assigned holder may keep Begin pending.
-                        } catch (ExecutionException retriableUntilAllHoldersReturn) {
-                            assertThat(rootCause(retriableUntilAllHoldersReturn))
-                                    .isInstanceOf(RetriableException.class);
-                        }
+                        CompletableFuture<BulkLoadTargetInfo> beginFuture =
+                                bulkLoadRpc(admin).beginBulkLoad(PhysicalTablePath.of(tablePath));
+                        assertThatThrownBy(() -> beginFuture.get(5, TimeUnit.SECONDS))
+                                .isInstanceOf(TimeoutException.class);
 
                         cluster.startTabletServer(staleHolder);
                         Replica reRegisteredReplica =
@@ -1139,15 +1089,20 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
                                 .contains(bucket.toString());
 
                         cluster.startTabletServer(unavailableHolder);
-                        BeginBulkLoadResult result =
-                                bulkLoadRpc(admin)
-                                        .beginBulkLoad(PhysicalTablePath.of(tablePath), callerToken)
-                                        .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-                        assertThat(result.isCreated()).isFalse();
-                        assertThat(result.getTargetInfo()).isNull();
-                        assertThat(result.getStatus().getState()).isEqualTo(BulkLoadState.ABORTED);
-                        assertThat(result.getStatus().getAbortReason())
-                                .isEqualTo(BulkLoadAbortReason.TARGET_NOT_EMPTY);
+                        assertThatThrownBy(
+                                        () ->
+                                                beginFuture.get(
+                                                        E2E_TIMEOUT.toMillis(),
+                                                        TimeUnit.MILLISECONDS))
+                                .isInstanceOf(ExecutionException.class)
+                                .hasCauseInstanceOf(InvalidBulkLoadRequestException.class)
+                                .hasMessageContaining(BulkLoadAbortReason.TARGET_NOT_EMPTY.name());
+                        assertThat(
+                                        connection
+                                                .getBulkLoadClient()
+                                                .getInProgressBulkLoad(
+                                                        PhysicalTablePath.of(tablePath)))
+                                .isEmpty();
                     }
                 });
     }
@@ -1181,13 +1136,8 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
 
                         BulkLoadClient bulkLoadClient = connection.getBulkLoadClient();
                         BulkLoadBuildContext context =
-                                bulkLoadClient
-                                        .begin(
-                                                PhysicalTablePath.of(tablePath),
-                                                UUID.randomUUID().toString(),
-                                                null,
-                                                E2E_TIMEOUT)
-                                        .getBuildContext();
+                                bulkLoadClient.begin(
+                                        PhysicalTablePath.of(tablePath), null, E2E_TIMEOUT);
                         Object[] bucketOneValues =
                                 rowForBucket(tableInfo, 1, 0, new HashSet<>(), "wrong-bucket");
                         java.nio.file.Path workDirectory =
@@ -1244,13 +1194,8 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
 
                         BulkLoadClient bulkLoadClient = connection.getBulkLoadClient();
                         BulkLoadBuildContext context =
-                                bulkLoadClient
-                                        .begin(
-                                                PhysicalTablePath.of(tablePath),
-                                                UUID.randomUUID().toString(),
-                                                null,
-                                                E2E_TIMEOUT)
-                                        .getBuildContext();
+                                bulkLoadClient.begin(
+                                        PhysicalTablePath.of(tablePath), null, E2E_TIMEOUT);
                         java.nio.file.Path callerParent =
                                 Files.createTempDirectory("fluss-bulkload-caller-parent-");
                         java.nio.file.Path sentinel = callerParent.resolve("caller-sentinel");
@@ -1305,16 +1250,16 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
 
     private static void assertTargetNotEmpty(
             FlussAdmin admin, PhysicalTablePath target, String expectedEvidence) throws Exception {
-        BeginBulkLoadResult rejected =
-                bulkLoadRpc(admin)
-                        .beginBulkLoad(target, UUID.randomUUID().toString())
-                        .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-        assertThat(rejected.isCreated()).isTrue();
-        assertThat(rejected.getTargetInfo()).isNull();
-        assertThat(rejected.getStatus().getState()).isEqualTo(BulkLoadState.ABORTED);
-        assertThat(rejected.getStatus().getAbortReason())
-                .isEqualTo(BulkLoadAbortReason.TARGET_NOT_EMPTY);
-        assertThat(rejected.getStatus().getAbortMessage()).contains(expectedEvidence);
+        assertThatThrownBy(
+                        () ->
+                                bulkLoadRpc(admin)
+                                        .beginBulkLoad(target)
+                                        .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                .isInstanceOf(ExecutionException.class)
+                .hasCauseInstanceOf(InvalidBulkLoadRequestException.class)
+                .hasMessageContaining(BulkLoadAbortReason.TARGET_NOT_EMPTY.name())
+                .hasMessageContaining(expectedEvidence);
+        assertThat(bulkLoadRpc(admin).getInProgressBulkLoad(target).get()).isEmpty();
     }
 
     private static void writeAndAwaitOrdinaryRow(
@@ -1371,10 +1316,13 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
         awaitPublicBucketReadiness(table, readinessProbes);
 
         PhysicalTablePath target = PhysicalTablePath.of(tablePath);
-        BulkLoadBeginResult result =
-                bulkLoadClient.begin(target, UUID.randomUUID().toString(), null, E2E_TIMEOUT);
-        BulkLoadBuildContext context = result.getBuildContext();
-        assertThat(result.getStatus().getState()).isEqualTo(BulkLoadState.BEGUN);
+        BulkLoadBuildContext context = bulkLoadClient.begin(target, null, E2E_TIMEOUT);
+        assertThat(bulkLoadClient.getInProgressBulkLoad(target))
+                .hasValueSatisfying(
+                        status -> {
+                            assertThat(status.getHandle()).isEqualTo(context.getHandle());
+                            assertThat(status.getState()).isEqualTo(BulkLoadState.BEGUN);
+                        });
         assertLoadingAccessRejected(accessProbeTable, tableInfo, first);
 
         List<BulkLoadBucketFiles> bucketFiles = new ArrayList<>();
@@ -1473,14 +1421,12 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
         }
         awaitPublicBucketReadiness(table, readinessProbes);
 
-        BeginBulkLoadResult begin =
+        BulkLoadTargetInfo targetInfo =
                 bulkLoadRpc(featureAdmin)
-                        .beginBulkLoad(
-                                PhysicalTablePath.of(tablePath), UUID.randomUUID().toString())
+                        .beginBulkLoad(PhysicalTablePath.of(tablePath))
                         .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-        assertThat(begin.isCreated()).isTrue();
 
-        try (BuiltBulkLoadInput input = buildInput(begin, inputRows, ChangelogImage.FULL)) {
+        try (BuiltBulkLoadInput input = buildInput(targetInfo, inputRows, ChangelogImage.FULL)) {
             assertThatThrownBy(
                             () ->
                                     featureAdmin
@@ -1564,14 +1510,11 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
                         WAL_LIVE_PARTITION),
                 "non-target partition is live before Begin");
 
-        BeginBulkLoadResult begin =
+        BulkLoadTargetInfo targetInfo =
                 bulkLoadRpc(featureAdmin)
-                        .beginBulkLoad(
-                                PhysicalTablePath.of(tablePath, WAL_TARGET_PARTITION),
-                                UUID.randomUUID().toString())
+                        .beginBulkLoad(PhysicalTablePath.of(tablePath, WAL_TARGET_PARTITION))
                         .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-        assertThat(begin.isCreated()).isTrue();
-        assertThat(begin.getStatus().getHandle().getPartitionId()).isEqualTo(targetPartitionId);
+        assertThat(targetInfo.getHandle().getPartitionId()).isEqualTo(targetPartitionId);
         writeAndAwaitPartitionRow(
                 table,
                 tableInfo.getRowType(),
@@ -1585,7 +1528,7 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
                         WAL_LIVE_PARTITION),
                 "non-target partition is live while target is LOADING");
 
-        try (BuiltBulkLoadInput input = buildInput(begin, targetRows, ChangelogImage.WAL)) {
+        try (BuiltBulkLoadInput input = buildInput(targetInfo, targetRows, ChangelogImage.WAL)) {
             BulkLoadTestDataBuilder.BuildResult expected = input.getBuildResult();
             assertThat(expected.getBuckets())
                     .hasSize(BUCKET_COUNT)
@@ -2171,23 +2114,58 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
     private static void verifyPublicRows(Table table, RowType rowType, List<Object[]> expectedRows)
             throws Exception {
         Lookuper lookuper = table.newLookup().createLookuper();
+        long lookupDeadlineNanos = System.nanoTime() + E2E_TIMEOUT.toNanos();
+        List<CompletableFuture<LookupResult>> lookupFutures = new ArrayList<>(expectedRows.size());
         for (Object[] expected : expectedRows) {
+            lookupFutures.add(lookuper.lookup(row((Integer) expected[0])));
+        }
+        CompletableFuture<LookupResult> absentLookup = lookuper.lookup(row(Integer.MAX_VALUE));
+
+        for (int rowIndex = 0; rowIndex < expectedRows.size(); rowIndex++) {
+            Object[] expected = expectedRows.get(rowIndex);
+            int key = (Integer) expected[0];
             InternalRow actual =
-                    lookuper.lookup(row((Integer) expected[0]))
-                            .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                    awaitLookup(
+                                    lookupFutures.get(rowIndex),
+                                    lookupDeadlineNanos,
+                                    "public row for key " + key)
                             .getSingletonRow();
             assertThatRow(actual)
+                    .as("public lookup result for key %s", key)
                     .withSchema(rowType)
                     .isEqualTo(row(rowType, Arrays.copyOf(expected, expected.length)));
         }
+
         assertThat(
-                        lookuper.lookup(row(Integer.MAX_VALUE))
-                                .get(E2E_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)
+                        awaitLookup(
+                                        absentLookup,
+                                        lookupDeadlineNanos,
+                                        "absent public key " + Integer.MAX_VALUE)
                                 .getSingletonRow())
+                .as("public lookup result for absent key %s", Integer.MAX_VALUE)
                 .isNull();
 
         List<InternalRow> scanned = awaitPublicBatchScan(table);
         assertThat(toLogicalRows(scanned)).containsExactlyInAnyOrderElementsOf(expectedRows);
+    }
+
+    private static LookupResult awaitLookup(
+            CompletableFuture<LookupResult> lookupFuture, long deadlineNanos, String description) {
+        long remainingNanos = deadlineNanos - System.nanoTime();
+        if (remainingNanos <= 0) {
+            throw new AssertionError("Timed out verifying " + description + ".");
+        }
+        try {
+            return lookupFuture.get(remainingNanos, TimeUnit.NANOSECONDS);
+        } catch (ExecutionException failure) {
+            throw new AssertionError("Lookup failed for " + description + ".", failure.getCause());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(
+                    "Interrupted while verifying " + description + ".", interrupted);
+        } catch (TimeoutException timeout) {
+            throw new AssertionError("Timed out verifying " + description + ".", timeout);
+        }
     }
 
     private static List<InternalRow> awaitPublicBatchScan(Table table) {
@@ -2529,26 +2507,6 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
         return new BulkLoadRpcClient(admin.getAdminGateway());
     }
 
-    private static List<BulkLoadBucketFiles> buildPublicBucketFiles(
-            BulkLoadBuildContext context, List<Object[]> logicalRows) throws Exception {
-        TableInfo tableInfo = context.getTableInfo();
-        List<BulkLoadBucketFiles> bucketFiles = new ArrayList<>();
-        for (int bucket = 0; bucket < tableInfo.getNumBuckets(); bucket++) {
-            java.nio.file.Path workDirectory =
-                    Files.createTempDirectory("fluss-bulkload-retained-terminal-");
-            try (BulkLoadBucketWriter writer =
-                    new BulkLoadBucketWriter(context, bucket, workDirectory.toFile())) {
-                for (Object[] values : logicalRows) {
-                    if (bucketContains(tableInfo, bucket, values)) {
-                        writer.add(row(tableInfo.getRowType(), values));
-                    }
-                }
-                bucketFiles.add(writer.finish());
-            }
-        }
-        return bucketFiles;
-    }
-
     private static BulkLoadFileHandle manifestHandle(BuiltBulkLoadInput input) {
         return new BulkLoadFileHandle(
                 input.getBuildResult().getManifestPath().toString(),
@@ -2557,17 +2515,14 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
     }
 
     private static BuiltBulkLoadInput buildInput(
-            BeginBulkLoadResult result, List<Object[]> logicalRows, ChangelogImage changelogImage) {
-        checkNotNull(result, "BulkLoad Begin result must not be null.");
-        checkArgument(result.isCreated(), "BulkLoad Begin must create a transaction.");
-        checkNotNull(
-                result.getTargetInfo(),
-                "BulkLoad Begin must return frozen target information before input creation.");
+            BulkLoadTargetInfo targetInfo,
+            List<Object[]> logicalRows,
+            ChangelogImage changelogImage) {
+        checkNotNull(targetInfo, "BulkLoad target info must not be null.");
         try {
             return new BuiltBulkLoadInput(
-                    result,
-                    new BulkLoadTestDataBuilder()
-                            .build(result.getTargetInfo(), logicalRows, changelogImage));
+                    targetInfo,
+                    new BulkLoadTestDataBuilder().build(targetInfo, logicalRows, changelogImage));
         } catch (Exception e) {
             throw new CompletionException("Failed to build public BulkLoad input.", e);
         }
@@ -2632,25 +2587,25 @@ final class BulkLoadE2EITCase extends ClientToServerITCaseBase {
                 + (message == null || message.isEmpty() ? "" : ": " + message);
     }
 
-    /** Complete Begin result and independently retained deterministic input. */
+    /** Frozen target information and independently retained deterministic input. */
     public static final class BuiltBulkLoadInput implements AutoCloseable {
-        private final BeginBulkLoadResult beginResult;
+        private final BulkLoadTargetInfo targetInfo;
         private final BulkLoadTestDataBuilder.BuildResult buildResult;
 
         private BuiltBulkLoadInput(
-                BeginBulkLoadResult beginResult, BulkLoadTestDataBuilder.BuildResult buildResult) {
-            this.beginResult = beginResult;
+                BulkLoadTargetInfo targetInfo, BulkLoadTestDataBuilder.BuildResult buildResult) {
+            this.targetInfo = targetInfo;
             this.buildResult = buildResult;
         }
 
-        /** Returns the public Begin result that authorized input creation. */
-        public BeginBulkLoadResult getBeginResult() {
-            return beginResult;
+        /** Returns the frozen target information that authorized input creation. */
+        public BulkLoadTargetInfo getTargetInfo() {
+            return targetInfo;
         }
 
         /** Returns the handle used by subsequent lifecycle calls. */
         public BulkLoadHandle getHandle() {
-            return beginResult.getStatus().getHandle();
+            return targetInfo.getHandle();
         }
 
         /** Returns the retained manifest length. */

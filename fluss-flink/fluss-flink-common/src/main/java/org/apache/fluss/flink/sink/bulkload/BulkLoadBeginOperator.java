@@ -19,9 +19,11 @@ package org.apache.fluss.flink.sink.bulkload;
 
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
-import org.apache.fluss.client.bulkload.BulkLoadBeginResult;
 import org.apache.fluss.client.bulkload.BulkLoadBuildContext;
+import org.apache.fluss.client.bulkload.BulkLoadClient;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.metadata.BulkLoadState;
+import org.apache.fluss.metadata.BulkLoadStatus;
 import org.apache.fluss.metadata.PhysicalTablePath;
 
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
@@ -31,6 +33,7 @@ import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import javax.annotation.Nullable;
 
 import java.time.Duration;
+import java.util.Optional;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
@@ -38,24 +41,25 @@ import static org.apache.fluss.utils.Preconditions.checkState;
 
 /**
  * The operator that begins the BulkLoad transaction of the primary-key bulk-load protocol; it is
- * the single entry point of transaction initiation and leftover-transaction recovery in the
- * BulkLoad sink topology.
+ * the single entry point of transaction initiation and leftover-transaction cleanup in the BulkLoad
+ * sink topology.
  *
- * <p>The operator consumes a single trigger element and begins or recovers the submission through
- * the public BulkLoad client. The BulkLoad sink topology contract guarantees exactly one trigger
- * element per operator instance; a second trigger element fails fast via a state check:
+ * <p>The operator consumes a single trigger element and checks the target through the public
+ * BulkLoad client before beginning a fresh transaction. The BulkLoad sink topology contract
+ * guarantees exactly one trigger element per operator instance; a second trigger element fails fast
+ * via a state check:
  *
  * <ul>
- *   <li>when this submission creates or recovers a {@code BEGUN} transaction, it emits the frozen
- *       build context, which is broadcast to the downstream Build operators;
- *   <li>when this submission recovers its {@code COMMITTING} transaction, it completes the durable
- *       decision through the BulkLoad client and emits nothing.
+ *   <li>when no transaction is in progress, it begins one;
+ *   <li>when a {@code BEGUN} transaction remains, it aborts that transaction and begins a fresh
+ *       one;
+ *   <li>when a {@code COMMITTING} transaction remains, it fails because aborting a durable Commit
+ *       decision is not safe.
  * </ul>
  *
- * <p>The begin-and-recover sequence and the completion of a leftover transaction share the same
- * client-side await budget given by the await timeout. The connection is created lazily on the
- * trigger element and is closed by {@link #close()}, which is idempotent and safe even when no
- * element was ever processed.
+ * <p>Every successful invocation emits exactly one frozen build context, which is broadcast to the
+ * downstream Build operators. The connection is created lazily on the trigger element and is closed
+ * by {@link #close()}, which is idempotent and safe even when no element was ever processed.
  */
 final class BulkLoadBeginOperator extends AbstractStreamOperator<BulkLoadBuildContext>
         implements OneInputStreamOperator<Long, BulkLoadBuildContext> {
@@ -64,7 +68,6 @@ final class BulkLoadBeginOperator extends AbstractStreamOperator<BulkLoadBuildCo
 
     private final Configuration flussConfig;
     private final PhysicalTablePath target;
-    private final String callerToken;
     private final @Nullable Duration buildTimeout;
     private final Duration awaitTimeout;
     private transient @Nullable Connection connection;
@@ -72,12 +75,10 @@ final class BulkLoadBeginOperator extends AbstractStreamOperator<BulkLoadBuildCo
     BulkLoadBeginOperator(
             Configuration flussConfig,
             PhysicalTablePath target,
-            String callerToken,
             @Nullable Duration buildTimeout,
             Duration awaitTimeout) {
         this.flussConfig = checkNotNull(flussConfig, "Fluss configuration must not be null.");
         this.target = checkNotNull(target, "BulkLoad target must not be null.");
-        this.callerToken = checkNotNull(callerToken, "BulkLoad caller token must not be null.");
         this.buildTimeout = buildTimeout;
         this.awaitTimeout = checkNotNull(awaitTimeout, "BulkLoad await timeout must not be null.");
         checkArgument(
@@ -94,13 +95,32 @@ final class BulkLoadBeginOperator extends AbstractStreamOperator<BulkLoadBuildCo
         Connection newConnection = ConnectionFactory.createConnection(flussConfig);
         this.connection = newConnection;
         try {
-            BulkLoadBeginResult result =
-                    newConnection
-                            .getBulkLoadClient()
-                            .begin(target, callerToken, buildTimeout, awaitTimeout);
-            if (result.isBuildRequired()) {
-                output.collect(new StreamRecord<>(result.getBuildContext()));
+            BulkLoadClient client = newConnection.getBulkLoadClient();
+            Optional<BulkLoadStatus> inProgress = client.getInProgressBulkLoad(target);
+            if (inProgress.isPresent()) {
+                BulkLoadStatus status = inProgress.get();
+                if (status.getState() == BulkLoadState.BEGUN) {
+                    BulkLoadStatus aborted = client.abort(status.getHandle());
+                    checkState(
+                            aborted.getState() == BulkLoadState.ABORTED,
+                            "Aborting the leftover BulkLoad transaction returned state %s.",
+                            aborted.getState());
+                } else if (status.getState() == BulkLoadState.COMMITTING) {
+                    throw new IllegalStateException(
+                            "BulkLoad target "
+                                    + target
+                                    + " has a COMMITTING transaction that cannot be aborted.");
+                } else {
+                    throw new IllegalStateException(
+                            "BulkLoad target "
+                                    + target
+                                    + " returned unexpected in-progress state "
+                                    + status.getState()
+                                    + '.');
+                }
             }
+            BulkLoadBuildContext context = client.begin(target, buildTimeout, awaitTimeout);
+            output.collect(new StreamRecord<>(context));
         } catch (Exception e) {
             // Release the connection eagerly on failure; close() stays idempotent. A close failure
             // must never mask the original failure.

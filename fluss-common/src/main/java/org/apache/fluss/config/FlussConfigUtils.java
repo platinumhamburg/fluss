@@ -246,7 +246,6 @@ public class FlussConfigUtils {
         validMinDuration(conf, ConfigOptions.BULKLOAD_COMMIT_DECISION_TIMEOUT, 1);
         validMinDuration(conf, ConfigOptions.BULKLOAD_RESULT_RETENTION, 1);
         validMinValue(conf, ConfigOptions.BULKLOAD_MAX_ACTIVE_TRANSACTIONS, 1);
-        validMinValue(conf, ConfigOptions.BULKLOAD_MAX_TRANSACTIONS_PER_TARGET, 1);
         validPositiveMemory(conf, ConfigOptions.BULKLOAD_MANIFEST_MAX_SIZE);
         validPositiveMemory(conf, ConfigOptions.BULKLOAD_INPUT_MAX_SIZE);
 

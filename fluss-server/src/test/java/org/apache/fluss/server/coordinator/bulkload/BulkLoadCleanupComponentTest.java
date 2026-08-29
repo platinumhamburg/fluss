@@ -323,7 +323,6 @@ class BulkLoadCleanupComponentTest {
         return new BulkLoadTransaction(
                 handle(tableId, "550e8400-e29b-41d4-a716-446655440041"),
                 BulkLoadState.BEGUN,
-                "caller-token",
                 "alice",
                 "USER",
                 "file:///warehouse",
@@ -347,7 +346,6 @@ class BulkLoadCleanupComponentTest {
         return new BulkLoadTransaction(
                 handle(tableId, "550e8400-e29b-41d4-a716-446655440042"),
                 BulkLoadState.ABORTED,
-                "caller-token",
                 "alice",
                 "USER",
                 "file:///warehouse",

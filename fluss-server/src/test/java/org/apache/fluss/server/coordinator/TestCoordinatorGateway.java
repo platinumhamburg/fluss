@@ -82,6 +82,8 @@ import org.apache.fluss.rpc.messages.GetDatabaseInfoRequest;
 import org.apache.fluss.rpc.messages.GetDatabaseInfoResponse;
 import org.apache.fluss.rpc.messages.GetFileSystemSecurityTokenRequest;
 import org.apache.fluss.rpc.messages.GetFileSystemSecurityTokenResponse;
+import org.apache.fluss.rpc.messages.GetInProgressBulkLoadRequest;
+import org.apache.fluss.rpc.messages.GetInProgressBulkLoadResponse;
 import org.apache.fluss.rpc.messages.GetKvSnapshotMetadataRequest;
 import org.apache.fluss.rpc.messages.GetKvSnapshotMetadataResponse;
 import org.apache.fluss.rpc.messages.GetLakeSnapshotRequest;
@@ -171,6 +173,13 @@ public class TestCoordinatorGateway implements CoordinatorGateway {
 
     @Override
     public CompletableFuture<BeginBulkLoadResponse> beginBulkLoad(BeginBulkLoadRequest request) {
+        return FutureUtils.completedExceptionally(
+                new UnsupportedOperationException("BulkLoad RPC is not implemented."));
+    }
+
+    @Override
+    public CompletableFuture<GetInProgressBulkLoadResponse> getInProgressBulkLoad(
+            GetInProgressBulkLoadRequest request) {
         return FutureUtils.completedExceptionally(
                 new UnsupportedOperationException("BulkLoad RPC is not implemented."));
     }

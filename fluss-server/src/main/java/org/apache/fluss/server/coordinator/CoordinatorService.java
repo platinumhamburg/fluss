@@ -115,6 +115,8 @@ import org.apache.fluss.rpc.messages.DropTableRequest;
 import org.apache.fluss.rpc.messages.DropTableResponse;
 import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
 import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
+import org.apache.fluss.rpc.messages.GetInProgressBulkLoadRequest;
+import org.apache.fluss.rpc.messages.GetInProgressBulkLoadResponse;
 import org.apache.fluss.rpc.messages.GetProducerOffsetsRequest;
 import org.apache.fluss.rpc.messages.GetProducerOffsetsResponse;
 import org.apache.fluss.rpc.messages.LakeTieringHeartbeatRequest;
@@ -133,6 +135,7 @@ import org.apache.fluss.rpc.messages.PbHeartbeatReqForTable;
 import org.apache.fluss.rpc.messages.PbHeartbeatRespForTable;
 import org.apache.fluss.rpc.messages.PbKvSnapshotLeaseForTable;
 import org.apache.fluss.rpc.messages.PbLakeTieringStats;
+import org.apache.fluss.rpc.messages.PbPhysicalTablePath;
 import org.apache.fluss.rpc.messages.PbPrepareLakeTableRespForTable;
 import org.apache.fluss.rpc.messages.PbProducerTableOffsets;
 import org.apache.fluss.rpc.messages.PbTableBucket;
@@ -174,6 +177,7 @@ import org.apache.fluss.server.coordinator.event.CommitLakeTableSnapshotEvent;
 import org.apache.fluss.server.coordinator.event.CommitRemoteLogManifestEvent;
 import org.apache.fluss.server.coordinator.event.ControlledShutdownEvent;
 import org.apache.fluss.server.coordinator.event.EventManager;
+import org.apache.fluss.server.coordinator.event.GetInProgressBulkLoadEvent;
 import org.apache.fluss.server.coordinator.event.ListRebalanceProgressEvent;
 import org.apache.fluss.server.coordinator.event.RebalanceEvent;
 import org.apache.fluss.server.coordinator.event.RemoveServerTagEvent;
@@ -351,10 +355,31 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 .put(
                         new BeginBulkLoadEvent(
                                 target,
-                                request.getCallerToken(),
                                 request.hasBuildTimeoutMs() ? request.getBuildTimeoutMs() : null,
                                 creator,
                                 future));
+        return future;
+    }
+
+    @Override
+    public CompletableFuture<GetInProgressBulkLoadResponse> getInProgressBulkLoad(
+            GetInProgressBulkLoadRequest request) {
+        PhysicalTablePath target = validateTarget(request);
+        authorize(target, OperationType.WRITE);
+        Session session = currentSession();
+        FlussPrincipal sessionPrincipal = session.getPrincipal();
+        FlussPrincipal creator =
+                new FlussPrincipal(sessionPrincipal.getName(), sessionPrincipal.getType());
+        boolean canAlter =
+                authorizer == null
+                        || authorizer.isAuthorized(
+                                session,
+                                OperationType.ALTER,
+                                Resource.table(target.getTablePath()));
+        CompletableFuture<GetInProgressBulkLoadResponse> future = new CompletableFuture<>();
+        eventManagerSupplier
+                .get()
+                .put(new GetInProgressBulkLoadEvent(target, creator, canAlter, future));
         return future;
     }
 
@@ -387,25 +412,36 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     }
 
     private PhysicalTablePath validateTarget(BeginBulkLoadRequest request) {
-        if (!request.hasTarget()
-                || !request.getTarget().hasDatabaseName()
-                || !request.getTarget().hasTableName()
-                || request.getTarget().getDatabaseName().trim().isEmpty()
-                || request.getTarget().getTableName().trim().isEmpty()
-                || (request.getTarget().hasPartitionName()
-                        && request.getTarget().getPartitionName().isEmpty())
-                || !request.hasCallerToken()
-                || request.getCallerToken().trim().isEmpty()
-                || (request.hasBuildTimeoutMs() && request.getBuildTimeoutMs() <= 0)) {
+        if (request.hasBuildTimeoutMs() && request.getBuildTimeoutMs() <= 0) {
             throw new InvalidBulkLoadRequestException("Invalid BulkLoad Begin request.");
+        }
+        return validateTarget(
+                request.hasTarget(), request.hasTarget() ? request.getTarget() : null);
+    }
+
+    private PhysicalTablePath validateTarget(GetInProgressBulkLoadRequest request) {
+        return validateTarget(
+                request.hasTarget(), request.hasTarget() ? request.getTarget() : null);
+    }
+
+    private PhysicalTablePath validateTarget(
+            boolean targetPresent, @Nullable PbPhysicalTablePath requestedTarget) {
+        if (!targetPresent
+                || requestedTarget == null
+                || !requestedTarget.hasDatabaseName()
+                || !requestedTarget.hasTableName()
+                || requestedTarget.getDatabaseName().trim().isEmpty()
+                || requestedTarget.getTableName().trim().isEmpty()
+                || (requestedTarget.hasPartitionName()
+                        && requestedTarget.getPartitionName().isEmpty())) {
+            throw new InvalidBulkLoadRequestException("Invalid BulkLoad target.");
         }
         PhysicalTablePath target =
                 PhysicalTablePath.of(
                         TablePath.of(
-                                request.getTarget().getDatabaseName(),
-                                request.getTarget().getTableName()),
-                        request.getTarget().hasPartitionName()
-                                ? request.getTarget().getPartitionName()
+                                requestedTarget.getDatabaseName(), requestedTarget.getTableName()),
+                        requestedTarget.hasPartitionName()
+                                ? requestedTarget.getPartitionName()
                                 : null);
         if (!target.isValid()) {
             throw new InvalidBulkLoadRequestException("Invalid BulkLoad target.");

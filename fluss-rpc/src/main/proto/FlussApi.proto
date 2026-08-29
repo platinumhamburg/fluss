@@ -825,7 +825,6 @@ message GetClusterHealthResponse {
 message BeginBulkLoadRequest {
   required PbPhysicalTablePath target = 1;
   optional int64 build_timeout_ms = 2;
-  required string caller_token = 3;
 }
 
 message PbBulkLoadHandle {
@@ -836,9 +835,7 @@ message PbBulkLoadHandle {
 }
 
 message BeginBulkLoadResponse {
-  required bool created = 1;
-  required PbBulkLoadStatus status = 2;
-  optional PbBulkLoadTargetInfo target_info = 3;
+  required PbBulkLoadTargetInfo target_info = 1;
 }
 
 message CommitBulkLoadRequest {
@@ -858,6 +855,14 @@ message AbortBulkLoadRequest {
 
 message AbortBulkLoadResponse {
   required PbBulkLoadStatus status = 1;
+}
+
+message GetInProgressBulkLoadRequest {
+  required PbPhysicalTablePath target = 1;
+}
+
+message GetInProgressBulkLoadResponse {
+  optional PbBulkLoadStatus status = 1;
 }
 
 message PbBulkLoadStatus {

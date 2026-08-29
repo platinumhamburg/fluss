@@ -288,9 +288,6 @@ class FlussConfigUtilsTest {
                 "bulkload.max-active-transactions",
                 conf -> conf.set(ConfigOptions.BULKLOAD_MAX_ACTIVE_TRANSACTIONS, 0));
         invalidValues.put(
-                "bulkload.max-transactions-per-target",
-                conf -> conf.set(ConfigOptions.BULKLOAD_MAX_TRANSACTIONS_PER_TARGET, 0));
-        invalidValues.put(
                 "bulkload.manifest.max-size",
                 conf -> conf.set(ConfigOptions.BULKLOAD_MANIFEST_MAX_SIZE, MemorySize.ZERO));
         invalidValues.put(

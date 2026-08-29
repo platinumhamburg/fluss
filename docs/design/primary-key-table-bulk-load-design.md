@@ -58,7 +58,7 @@ flowchart LR
 
     SDK -->|写最终文件| Snapshots
     SDK -->|发布描述文件| Manifest
-    SDK -->|Begin / Commit / Abort| Coordinator
+    SDK -->|Begin / GetInProgress / Commit / Abort| Coordinator
     Coordinator -.->|读取并验证| Manifest
     Coordinator -.->|读取并验证| Snapshots
     Coordinator <-->|持久化事务和普通元数据| ZK
@@ -142,11 +142,13 @@ BulkLoadClient bulkLoadClient = connection.getBulkLoadClient();
 核心 API 签名如下：
 
 ```java
-BulkLoadBeginResult begin(
+BulkLoadBuildContext begin(
         PhysicalTablePath target,
-        String submissionId,
         @Nullable Duration buildTimeout,
         Duration awaitTimeout)
+        throws Exception;
+
+Optional<BulkLoadStatus> getInProgressBulkLoad(PhysicalTablePath target)
         throws Exception;
 
 BulkLoadStatus commit(
@@ -164,14 +166,14 @@ BulkLoadBucketFiles finish() throws Exception;
 BulkLoadBucketFiles finishAtLogEndOffset(long logEndOffset) throws Exception;
 ```
 
-`submissionId` 是调用方为一次逻辑提交分配的稳定标识。Begin 将它与调用者身份组成幂等键，
-重试时恢复同一 transaction。`buildTimeout` 控制构建决定期限，`null` 使用服务端默认值；
-`awaitTimeout` 限制客户端等待 Begin 或 Commit 收敛的时间。
+`buildTimeout` 控制构建决定期限，`null` 使用服务端默认值；`awaitTimeout` 限制客户端等待
+Begin 或 Commit 收敛的时间。Begin 只创建新 transaction，成功时直接返回
+`BulkLoadBuildContext`。该上下文包含冻结的 `TableInfo`、bucket 路由规则、remote data
+directory、transaction handle 和每个 bucket 的 Snapshot ID。
 
-`BulkLoadBeginResult` 包含持久状态。`isBuildRequired()` 为 `true` 时，结果同时携带
-`BulkLoadBuildContext`；该上下文包含冻结的 `TableInfo`、bucket 路由规则、remote data
-directory、transaction handle 和每个 bucket 的 Snapshot ID。已经进入持久提交决定的恢复流程
-由 Client 完成，调用方收到终态结果后无需重新构建。
+如果 Begin 的结果未知，调用方以 physical target 查询当前进行中的 transaction。查询只返回
+`BEGUN` 或 `COMMITTING`，不创建、恢复或推进 transaction。可安全放弃的 `BEGUN` transaction
+通过 handle Abort 后再发起新的 Begin；`COMMITTING` 已经包含持久提交决定，不能 Abort。
 
 每个 `BulkLoadBucketWriter` 绑定一个 bucket 和一个本地 RocksDB 实例。`add` 重新校验
 `BulkLoadBuildContext.bucketOf(row)` 的结果。writer 完成后返回 `BulkLoadBucketFiles`，调用方
@@ -199,10 +201,11 @@ flowchart LR
     Writer --> Committer
 ```
 
-Begin operator 在运行时消费唯一 trigger，调用公共 `begin` API，并将冻结的 build context
-broadcast 给全部 Build subtasks。事务创建、目标 fence 和遗留 transaction 恢复均发生在该算子
-中，JobManager 的作业构建与 `EXPLAIN` 不产生事务副作用。若 Begin 已恢复提交中的 transaction，
-该算子完成持久决定且不输出 build context。
+Begin operator 在运行时消费唯一 trigger，先调用 `getInProgressBulkLoad`。没有进行中的
+transaction 时直接 Begin；遗留 `BEGUN` 时先 Abort，再 Begin；发现 `COMMITTING` 时明确失败，
+由持有原 committable 的标准 Sink V2 Committer 重试既有 Commit。新的 Begin 成功后，该算子把
+冻结的 build context broadcast 给全部 Build subtasks。JobManager 的作业构建与 `EXPLAIN` 不产生
+事务副作用。
 
 Build operator 有两路输入：按 Fluss bucket 分区的最终 `RowData`，以及 broadcast 的 build
 context。其 parallelism 固定为 `numBuckets`，subtask `b` 独占 bucket `b` 的 RocksDB writer；
@@ -221,9 +224,10 @@ BulkLoad 线协议复用 `AdminGateway`，API key 从版本 0 开始：
 
 | RPC | ApiKey | 请求 | 响应 |
 | --- | ---: | --- | --- |
-| `BeginBulkLoad` | 1065 | physical target、caller token、可选 build timeout | `created`、持久 status；fence 完成时携带 target info |
+| `BeginBulkLoad` | 1065 | physical target、可选 build timeout | fence 完成后的 target info |
 | `CommitBulkLoad` | 1066 | handle；首次提交携带 manifest path、length、SHA-256 | 当前持久 status |
 | `AbortBulkLoad` | 1067 | handle | `ABORTED` status |
+| `GetInProgressBulkLoad` | 1068 | physical target | 当前 `BEGUN` 或 `COMMITTING` status；不存在时为空 |
 
 Begin target info 向 Client 提供 handle、冻结的表定义与文件目录，以及按 bucket 排列的 Snapshot
 ID。Commit 的 manifest path、length 和 SHA-256 构成一个 identity：第一次 Commit 完整提供，
@@ -238,14 +242,14 @@ sequenceDiagram
     participant ZK as ZooKeeper
     participant TS as TabletServer
 
-    Caller->>Client: begin(target, submissionId)
+    Caller->>Client: begin(target)
     Client->>Coordinator: BeginBulkLoad
-    Coordinator->>ZK: 创建或恢复 transaction<br/>registration 写入 bulkLoadId 并切换为 LOADING
+    Coordinator->>ZK: 创建 transaction<br/>registration 写入 bulkLoadId 并切换为 LOADING
     Coordinator->>TS: 安装 LOADING metadata 并证明目标为空
     TS-->>Coordinator: fence confirmation
     Coordinator->>Coordinator: 复核 confirmation 与普通元数据
     Coordinator->>ZK: transaction 一次写入 snapshot_ids
-    Coordinator-->>Client: status + target info
+    Coordinator-->>Client: target info
     Client-->>Caller: BulkLoadBuildContext
 
     Caller->>Caller: 每个 bucket 构建 Snapshot S at E
@@ -275,10 +279,11 @@ sequenceDiagram
     end
 
     opt Begin result is unknown
-        Caller->>Client: retry begin(target, same submissionId)
-        Client->>Coordinator: one new BeginBulkLoad attempt
-        Coordinator->>ZK: recover the matching persisted transaction
-        Coordinator-->>Client: status + target info when fence is ready
+        Caller->>Client: getInProgressBulkLoad(target)
+        Client->>Coordinator: GetInProgressBulkLoad
+        Coordinator->>ZK: read registration pointer and exact transaction
+        Coordinator-->>Client: BEGUN / COMMITTING / empty
+        Caller->>Client: abort(BEGUN handle), then begin(target)
     end
 
     opt Commit result is unknown or retriable
@@ -288,8 +293,8 @@ sequenceDiagram
 ```
 
 每次公共 `begin` 调用只发送一次 `BeginBulkLoad` RPC，并在本次调用的 await timeout 内等待。
-调用方未取得确定结果时，以相同 `submissionId` 再次调用 `begin`；新的 RPC attempt 由
-Coordinator 按 caller identity 和 token 恢复同一持久 transaction。
+调用方未取得确定结果时，先查询 physical target。查询通过 registration 中的当前 handle 精确读取
+transaction，不扫描历史，也不改变状态。
 
 `commit` 在 Client 内部实现有界 retry loop。遇到 retriable failure 或未知结果时，它使用相同
 handle 和 manifest identity 重发 `CommitBulkLoad`，直到 RPC 返回终态或 await timeout 用尽。
@@ -334,7 +339,7 @@ checked-multi 中同时检查 registration version 和该 session fence：regist
 
 transaction 使用严格、确定性的版本化 JSON，保存以下持久事实：
 
-- handle、state、caller token、creator identity；
+- handle、state、creator identity；
 - frozen physical target、remote data directory、schema ID；
 - registration metadata path 与 version；
 - 按 bucket id 排列的 `snapshot_ids`；
@@ -349,7 +354,7 @@ manifest 验证、普通元数据注册和活跃文件保护提供 Snapshot iden
 registration 的 `bulk_load_id` 是物理目标当前 BulkLoad 所有权的唯一事实。`LOADING + id` 表示
 目标已关闭外部访问，`ACTIVE + id` 表示数据已经恢复服务但 transaction 尚未持久化终态，
 `ACTIVE + null` 表示目标没有被 BulkLoad 占用。`LOADING + null` 是非法组合。transaction 在终态
-后继续保留一段时间，以回答 Begin、Commit 和 Abort 重试。
+后继续保留一段时间，以回答 Commit 和 Abort 重试。
 
 ### 6.3 Outer manifest
 
@@ -510,8 +515,8 @@ transaction：
 - registration 已为 `ACTIVE` 的 transaction 完成最后的 terminal state 写入。
 
 terminal state 与 `ACTIVE + null` 已经原子持久化时，Coordinator 的普通启动元数据广播会发布
-当前 registration version；Begin、Commit 或 Abort 重试也会等待当前 TabletServer 实例确认该
-version 后再返回持久结果。
+当前 registration version；Commit 或 Abort 重试也会等待当前 TabletServer 实例确认该 version
+后再返回持久结果。
 
 TabletServer 的 ZooKeeper 连接在同一 session 内短暂中断时，进程内的 replica、角色和 BulkLoad
 fence 状态仍然连续。`SUSPENDED` 期间 TabletServer 关闭外部访问并使旧的在途请求失效；

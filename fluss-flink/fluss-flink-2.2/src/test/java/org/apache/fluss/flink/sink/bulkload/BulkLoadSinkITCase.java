@@ -47,9 +47,7 @@ import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.connector.sink2.CommittingSinkWriter;
 import org.apache.flink.api.connector.sink2.SinkWriter;
-import org.apache.flink.api.connector.sink2.StatefulSinkWriter;
 import org.apache.flink.api.connector.sink2.SupportsCommitter;
-import org.apache.flink.api.connector.sink2.SupportsWriterState;
 import org.apache.flink.api.java.typeutils.RowTypeInfo;
 import org.apache.flink.configuration.CoreOptions;
 import org.apache.flink.configuration.JobManagerOptions;
@@ -543,13 +541,7 @@ class BulkLoadSinkITCase {
         TableInfo tableInfo = admin.getTableInfo(target.getTablePath()).get();
         FLUSS_CLUSTER_EXTENSION.waitUntilTableReady(tableInfo.getTableId());
         BulkLoadBuildContext buildContext =
-                conn.getBulkLoadClient()
-                        .begin(
-                                target,
-                                java.util.UUID.randomUUID().toString(),
-                                null,
-                                Duration.ofMinutes(2))
-                        .getBuildContext();
+                conn.getBulkLoadClient().begin(target, null, Duration.ofMinutes(2));
         Path localWorkParent =
                 Files.createTempDirectory(taskManagerTmpParent, "bulk-load-commit-lifecycle-");
         try (BulkLoadBucketWriter bucketWriter =
@@ -560,34 +552,18 @@ class BulkLoadSinkITCase {
                     new BulkLoadCommitSink(
                             FLUSS_CLUSTER_EXTENSION.getClientConfig(), Duration.ofMinutes(2));
             assertThat(sink).isInstanceOf(SupportsCommitter.class);
-            assertThat(sink).isInstanceOf(SupportsWriterState.class);
 
             SinkWriter<BulkLoadCommittable> writer = sink.createWriter(null, null, 0);
             CommittingSinkWriter<BulkLoadCommittable, BulkLoadCommittable> committingWriter =
                     (CommittingSinkWriter<BulkLoadCommittable, BulkLoadCommittable>) writer;
-            List<BulkLoadCommittable> checkpointState;
             try {
                 writer.write(committable, null);
                 writer.flush(false);
                 assertThat(committingWriter.prepareCommit()).isEmpty();
-                checkpointState =
-                        ((StatefulSinkWriter<BulkLoadCommittable, BulkLoadCommittable>) writer)
-                                .snapshotState(1L);
+                writer.flush(true);
+                assertThat(committingWriter.prepareCommit()).containsExactly(committable);
             } finally {
                 writer.close();
-            }
-
-            StatefulSinkWriter<BulkLoadCommittable, BulkLoadCommittable> restoredWriter =
-                    sink.restoreWriter(null, checkpointState);
-            CommittingSinkWriter<BulkLoadCommittable, BulkLoadCommittable>
-                    restoredCommittingWriter =
-                            (CommittingSinkWriter<BulkLoadCommittable, BulkLoadCommittable>)
-                                    restoredWriter;
-            try {
-                restoredWriter.flush(true);
-                assertThat(restoredCommittingWriter.prepareCommit()).containsExactly(committable);
-            } finally {
-                restoredWriter.close();
             }
         } finally {
             try {
@@ -615,13 +591,7 @@ class BulkLoadSinkITCase {
         // transaction on the same target right afterwards must create a brand new one.
         PhysicalTablePath target = PhysicalTablePath.of(TablePath.of(DEFAULT_DB, "bl_explain"));
         BulkLoadBuildContext probe =
-                conn.getBulkLoadClient()
-                        .begin(
-                                target,
-                                java.util.UUID.randomUUID().toString(),
-                                null,
-                                Duration.ofMinutes(2))
-                        .getBuildContext();
+                conn.getBulkLoadClient().begin(target, null, Duration.ofMinutes(2));
         assertThat(conn.getBulkLoadClient().abort(probe.getHandle()).getState())
                 .isEqualTo(BulkLoadState.ABORTED);
     }

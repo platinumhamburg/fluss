@@ -22,14 +22,15 @@ import org.apache.fluss.client.bulkload.file.BulkLoadFileHandle;
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.exception.RetriableException;
 import org.apache.fluss.metadata.BulkLoadHandle;
-import org.apache.fluss.metadata.BulkLoadState;
 import org.apache.fluss.metadata.BulkLoadStatus;
+import org.apache.fluss.metadata.BulkLoadTargetInfo;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.rpc.RpcClient;
 
 import javax.annotation.Nullable;
 
 import java.time.Duration;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -43,12 +44,9 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * bulk-load protocol. All methods block the calling thread until the underlying request completes
  * or the caller-provided budget expires.
  *
- * <p>{@link #beginOrRecover} uses a stable caller token to recover only this submission's existing
- * transaction. An existing {@code BEGUN} transaction is returned with its original target info; an
- * existing {@code COMMITTING} or {@code COMMITTED} transaction is returned so its durable decision
- * can be completed. An existing {@code ABORTED} transaction produces an error describing that
- * persisted terminal outcome. Another submission occupying the target is rejected by the
- * Coordinator.
+ * <p>{@link #begin} issues one Begin request and returns its frozen target information. If the
+ * caller's local wait expires, the same request may still complete remotely; this driver never
+ * submits a replacement Begin request.
  *
  * <p>{@link #commitUntilReady} retries the same Commit request on {@link RetriableException} —
  * retrying is safe because a repeated commit joins the in-flight commit and awaits the same result
@@ -77,82 +75,43 @@ public final class BulkLoadTransactionDriver {
     }
 
     /**
-     * Begins a BulkLoad transaction for the target or recovers this caller's existing transaction.
+     * Begins a new BulkLoad transaction for the target.
      *
      * @param target the physical table or partition to load
-     * @param callerToken stable non-empty identity of this load submission
      * @param buildTimeout the explicit build timeout forwarded to Begin, or {@code null} to use the
      *     Coordinator's configured build timeout
      * @param overallTimeout the positive upper bound of the Begin request
-     * @return the created transaction or this caller's existing transaction
+     * @return the frozen target information of the created transaction
      * @throws TimeoutException if the overall timeout expires before a begin outcome is reached
      * @throws InterruptedException if the calling thread is interrupted while waiting
      * @throws Exception any failure of the underlying Begin, unwrapped
      */
-    public BeginBulkLoadResult beginOrRecover(
-            PhysicalTablePath target,
-            String callerToken,
-            @Nullable Duration buildTimeout,
-            Duration overallTimeout)
+    public BulkLoadTargetInfo begin(
+            PhysicalTablePath target, @Nullable Duration buildTimeout, Duration overallTimeout)
             throws Exception {
         checkNotNull(target, "BulkLoad target must not be null.");
-        checkNotNull(callerToken, "BulkLoad caller token must not be null.");
-        checkArgument(!callerToken.trim().isEmpty(), "BulkLoad caller token must not be empty.");
         checkNotNull(overallTimeout, "BulkLoad overall timeout must not be null.");
         checkArgument(
                 !overallTimeout.isNegative() && !overallTimeout.isZero(),
                 "BulkLoad overall timeout must be positive.");
 
-        BeginBulkLoadResult result;
         try {
-            result =
-                    await(
-                            beginFuture(target, callerToken, buildTimeout),
-                            overallTimeout.toMillis());
+            return await(beginFuture(target, buildTimeout), overallTimeout.toMillis());
         } catch (TimeoutException e) {
             throw beginTimeout(target, overallTimeout);
         }
-        if (result.isCreated() && result.getTargetInfo() == null) {
-            throw new IllegalStateException(
-                    "BulkLoad begin was rejected for target "
-                            + target
-                            + ": "
-                            + describe(result.getStatus()));
-        }
-        BulkLoadState state = result.getStatus().getState();
-        if (state == BulkLoadState.BEGUN) {
-            checkNotNull(
-                    result.getTargetInfo(),
-                    "Recovered BEGUN BulkLoad transaction must have target info.");
-            return result;
-        }
-        if (!result.isCreated()
-                && (state == BulkLoadState.COMMITTING || state == BulkLoadState.COMMITTED)) {
-            return result;
-        }
-        if (!result.isCreated() && state == BulkLoadState.ABORTED) {
-            throw new IllegalStateException(
-                    "BulkLoad submission already reached its terminal outcome: "
-                            + describe(result.getStatus())
-                            + '.');
-        }
-        throw new IllegalStateException(
-                "Unexpected BulkLoad Begin state " + state + " for target " + target + ".");
     }
 
     /**
-     * Resumes a transaction whose manifest identity is already durable, retrying until the target
-     * is ready or the await timeout expires.
+     * Returns the in-progress transaction for the target, if the caller may access one.
      *
-     * @param handle the transaction handle returned by Begin
-     * @param awaitTimeout the positive upper bound of the whole commit sequence
-     * @throws TimeoutException if the await timeout expires before commit is confirmed
-     * @throws InterruptedException if the calling thread is interrupted while waiting
-     * @throws Exception any non-retriable failure of the Commit request
+     * @param target the physical table or partition to inspect
+     * @return the in-progress status, or empty when no transaction is in progress
      */
-    public BulkLoadStatus commitUntilReady(BulkLoadHandle handle, Duration awaitTimeout)
+    public Optional<BulkLoadStatus> getInProgressBulkLoad(PhysicalTablePath target)
             throws Exception {
-        return commitUntilReadyInternal(handle, null, awaitTimeout);
+        checkNotNull(target, "BulkLoad target must not be null.");
+        return await(rpcClient.getInProgressBulkLoad(target));
     }
 
     /**
@@ -174,15 +133,7 @@ public final class BulkLoadTransactionDriver {
     public BulkLoadStatus commitUntilReady(
             BulkLoadHandle handle, BulkLoadFileHandle manifest, Duration awaitTimeout)
             throws Exception {
-        return commitUntilReadyInternal(
-                handle,
-                checkNotNull(manifest, "BulkLoad manifest must not be null."),
-                awaitTimeout);
-    }
-
-    private BulkLoadStatus commitUntilReadyInternal(
-            BulkLoadHandle handle, @Nullable BulkLoadFileHandle manifest, Duration awaitTimeout)
-            throws Exception {
+        checkNotNull(manifest, "BulkLoad manifest must not be null.");
         checkNotNull(handle, "BulkLoad handle must not be null.");
         checkNotNull(awaitTimeout, "BulkLoad commit await timeout must not be null.");
         checkArgument(
@@ -207,11 +158,7 @@ public final class BulkLoadTransactionDriver {
                 throw timeout;
             }
             try {
-                CompletableFuture<BulkLoadStatus> commit =
-                        manifest == null
-                                ? rpcClient.commitBulkLoad(handle)
-                                : rpcClient.commitBulkLoad(handle, manifest);
-                return await(commit, remainingMs);
+                return await(rpcClient.commitBulkLoad(handle, manifest), remainingMs);
             } catch (RetriableException e) {
                 // The commit outcome is unknown: retry the same request after a
                 // short pause, bounded by the await budget.
@@ -240,11 +187,11 @@ public final class BulkLoadTransactionDriver {
         return await(rpcClient.abortBulkLoad(handle));
     }
 
-    private CompletableFuture<BeginBulkLoadResult> beginFuture(
-            PhysicalTablePath target, String callerToken, @Nullable Duration buildTimeout) {
+    private CompletableFuture<BulkLoadTargetInfo> beginFuture(
+            PhysicalTablePath target, @Nullable Duration buildTimeout) {
         return buildTimeout == null
-                ? rpcClient.beginBulkLoad(target, callerToken)
-                : rpcClient.beginBulkLoad(target, callerToken, buildTimeout);
+                ? rpcClient.beginBulkLoad(target)
+                : rpcClient.beginBulkLoad(target, buildTimeout);
     }
 
     private static TimeoutException beginTimeout(
@@ -255,17 +202,6 @@ public final class BulkLoadTransactionDriver {
                         + " did not succeed within "
                         + overallTimeout.toMillis()
                         + " ms.");
-    }
-
-    private static String describe(BulkLoadStatus status) {
-        return "state="
-                + status.getState()
-                + ", bulkLoadId="
-                + status.getHandle().getBulkLoadId()
-                + ", abortReason="
-                + status.getAbortReason()
-                + ", abortMessage="
-                + status.getAbortMessage();
     }
 
     private static long remainingMs(long deadlineNanos) {

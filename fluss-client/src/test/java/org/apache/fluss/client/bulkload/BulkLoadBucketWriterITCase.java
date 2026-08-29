@@ -39,7 +39,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Collections;
-import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import static org.apache.fluss.testutils.DataTestUtils.row;
@@ -83,13 +82,8 @@ final class BulkLoadBucketWriterITCase {
                 cluster.waitUntilTableReady(tableInfo.getTableId());
 
                 BulkLoadClient client = connection.getBulkLoadClient();
-                BulkLoadBeginResult result =
-                        client.begin(
-                                PhysicalTablePath.of(tablePath),
-                                UUID.randomUUID().toString(),
-                                null,
-                                TIMEOUT);
-                BulkLoadBuildContext context = result.getBuildContext();
+                BulkLoadBuildContext context =
+                        client.begin(PhysicalTablePath.of(tablePath), null, TIMEOUT);
                 InternalRow first = row(tableInfo.getRowType(), 1, "z");
                 InternalRow last = row(tableInfo.getRowType(), 1, "a");
                 Path workDirectory = Files.createTempDirectory("fluss-bulkload-last-row-wins-");

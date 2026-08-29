@@ -34,9 +34,12 @@ import org.apache.fluss.rpc.messages.AbortBulkLoadRequest;
 import org.apache.fluss.rpc.messages.BeginBulkLoadRequest;
 import org.apache.fluss.rpc.messages.BeginBulkLoadResponse;
 import org.apache.fluss.rpc.messages.CommitBulkLoadRequest;
+import org.apache.fluss.rpc.messages.GetInProgressBulkLoadRequest;
+import org.apache.fluss.rpc.messages.GetInProgressBulkLoadResponse;
 import org.apache.fluss.rpc.messages.PbBulkLoadStatus;
 
 import java.time.Duration;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
@@ -70,37 +73,51 @@ final class BulkLoadRpcClient {
     }
 
     /** Begins a BulkLoad transaction using the Coordinator's configured build timeout. */
-    CompletableFuture<BeginBulkLoadResult> beginBulkLoad(
-            PhysicalTablePath target, String callerToken) {
+    CompletableFuture<BulkLoadTargetInfo> beginBulkLoad(PhysicalTablePath target) {
         PhysicalTablePath validatedTarget = validateBulkLoadTarget(target);
         BeginBulkLoadRequest request =
-                new BeginBulkLoadRequest()
-                        .setTarget(toPbPhysicalTablePath(validatedTarget))
-                        .setCallerToken(validateCallerToken(callerToken));
+                new BeginBulkLoadRequest().setTarget(toPbPhysicalTablePath(validatedTarget));
         return gateway.beginBulkLoad(request)
                 .thenApply(
                         response ->
                                 convertBulkLoadResponse(
                                         "Begin",
-                                        () -> toBeginBulkLoadResult(response, validatedTarget)));
+                                        () ->
+                                                toMatchingBulkLoadTargetInfo(
+                                                        response, validatedTarget)));
     }
 
     /** Begins a BulkLoad transaction using the supplied build timeout. */
-    CompletableFuture<BeginBulkLoadResult> beginBulkLoad(
-            PhysicalTablePath target, String callerToken, Duration buildTimeout) {
+    CompletableFuture<BulkLoadTargetInfo> beginBulkLoad(
+            PhysicalTablePath target, Duration buildTimeout) {
         PhysicalTablePath validatedTarget = validateBulkLoadTarget(target);
         long buildTimeoutMs = validateBuildTimeout(buildTimeout);
         BeginBulkLoadRequest request =
                 new BeginBulkLoadRequest()
                         .setTarget(toPbPhysicalTablePath(validatedTarget))
-                        .setCallerToken(validateCallerToken(callerToken))
                         .setBuildTimeoutMs(buildTimeoutMs);
         return gateway.beginBulkLoad(request)
                 .thenApply(
                         response ->
                                 convertBulkLoadResponse(
                                         "Begin",
-                                        () -> toBeginBulkLoadResult(response, validatedTarget)));
+                                        () ->
+                                                toMatchingBulkLoadTargetInfo(
+                                                        response, validatedTarget)));
+    }
+
+    /** Gets the in-progress BulkLoad transaction for the target, if one is visible. */
+    CompletableFuture<Optional<BulkLoadStatus>> getInProgressBulkLoad(PhysicalTablePath target) {
+        PhysicalTablePath validatedTarget = validateBulkLoadTarget(target);
+        GetInProgressBulkLoadRequest request =
+                new GetInProgressBulkLoadRequest()
+                        .setTarget(toPbPhysicalTablePath(validatedTarget));
+        return gateway.getInProgressBulkLoad(request)
+                .thenApply(
+                        response ->
+                                convertBulkLoadResponse(
+                                        "GetInProgress",
+                                        () -> toMatchingBulkLoadStatus(response, validatedTarget)));
     }
 
     /** Commits a BulkLoad transaction using the supplied manifest. */
@@ -114,21 +131,6 @@ final class BulkLoadRpcClient {
                         .setManifestLength(manifest.getLength())
                         .setManifestSha256(manifest.getSha256())
                         .setManifestPath(manifest.getPath());
-        return gateway.commitBulkLoad(request)
-                .thenApply(
-                        response ->
-                                convertBulkLoadResponse(
-                                        "Commit",
-                                        () ->
-                                                toMatchingBulkLoadStatus(
-                                                        response.getStatus(), validatedHandle)));
-    }
-
-    /** Resumes a BulkLoad transaction whose manifest identity is already durable. */
-    CompletableFuture<BulkLoadStatus> commitBulkLoad(BulkLoadHandle handle) {
-        BulkLoadHandle validatedHandle = validateBulkLoadHandle(handle);
-        CommitBulkLoadRequest request =
-                new CommitBulkLoadRequest().setHandle(toPbBulkLoadHandle(validatedHandle));
         return gateway.commitBulkLoad(request)
                 .thenApply(
                         response ->
@@ -163,13 +165,6 @@ final class BulkLoadRpcClient {
         } catch (RuntimeException e) {
             throw new InvalidBulkLoadRequestException("Invalid BulkLoad target.", e);
         }
-    }
-
-    private static String validateCallerToken(String callerToken) {
-        if (callerToken == null || callerToken.trim().isEmpty()) {
-            throw new InvalidBulkLoadRequestException("BulkLoad caller token must not be empty.");
-        }
-        return callerToken;
     }
 
     private static long validateBuildTimeout(Duration buildTimeout) {
@@ -221,16 +216,27 @@ final class BulkLoadRpcClient {
         }
     }
 
-    private static BeginBulkLoadResult toBeginBulkLoadResult(
+    private static BulkLoadTargetInfo toMatchingBulkLoadTargetInfo(
             BeginBulkLoadResponse response, PhysicalTablePath requestedTarget) {
-        BulkLoadStatus status = toBulkLoadStatus(response.getStatus());
-        if (!status.getHandle().getTarget().equals(requestedTarget)) {
+        BulkLoadTargetInfo targetInfo = toBulkLoadTargetInfo(response.getTargetInfo());
+        if (!targetInfo.getHandle().getTarget().equals(requestedTarget)) {
             throw new IllegalArgumentException(
                     "BulkLoad Begin response does not identify the requested target.");
         }
-        BulkLoadTargetInfo targetInfo =
-                response.hasTargetInfo() ? toBulkLoadTargetInfo(response.getTargetInfo()) : null;
-        return new BeginBulkLoadResult(response.isCreated(), status, targetInfo);
+        return targetInfo;
+    }
+
+    private static Optional<BulkLoadStatus> toMatchingBulkLoadStatus(
+            GetInProgressBulkLoadResponse response, PhysicalTablePath requestedTarget) {
+        if (!response.hasStatus()) {
+            return Optional.empty();
+        }
+        BulkLoadStatus status = toBulkLoadStatus(response.getStatus());
+        if (!status.getHandle().getTarget().equals(requestedTarget)) {
+            throw new IllegalArgumentException(
+                    "BulkLoad GetInProgress response does not identify the requested target.");
+        }
+        return Optional.of(status);
     }
 
     private static BulkLoadStatus toMatchingBulkLoadStatus(

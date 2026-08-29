@@ -20,12 +20,11 @@ package org.apache.fluss.client.bulkload;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.client.bulkload.file.BulkLoadFileHandle;
-import org.apache.fluss.client.bulkload.protocol.BeginBulkLoadResult;
 import org.apache.fluss.client.bulkload.protocol.BulkLoadTransactionDriver;
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.metadata.BulkLoadHandle;
-import org.apache.fluss.metadata.BulkLoadState;
 import org.apache.fluss.metadata.BulkLoadStatus;
+import org.apache.fluss.metadata.BulkLoadTargetInfo;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.rpc.RpcClient;
 
@@ -34,6 +33,7 @@ import javax.annotation.concurrent.ThreadSafe;
 
 import java.time.Duration;
 import java.util.Collection;
+import java.util.Optional;
 
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
@@ -43,7 +43,7 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * <p>A single process may call {@link #begin}, build every bucket with {@link
  * BulkLoadBucketWriter}, and call {@link #commit}. Distributed engines may serialize the returned
  * {@link BulkLoadBuildContext}, build buckets independently, and send the opaque {@link
- * BulkLoadBucketFiles}s to one committer. Manifest assembly and transaction recovery remain
+ * BulkLoadBucketFiles}s to one committer. Manifest assembly and exact Commit retries remain
  * internal to this client.
  *
  * <p>This client is thread-safe. Concurrent calls keep all transaction-specific state in their
@@ -68,32 +68,29 @@ public final class BulkLoadClient {
     }
 
     /**
-     * Begins or recovers this submission.
+     * Begins a new BulkLoad transaction.
      *
-     * <p>A result requiring a build contains the frozen context for producing bucket files. A
-     * result that does not require a build represents a previously decided transaction recovered to
-     * the returned persisted status.
+     * <p>A successful call always returns the frozen context for producing bucket files. If the
+     * request outcome is uncertain, use {@link #getInProgressBulkLoad} before deciding whether to
+     * retry the workflow.
      *
-     * @return the persisted status and, when building is required, its frozen build context
+     * @return the frozen build context of the newly begun transaction
      */
-    public BulkLoadBeginResult begin(
-            PhysicalTablePath target,
-            String submissionId,
-            @Nullable Duration buildTimeout,
-            Duration awaitTimeout)
+    public BulkLoadBuildContext begin(
+            PhysicalTablePath target, @Nullable Duration buildTimeout, Duration awaitTimeout)
             throws Exception {
-        BeginBulkLoadResult result =
-                driver.beginOrRecover(target, submissionId, buildTimeout, awaitTimeout);
-        if (result.getTargetInfo() != null) {
-            return new BulkLoadBeginResult(
-                    result.getStatus(), new BulkLoadBuildContext(result.getTargetInfo()));
-        }
-        if (result.getStatus().getState() == BulkLoadState.COMMITTED) {
-            return new BulkLoadBeginResult(result.getStatus(), null);
-        }
-        BulkLoadStatus status =
-                driver.commitUntilReady(result.getStatus().getHandle(), awaitTimeout);
-        return new BulkLoadBeginResult(status, null);
+        BulkLoadTargetInfo targetInfo = driver.begin(target, buildTimeout, awaitTimeout);
+        return new BulkLoadBuildContext(targetInfo);
+    }
+
+    /**
+     * Returns the accessible in-progress transaction for the target.
+     *
+     * <p>This query does not change transaction state. Terminal transactions are not returned.
+     */
+    public Optional<BulkLoadStatus> getInProgressBulkLoad(PhysicalTablePath target)
+            throws Exception {
+        return driver.getInProgressBulkLoad(target);
     }
 
     /** Publishes the manifest internally and commits all bucket results atomically. */

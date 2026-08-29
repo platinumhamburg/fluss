@@ -112,7 +112,8 @@ public enum ApiKeys {
     LIST_KV_SNAPSHOTS(1064, 0, 1, PUBLIC),
     BEGIN_BULK_LOAD(1065, 0, 0, PUBLIC),
     COMMIT_BULK_LOAD(1066, 0, 0, PUBLIC),
-    ABORT_BULK_LOAD(1067, 0, 0, PUBLIC);
+    ABORT_BULK_LOAD(1067, 0, 0, PUBLIC),
+    GET_IN_PROGRESS_BULK_LOAD(1068, 0, 0, PUBLIC);
 
     private static final Map<Integer, ApiKeys> ID_TO_TYPE =
             Arrays.stream(ApiKeys.values())

@@ -8,28 +8,26 @@
 package org.apache.fluss.server.coordinator.event;
 
 import org.apache.fluss.metadata.PhysicalTablePath;
-import org.apache.fluss.rpc.messages.BeginBulkLoadResponse;
+import org.apache.fluss.rpc.messages.GetInProgressBulkLoadResponse;
 import org.apache.fluss.security.acl.FlussPrincipal;
-
-import javax.annotation.Nullable;
 
 import java.util.concurrent.CompletableFuture;
 
-/** Event-thread request to begin a BulkLoad transaction. */
-public final class BeginBulkLoadEvent implements CoordinatorEvent {
+/** Event-thread request to get an accessible in-progress BulkLoad transaction. */
+public final class GetInProgressBulkLoadEvent implements CoordinatorEvent {
     private final PhysicalTablePath target;
-    private final @Nullable Long buildTimeoutMs;
     private final FlussPrincipal creator;
-    private final CompletableFuture<BeginBulkLoadResponse> resultFuture;
+    private final boolean canAlter;
+    private final CompletableFuture<GetInProgressBulkLoadResponse> resultFuture;
 
-    public BeginBulkLoadEvent(
+    public GetInProgressBulkLoadEvent(
             PhysicalTablePath target,
-            @Nullable Long buildTimeoutMs,
             FlussPrincipal creator,
-            CompletableFuture<BeginBulkLoadResponse> resultFuture) {
+            boolean canAlter,
+            CompletableFuture<GetInProgressBulkLoadResponse> resultFuture) {
         this.target = target;
-        this.buildTimeoutMs = buildTimeoutMs;
         this.creator = creator;
+        this.canAlter = canAlter;
         this.resultFuture = resultFuture;
     }
 
@@ -37,16 +35,15 @@ public final class BeginBulkLoadEvent implements CoordinatorEvent {
         return target;
     }
 
-    @Nullable
-    public Long getBuildTimeoutMs() {
-        return buildTimeoutMs;
-    }
-
     public FlussPrincipal getCreator() {
         return creator;
     }
 
-    public CompletableFuture<BeginBulkLoadResponse> getResultFuture() {
+    public boolean canAlter() {
+        return canAlter;
+    }
+
+    public CompletableFuture<GetInProgressBulkLoadResponse> getResultFuture() {
         return resultFuture;
     }
 }

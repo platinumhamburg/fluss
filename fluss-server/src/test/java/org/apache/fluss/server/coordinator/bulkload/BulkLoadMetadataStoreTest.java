@@ -335,7 +335,6 @@ class BulkLoadMetadataStoreTest {
                     new BulkLoadTransaction(
                             handle,
                             BulkLoadState.BEGUN,
-                            "caller-token",
                             "alice",
                             "USER",
                             remoteDataDir,
@@ -412,6 +411,7 @@ class BulkLoadMetadataStoreTest {
                                     zkClient,
                                     TestingMetricGroups.COORDINATOR_METRICS,
                                     bucket -> false));
+
             CompletableFuture<CommitBulkLoadResponse> commitFuture = new CompletableFuture<>();
             manager.process(
                     new CommitBulkLoadEvent(
@@ -613,7 +613,7 @@ class BulkLoadMetadataStoreTest {
             manager.bindTabletServerGateway(liveServer, true);
 
             uncertainZkClient.failNextCheckedMultiAndReadAfterCommit();
-            BeginBulkLoadEvent uncertainBegin = beginEvent(firstPath, "first-caller");
+            BeginBulkLoadEvent uncertainBegin = beginEvent(firstPath);
             manager.process(uncertainBegin);
             assertThat(uncertainBegin.getResultFuture()).isCompletedExceptionally();
             Versioned<TableRegistration> firstOwned =
@@ -621,7 +621,7 @@ class BulkLoadMetadataStoreTest {
             assertThat(firstOwned.getValue().dataState).isEqualTo(BulkLoadDataState.LOADING);
             assertThat(firstOwned.getValue().bulkLoadId).isNotNull();
 
-            manager.process(beginEvent(secondPath, "blocked-caller"));
+            manager.process(beginEvent(secondPath));
             Versioned<TableRegistration> blocked =
                     observed(ZkData.TableZNode.path(secondPath), ZkData.TableZNode::decode);
             assertThat(blocked.getValue().dataState).isEqualTo(BulkLoadDataState.ACTIVE);
@@ -699,7 +699,7 @@ class BulkLoadMetadataStoreTest {
             manager.process(
                     (BulkLoadAsyncResultEvent)
                             eventManager.getEvents().get(eventManager.getEvents().size() - 1));
-            manager.process(beginEvent(secondPath, "admitted-caller"));
+            manager.process(beginEvent(secondPath));
             Versioned<TableRegistration> admitted =
                     observed(ZkData.TableZNode.path(secondPath), ZkData.TableZNode::decode);
             assertThat(admitted.getValue().dataState).isEqualTo(BulkLoadDataState.LOADING);
@@ -861,10 +861,9 @@ class BulkLoadMetadataStoreTest {
         }
     }
 
-    private static BeginBulkLoadEvent beginEvent(TablePath tablePath, String callerToken) {
+    private static BeginBulkLoadEvent beginEvent(TablePath tablePath) {
         return new BeginBulkLoadEvent(
                 PhysicalTablePath.of(tablePath),
-                callerToken,
                 null,
                 new FlussPrincipal("alice", "USER"),
                 new CompletableFuture<BeginBulkLoadResponse>());
@@ -953,7 +952,6 @@ class BulkLoadMetadataStoreTest {
         return new BulkLoadTransaction(
                 handle,
                 state,
-                "caller-token",
                 "alice",
                 "USER",
                 "file:///tmp/remote",

@@ -85,6 +85,7 @@ import org.apache.fluss.server.coordinator.event.DropPartitionEvent;
 import org.apache.fluss.server.coordinator.event.DropTableEvent;
 import org.apache.fluss.server.coordinator.event.EventProcessor;
 import org.apache.fluss.server.coordinator.event.FencedCoordinatorEvent;
+import org.apache.fluss.server.coordinator.event.GetInProgressBulkLoadEvent;
 import org.apache.fluss.server.coordinator.event.ListRebalanceProgressEvent;
 import org.apache.fluss.server.coordinator.event.NewCoordinatorEvent;
 import org.apache.fluss.server.coordinator.event.NewTabletServerEvent;
@@ -764,6 +765,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
     public void process(CoordinatorEvent event) {
         if (event instanceof BeginBulkLoadEvent) {
             bulkLoadManager.process((BeginBulkLoadEvent) event);
+        } else if (event instanceof GetInProgressBulkLoadEvent) {
+            bulkLoadManager.process((GetInProgressBulkLoadEvent) event);
         } else if (event instanceof CommitBulkLoadEvent) {
             bulkLoadManager.process((CommitBulkLoadEvent) event);
         } else if (event instanceof AbortBulkLoadEvent) {

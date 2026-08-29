@@ -52,7 +52,6 @@ final class BulkLoadBuildOperator extends AbstractStreamOperator<BulkLoadCommitt
 
     private static final long serialVersionUID = 1L;
 
-    private transient boolean completedByExistingTransaction;
     private transient boolean contextInputEnded;
     private transient int bucketId;
     private transient @Nullable BulkLoadBuildContext buildContext;
@@ -89,9 +88,6 @@ final class BulkLoadBuildOperator extends AbstractStreamOperator<BulkLoadCommitt
 
     @Override
     public void processElement1(StreamRecord<RowData> element) {
-        if (completedByExistingTransaction) {
-            return;
-        }
         checkNotNull(
                         bucketWriter,
                         "The BulkLoad build operator received data before the build context.")
@@ -103,14 +99,13 @@ final class BulkLoadBuildOperator extends AbstractStreamOperator<BulkLoadCommitt
     @Override
     public void endInput(int inputId) throws Exception {
         if (inputId == 2) {
-            completedByExistingTransaction = buildContext == null;
+            checkNotNull(
+                    buildContext,
+                    "The BulkLoad context input ended before a build context arrived.");
             contextInputEnded = true;
             return;
         }
         checkState(inputId == 1, "Unknown input id %s.", inputId);
-        if (completedByExistingTransaction) {
-            return;
-        }
         BulkLoadBuildContext context =
                 checkNotNull(buildContext, "BulkLoad data ended before the build context arrived.");
         BulkLoadBucketWriter writer =

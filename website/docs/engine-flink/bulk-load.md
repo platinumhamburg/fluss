@@ -107,12 +107,11 @@ through the regular sink path.
 
 ## Transaction Model
 
-Flink users submit one batch `INSERT INTO`; Begin, Commit, Abort, and status are not separate public
-Flink operations. The connector orchestrates the load through the BulkLoad client, while the
-corresponding `FlussAdmin` methods are internal protocol details. Begin verifies that the target is
-empty, fences regular access, and returns the frozen metadata needed to build each bucket. Commit
-submits the final manifest, atomically decides the metadata change, lets ordinary replica recovery
-load the files, and restores regular access.
+Flink users submit one batch `INSERT INTO`; Begin, Commit, Abort, and status query are not separate
+Flink operations. The connector orchestrates the load through the public BulkLoad client. Begin
+verifies that the target is empty, fences regular access, and returns the frozen metadata needed to
+build each bucket. Commit submits the final manifest, atomically decides the metadata change, lets
+ordinary replica recovery load the files, and restores regular access.
 
 The Flink SQL BulkLoad path uses a Begin → Build → Committer topology. Begin establishes the
 transaction and frozen build context, parallel Build tasks produce the bucket Snapshots, and one
@@ -182,10 +181,8 @@ and uploaded and Commit is requested. Estimate the build time from the data volu
 upload bandwidth between the TaskManagers and the remote storage, and set the timeout generously;
 large imports should always set it explicitly instead of relying on the server-side default.
 
-If the deadline expires before the manifest is submitted, the server reclaims the transaction and
-lifts the fence. A restart of the same job graph retains its caller token, observes the expired
-transaction as `ABORTED`, and fails. Submit a new job graph to use a new token and begin a new
-transaction.
+If the deadline expires before the manifest is submitted, the server aborts the transaction and
+lifts the fence. A restarted job then observes no in-progress transaction and begins a new one.
 
 Be aware of the fence trade-off: from the moment the transaction begins until it terminates, the
 target table or partition is fenced and regular access to it is rejected. This is a deliberate
@@ -194,24 +191,21 @@ expected build time.
 
 ## Failure Recovery
 
-The caller token is generated when the Flink job graph is built and remains stable across restarts
-of that graph. Recovery therefore addresses the same durable transaction:
+The Begin operator queries the target before starting a transaction:
 
-- For `BEGUN`, the restarted job reuses the same transaction and frozen metadata. Local attempt
-  state is not resumed; every bucket replays its complete input and rebuilds its files.
-- For `COMMITTING` or `COMMITTED`, the job repeats the exact Commit. The request joins or confirms
-  the existing durable decision, including after Coordinator or TabletServer failover.
+- With no in-progress transaction, it begins a new transaction.
+- For `BEGUN`, it aborts the leftover transaction and begins a new one. Every bucket then replays
+  its complete input and rebuilds its files.
+- For `COMMITTING`, it fails explicitly because the durable Commit decision cannot be aborted. A
+  Sink V2 Committer that already holds the materialized committable retries the exact Commit,
+  including after Coordinator or TabletServer failover.
 - If a Commit result is unknown, the client retries that exact Commit within
-  `sink.bulk-load.await-timeout`; it does not switch to status polling.
-- For `ABORTED`, including a transaction reclaimed after its build deadline, the same token reports
-  the persisted terminal outcome and the job fails. Starting a fresh transaction requires a new
-  job graph and therefore a new token.
+  `sink.bulk-load.await-timeout`.
 
-An independently submitted `INSERT INTO` is a new load, not a retry of the earlier transaction. If
-the earlier load committed, the new load is rejected because the target is no longer empty. Within
-one load, each bucket writer keeps the last complete row it observes for a primary key. If the input
-does not define a stable order, perform any deterministic ordering or deduplication required by the
-application before BulkLoad.
+An independently submitted `INSERT INTO` is a new load. If the earlier load committed, the new load
+is rejected because the target is no longer empty. Within one load, each bucket writer keeps the
+last complete row it observes for a primary key. If the input does not define a stable order,
+perform any deterministic ordering or deduplication required by the application before BulkLoad.
 
 ## V1 Limitations
 

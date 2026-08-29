@@ -36,7 +36,7 @@ class BulkLoadMetadataTest {
 
         assertThat(new String(transactionBytes, StandardCharsets.UTF_8))
                 .isEqualTo(
-                        "{\"version\":1,\"bulk_load_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"state\":1,\"caller_token\":\"caller-token\",\"database_name\":\"db\",\"table_name\":\"table\",\"table_id\":41,\"creator_name\":\"alice\",\"creator_type\":\"USER\",\"remote_data_dir\":\"file:///warehouse\",\"schema_id\":3,\"metadata_path\":\"/metadata/db/table\",\"metadata_version\":7,\"snapshot_ids\":[17],\"created_time_ms\":100,\"updated_time_ms\":200,\"build_deadline_ms\":300,\"commit_decision_deadline_ms\":400,\"manifest_path\":\"file:///warehouse/bulkload/manifest.json\",\"manifest_length\":500,\"manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}");
+                        "{\"version\":1,\"bulk_load_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"state\":1,\"database_name\":\"db\",\"table_name\":\"table\",\"table_id\":41,\"creator_name\":\"alice\",\"creator_type\":\"USER\",\"remote_data_dir\":\"file:///warehouse\",\"schema_id\":3,\"metadata_path\":\"/metadata/db/table\",\"metadata_version\":7,\"snapshot_ids\":[17],\"created_time_ms\":100,\"updated_time_ms\":200,\"build_deadline_ms\":300,\"commit_decision_deadline_ms\":400,\"manifest_path\":\"file:///warehouse/bulkload/manifest.json\",\"manifest_length\":500,\"manifest_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}");
         assertThat(ZkData.BulkLoadTableTransactionZNode.decode(transactionBytes))
                 .isEqualTo(transaction);
     }
@@ -176,7 +176,6 @@ class BulkLoadMetadataTest {
                         null,
                         "550e8400-e29b-41d4-a716-446655440000"),
                 state,
-                "caller-token",
                 "alice",
                 "USER",
                 "file:///warehouse",

@@ -43,7 +43,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
@@ -66,8 +65,7 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  *
  * <ul>
  *   <li>{@link BulkLoadBeginOperator} runs at parallelism one on a single trigger element and
- *       broadcasts the frozen build context to every Build subtask, or completes the broadcast
- *       empty after recovering a leftover transaction;
+ *       broadcasts exactly one frozen build context to every Build subtask;
  *   <li>the data edge is partitioned by the Fluss bucket id: the key selector computes the bucket
  *       full-schema row once and routes bucket {@code b} directly to subtask {@code b};
  *   <li>{@link BulkLoadBuildOperator} runs at the bucket count, owns one RocksDB, and emits one
@@ -130,7 +128,6 @@ public final class BulkLoadSinkTopology {
         PhysicalTablePath target = physicalTarget(tablePath, partitionKeys, staticPartitionValues);
 
         StreamExecutionEnvironment env = dataStream.getExecutionEnvironment();
-        String callerToken = UUID.randomUUID().toString();
         // Exactly one trigger element: fromElements is a non-parallel source, and the begin
         // operator contract requires exactly one trigger per operator instance anyway.
         DataStream<BulkLoadBuildContext> buildContextStream =
@@ -139,11 +136,7 @@ public final class BulkLoadSinkTopology {
                                 "BulkLoadBegin(" + target + ")",
                                 TypeInformation.of(BulkLoadBuildContext.class),
                                 new BulkLoadBeginOperator(
-                                        flussConfig,
-                                        target,
-                                        callerToken,
-                                        buildTimeout,
-                                        awaitTimeout))
+                                        flussConfig, target, buildTimeout, awaitTimeout))
                         .setParallelism(1);
 
         org.apache.fluss.types.RowType flussRowType = FlinkConversions.toFlussRowType(tableRowType);

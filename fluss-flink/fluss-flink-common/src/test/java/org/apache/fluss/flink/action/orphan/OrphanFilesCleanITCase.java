@@ -183,13 +183,7 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
 
         BulkLoadClient bulkLoadClient = connection.getBulkLoadClient();
         BulkLoadBuildContext buildContext =
-                bulkLoadClient
-                        .begin(
-                                PhysicalTablePath.of(tablePath),
-                                java.util.UUID.randomUUID().toString(),
-                                null,
-                                Duration.ofMinutes(2))
-                        .getBuildContext();
+                bulkLoadClient.begin(PhysicalTablePath.of(tablePath), null, Duration.ofMinutes(2));
         BulkLoadHandle handle = buildContext.getHandle();
         Path workDirectory = Files.createTempDirectory("fluss-bulkload-orphan-clean-");
         KeyEncoder bucketKeyEncoder =

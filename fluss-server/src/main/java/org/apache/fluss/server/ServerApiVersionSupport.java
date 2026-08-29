@@ -38,7 +38,11 @@ import java.util.Set;
 public final class ServerApiVersionSupport {
 
     private static final Set<ApiKeys> REQUIRED_COORDINATOR_BULK_LOAD_APIS =
-            EnumSet.of(ApiKeys.BEGIN_BULK_LOAD, ApiKeys.COMMIT_BULK_LOAD, ApiKeys.ABORT_BULK_LOAD);
+            EnumSet.of(
+                    ApiKeys.BEGIN_BULK_LOAD,
+                    ApiKeys.COMMIT_BULK_LOAD,
+                    ApiKeys.ABORT_BULK_LOAD,
+                    ApiKeys.GET_IN_PROGRESS_BULK_LOAD);
 
     private static final Set<ApiKeys> REQUIRED_TABLET_BULK_LOAD_APIS =
             EnumSet.of(

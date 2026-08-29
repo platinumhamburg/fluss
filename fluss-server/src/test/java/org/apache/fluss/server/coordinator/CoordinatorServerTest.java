@@ -96,7 +96,8 @@ class CoordinatorServerTest extends ServerTestBase {
                 .contains(
                         ApiKeys.BEGIN_BULK_LOAD.id,
                         ApiKeys.COMMIT_BULK_LOAD.id,
-                        ApiKeys.ABORT_BULK_LOAD.id)
+                        ApiKeys.ABORT_BULK_LOAD.id,
+                        ApiKeys.GET_IN_PROGRESS_BULK_LOAD.id)
                 .doesNotContain(
                         ApiKeys.UPDATE_METADATA.id,
                         ApiKeys.NOTIFY_LEADER_AND_ISR.id,

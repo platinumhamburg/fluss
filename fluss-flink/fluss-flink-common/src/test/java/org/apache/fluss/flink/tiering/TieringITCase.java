@@ -22,7 +22,6 @@ import org.apache.fluss.bucketing.BucketingFunction;
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
 import org.apache.fluss.client.admin.Admin;
-import org.apache.fluss.client.bulkload.BulkLoadBeginResult;
 import org.apache.fluss.client.bulkload.BulkLoadBucketFiles;
 import org.apache.fluss.client.bulkload.BulkLoadBucketWriter;
 import org.apache.fluss.client.bulkload.BulkLoadBuildContext;
@@ -287,20 +286,15 @@ abstract class TieringITCase extends FlinkTieringTestBase {
                         true)
                 .get(BULKLOAD_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
 
-        String callerToken = java.util.UUID.randomUUID().toString();
         BulkLoadBuildContext buildContext =
                 waitValue(
                         () -> {
                             try {
-                                BulkLoadBeginResult result =
+                                return Optional.of(
                                         bulkLoadClient.begin(
                                                 PhysicalTablePath.of(tablePath),
-                                                callerToken,
                                                 null,
-                                                BULKLOAD_TIMEOUT);
-                                return result.isBuildRequired()
-                                        ? Optional.of(result.getBuildContext())
-                                        : Optional.empty();
+                                                BULKLOAD_TIMEOUT));
                             } catch (Exception failure) {
                                 Throwable cause = ExceptionUtils.stripExecutionException(failure);
                                 if (cause instanceof org.apache.fluss.exception.TimeoutException) {

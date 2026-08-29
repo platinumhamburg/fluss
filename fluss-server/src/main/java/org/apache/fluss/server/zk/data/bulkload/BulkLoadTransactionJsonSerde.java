@@ -38,7 +38,6 @@ public final class BulkLoadTransactionJsonSerde
     private static final String VERSION_KEY = "version";
     private static final String BULK_LOAD_ID = "bulk_load_id";
     private static final String STATE = "state";
-    private static final String CALLER_TOKEN = "caller_token";
     private static final String DATABASE_NAME = "database_name";
     private static final String TABLE_NAME = "table_name";
     private static final String PARTITION_NAME = "partition_name";
@@ -79,7 +78,6 @@ public final class BulkLoadTransactionJsonSerde
                     VERSION_KEY,
                     BULK_LOAD_ID,
                     STATE,
-                    CALLER_TOKEN,
                     DATABASE_NAME,
                     TABLE_NAME,
                     PARTITION_NAME,
@@ -110,7 +108,6 @@ public final class BulkLoadTransactionJsonSerde
         generator.writeNumberField(VERSION_KEY, VERSION);
         generator.writeStringField(BULK_LOAD_ID, transaction.getBulkLoadId());
         generator.writeNumberField(STATE, transaction.getState().getCode());
-        generator.writeStringField(CALLER_TOKEN, transaction.getCallerToken());
         generator.writeStringField(DATABASE_NAME, transaction.getDatabaseName());
         generator.writeStringField(TABLE_NAME, transaction.getTableName());
         if (transaction.getPartitionName() != null) {
@@ -176,7 +173,6 @@ public final class BulkLoadTransactionJsonSerde
         return new BulkLoadTransaction(
                 handle,
                 BulkLoadState.fromCode(requiredInt(node, STATE)),
-                requiredString(node, CALLER_TOKEN),
                 requiredString(node, CREATOR_NAME),
                 requiredString(node, CREATOR_TYPE),
                 requiredString(node, REMOTE_DATA_DIR),

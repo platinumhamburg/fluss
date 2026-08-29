@@ -30,6 +30,8 @@ import org.apache.fluss.rpc.messages.BeginBulkLoadRequest;
 import org.apache.fluss.rpc.messages.BeginBulkLoadResponse;
 import org.apache.fluss.rpc.messages.CommitBulkLoadRequest;
 import org.apache.fluss.rpc.messages.CommitBulkLoadResponse;
+import org.apache.fluss.rpc.messages.GetInProgressBulkLoadRequest;
+import org.apache.fluss.rpc.messages.GetInProgressBulkLoadResponse;
 import org.apache.fluss.rpc.messages.PbApiVersion;
 import org.apache.fluss.rpc.messages.PbBulkLoadHandle;
 import org.apache.fluss.rpc.messages.PbBulkLoadStatus;
@@ -177,7 +179,10 @@ class MessageCodecTest {
         assertThat(messages)
                 .extracting(message -> message.api)
                 .containsExactly(
-                        ApiKeys.BEGIN_BULK_LOAD, ApiKeys.COMMIT_BULK_LOAD, ApiKeys.ABORT_BULK_LOAD);
+                        ApiKeys.BEGIN_BULK_LOAD,
+                        ApiKeys.COMMIT_BULK_LOAD,
+                        ApiKeys.ABORT_BULK_LOAD,
+                        ApiKeys.GET_IN_PROGRESS_BULK_LOAD);
 
         int requestId = 2000;
         for (MessagePair message : messages) {
@@ -241,12 +246,8 @@ class MessageCodecTest {
                         ApiKeys.BEGIN_BULK_LOAD,
                         new BeginBulkLoadRequest()
                                 .setTarget(physicalPath())
-                                .setCallerToken("caller-token")
                                 .setBuildTimeoutMs(30_000L),
-                        new BeginBulkLoadResponse()
-                                .setCreated(true)
-                                .setStatus(status())
-                                .setTargetInfo(targetInfo())),
+                        new BeginBulkLoadResponse().setTargetInfo(targetInfo())),
                 new MessagePair(
                         ApiKeys.COMMIT_BULK_LOAD,
                         new CommitBulkLoadRequest()
@@ -258,7 +259,11 @@ class MessageCodecTest {
                 new MessagePair(
                         ApiKeys.ABORT_BULK_LOAD,
                         new AbortBulkLoadRequest().setHandle(handle()),
-                        new AbortBulkLoadResponse().setStatus(status())));
+                        new AbortBulkLoadResponse().setStatus(status())),
+                new MessagePair(
+                        ApiKeys.GET_IN_PROGRESS_BULK_LOAD,
+                        new GetInProgressBulkLoadRequest().setTarget(physicalPath()),
+                        new GetInProgressBulkLoadResponse().setStatus(status())));
     }
 
     private static PbPhysicalTablePath physicalPath() {

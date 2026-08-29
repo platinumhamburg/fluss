@@ -35,7 +35,6 @@ public final class BulkLoadTransaction {
 
     private final BulkLoadHandle handle;
     private final BulkLoadState state;
-    private final String callerToken;
     private final String creatorName;
     private final String creatorType;
     private final String remoteDataDir;
@@ -58,7 +57,6 @@ public final class BulkLoadTransaction {
     public BulkLoadTransaction(
             BulkLoadHandle handle,
             BulkLoadState state,
-            String callerToken,
             String creatorName,
             String creatorType,
             String remoteDataDir,
@@ -78,8 +76,6 @@ public final class BulkLoadTransaction {
             @Nullable String abortMessage) {
         this.handle = checkNotNull(handle, "BulkLoad handle must not be null.");
         this.state = checkNotNull(state, "BulkLoad state must not be null.");
-        this.callerToken = checkNotNull(callerToken, "BulkLoad caller token must not be null.");
-        checkArgument(!callerToken.trim().isEmpty(), "BulkLoad caller token must not be empty.");
         this.creatorName = checkNotNull(creatorName, "BulkLoad creator name must not be null.");
         this.creatorType = checkNotNull(creatorType, "BulkLoad creator type must not be null.");
         this.remoteDataDir =
@@ -171,10 +167,6 @@ public final class BulkLoadTransaction {
 
     public BulkLoadState getState() {
         return state;
-    }
-
-    public String getCallerToken() {
-        return callerToken;
     }
 
     public String getDatabaseName() {
@@ -296,7 +288,6 @@ public final class BulkLoadTransaction {
                 && buildDeadlineMs == that.buildDeadlineMs
                 && Objects.equals(handle, that.handle)
                 && state == that.state
-                && Objects.equals(callerToken, that.callerToken)
                 && Objects.equals(creatorName, that.creatorName)
                 && Objects.equals(creatorType, that.creatorType)
                 && Objects.equals(remoteDataDir, that.remoteDataDir)
@@ -316,7 +307,6 @@ public final class BulkLoadTransaction {
                 Objects.hash(
                         handle,
                         state,
-                        callerToken,
                         creatorName,
                         creatorType,
                         remoteDataDir,

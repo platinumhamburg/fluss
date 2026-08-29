@@ -30,10 +30,7 @@ import org.apache.flink.api.connector.sink2.Committer;
 import org.apache.flink.api.connector.sink2.CommitterInitContext;
 import org.apache.flink.api.connector.sink2.CommittingSinkWriter;
 import org.apache.flink.api.connector.sink2.SinkWriter;
-import org.apache.flink.api.connector.sink2.StatefulSinkWriter;
 import org.apache.flink.api.connector.sink2.SupportsCommitter;
-import org.apache.flink.api.connector.sink2.SupportsWriterState;
-import org.apache.flink.api.connector.sink2.WriterInitContext;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.flink.metrics.groups.SinkWriterMetricGroup;
 
@@ -50,8 +47,7 @@ import static org.apache.fluss.utils.Preconditions.checkState;
 
 /** Terminal sink that hands all bucket files to Flink's standard committer at end of input. */
 final class BulkLoadCommitSink extends SinkAdapter<BulkLoadCommittable>
-        implements SupportsCommitter<BulkLoadCommittable>,
-                SupportsWriterState<BulkLoadCommittable, BulkLoadCommittable> {
+        implements SupportsCommitter<BulkLoadCommittable> {
 
     private static final long serialVersionUID = 1L;
 
@@ -69,18 +65,7 @@ final class BulkLoadCommitSink extends SinkAdapter<BulkLoadCommittable>
     @Override
     protected SinkWriter<BulkLoadCommittable> createWriter(
             MailboxExecutor mailboxExecutor, SinkWriterMetricGroup metricGroup, int subtaskIndex) {
-        return new CommitWriter(Collections.emptyList());
-    }
-
-    @Override
-    public StatefulSinkWriter<BulkLoadCommittable, BulkLoadCommittable> restoreWriter(
-            WriterInitContext context, Collection<BulkLoadCommittable> recoveredState) {
-        return new CommitWriter(recoveredState);
-    }
-
-    @Override
-    public SimpleVersionedSerializer<BulkLoadCommittable> getWriterStateSerializer() {
-        return new BulkLoadCommittableSerializer();
+        return new CommitWriter();
     }
 
     @Override
@@ -94,15 +79,10 @@ final class BulkLoadCommitSink extends SinkAdapter<BulkLoadCommittable>
     }
 
     private static final class CommitWriter
-            implements CommittingSinkWriter<BulkLoadCommittable, BulkLoadCommittable>,
-                    StatefulSinkWriter<BulkLoadCommittable, BulkLoadCommittable> {
+            implements CommittingSinkWriter<BulkLoadCommittable, BulkLoadCommittable> {
 
-        private final List<BulkLoadCommittable> committables;
+        private final List<BulkLoadCommittable> committables = new ArrayList<>();
         private boolean endOfInput;
-
-        private CommitWriter(Collection<BulkLoadCommittable> recoveredState) {
-            this.committables = new ArrayList<>(recoveredState);
-        }
 
         @Override
         public void write(BulkLoadCommittable committable, Context context) {
@@ -122,11 +102,6 @@ final class BulkLoadCommitSink extends SinkAdapter<BulkLoadCommittable>
             List<BulkLoadCommittable> prepared = new ArrayList<>(committables);
             committables.clear();
             return prepared;
-        }
-
-        @Override
-        public List<BulkLoadCommittable> snapshotState(long checkpointId) {
-            return new ArrayList<>(committables);
         }
 
         @Override

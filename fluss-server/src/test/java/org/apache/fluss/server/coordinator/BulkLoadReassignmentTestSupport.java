@@ -223,7 +223,6 @@ final class BulkLoadReassignmentTestSupport {
         return new BulkLoadTransaction(
                 handle,
                 state,
-                "caller-token",
                 "alice",
                 "USER",
                 "file:///tmp",
