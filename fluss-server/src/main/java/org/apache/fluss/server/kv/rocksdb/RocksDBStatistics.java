@@ -19,16 +19,16 @@ package org.apache.fluss.server.kv.rocksdb;
 
 import org.apache.fluss.server.utils.ResourceGuard;
 
-import org.fluss.rocksdb.Cache;
-import org.fluss.rocksdb.ColumnFamilyHandle;
-import org.fluss.rocksdb.HistogramData;
-import org.fluss.rocksdb.HistogramType;
-import org.fluss.rocksdb.MemoryUsageType;
-import org.fluss.rocksdb.MemoryUtil;
-import org.fluss.rocksdb.RocksDB;
-import org.fluss.rocksdb.RocksDBException;
-import org.fluss.rocksdb.Statistics;
-import org.fluss.rocksdb.TickerType;
+import io.github.fluss_contrib.rocksdb.Cache;
+import io.github.fluss_contrib.rocksdb.ColumnFamilyHandle;
+import io.github.fluss_contrib.rocksdb.HistogramData;
+import io.github.fluss_contrib.rocksdb.HistogramType;
+import io.github.fluss_contrib.rocksdb.MemoryUsageType;
+import io.github.fluss_contrib.rocksdb.MemoryUtil;
+import io.github.fluss_contrib.rocksdb.RocksDB;
+import io.github.fluss_contrib.rocksdb.RocksDBException;
+import io.github.fluss_contrib.rocksdb.Statistics;
+import io.github.fluss_contrib.rocksdb.TickerType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

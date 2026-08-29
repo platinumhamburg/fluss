@@ -20,7 +20,7 @@ package org.apache.fluss.server.kv.rocksdb;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.utils.IOUtils;
 
-import org.fluss.rocksdb.RocksDB;
+import io.github.fluss_contrib.rocksdb.RocksDB;
 import org.junit.jupiter.api.extension.AfterEachCallback;
 import org.junit.jupiter.api.extension.BeforeEachCallback;
 import org.junit.jupiter.api.extension.ExtensionContext;

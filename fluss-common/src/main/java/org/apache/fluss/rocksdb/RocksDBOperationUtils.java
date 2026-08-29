@@ -20,12 +20,12 @@ package org.apache.fluss.rocksdb;
 import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.OperatingSystem;
 
-import org.fluss.rocksdb.ColumnFamilyDescriptor;
-import org.fluss.rocksdb.ColumnFamilyHandle;
-import org.fluss.rocksdb.ColumnFamilyOptions;
-import org.fluss.rocksdb.DBOptions;
-import org.fluss.rocksdb.RocksDB;
-import org.fluss.rocksdb.RocksDBException;
+import io.github.fluss_contrib.rocksdb.ColumnFamilyDescriptor;
+import io.github.fluss_contrib.rocksdb.ColumnFamilyHandle;
+import io.github.fluss_contrib.rocksdb.ColumnFamilyOptions;
+import io.github.fluss_contrib.rocksdb.DBOptions;
+import io.github.fluss_contrib.rocksdb.RocksDB;
+import io.github.fluss_contrib.rocksdb.RocksDBException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
