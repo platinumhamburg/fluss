@@ -24,7 +24,7 @@ import org.apache.fluss.server.exception.KvBuildingException;
 import org.apache.fluss.server.kv.RowTtlCompactionFilterFactory;
 import org.apache.fluss.utils.clock.ManualClock;
 
-import org.fluss.rocksdb.FlussTtlCompactionFilter;
+import io.github.fluss_contrib.rocksdb.FlussTtlCompactionFilter;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 

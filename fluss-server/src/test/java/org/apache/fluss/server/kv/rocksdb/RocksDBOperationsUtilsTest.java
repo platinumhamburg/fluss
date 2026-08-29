@@ -19,11 +19,11 @@ package org.apache.fluss.server.kv.rocksdb;
 
 import org.apache.fluss.rocksdb.RocksDBOperationUtils;
 
-import org.fluss.rocksdb.ColumnFamilyDescriptor;
-import org.fluss.rocksdb.ColumnFamilyOptions;
-import org.fluss.rocksdb.DBOptions;
-import org.fluss.rocksdb.RocksDB;
-import org.fluss.rocksdb.RocksDBException;
+import io.github.fluss_contrib.rocksdb.ColumnFamilyDescriptor;
+import io.github.fluss_contrib.rocksdb.ColumnFamilyOptions;
+import io.github.fluss_contrib.rocksdb.DBOptions;
+import io.github.fluss_contrib.rocksdb.RocksDB;
+import io.github.fluss_contrib.rocksdb.RocksDBException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 

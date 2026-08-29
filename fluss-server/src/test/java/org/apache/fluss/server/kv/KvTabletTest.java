@@ -87,8 +87,8 @@ import org.apache.fluss.utils.clock.ManualClock;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.FlussScheduler;
 
-import org.fluss.rocksdb.FlushOptions;
-import org.fluss.rocksdb.RocksDBException;
+import io.github.fluss_contrib.rocksdb.FlushOptions;
+import io.github.fluss_contrib.rocksdb.RocksDBException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -2278,7 +2278,7 @@ class KvTabletTest {
         assertThat(statistics).as("RocksDB statistics should be available").isNotNull();
 
         // Verify statistics is properly initialized
-        org.fluss.rocksdb.Statistics stats = kvTablet.getRocksDBKv().getStatistics();
+        io.github.fluss_contrib.rocksdb.Statistics stats = kvTablet.getRocksDBKv().getStatistics();
         assertThat(stats).as("RocksDB Statistics should be enabled").isNotNull();
 
         // All metrics should start at 0 for a fresh database

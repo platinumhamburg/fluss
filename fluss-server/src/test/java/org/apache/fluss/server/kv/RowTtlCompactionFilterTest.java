@@ -25,10 +25,10 @@ import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.row.encode.ValueEncoder;
 import org.apache.fluss.utils.clock.ManualClock;
 
-import org.fluss.rocksdb.ColumnFamilyOptions;
-import org.fluss.rocksdb.DBOptions;
-import org.fluss.rocksdb.FlushOptions;
-import org.fluss.rocksdb.FlussTtlCompactionFilter;
+import io.github.fluss_contrib.rocksdb.ColumnFamilyOptions;
+import io.github.fluss_contrib.rocksdb.DBOptions;
+import io.github.fluss_contrib.rocksdb.FlushOptions;
+import io.github.fluss_contrib.rocksdb.FlussTtlCompactionFilter;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 

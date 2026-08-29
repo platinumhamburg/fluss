@@ -28,7 +28,7 @@ import org.apache.fluss.server.utils.TestProcessBuilder;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.FlussPaths;
 
-import org.fluss.rocksdb.RocksDB;
+import io.github.fluss_contrib.rocksdb.RocksDB;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;

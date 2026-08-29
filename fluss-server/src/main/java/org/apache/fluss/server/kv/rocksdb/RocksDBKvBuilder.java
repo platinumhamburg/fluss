@@ -24,12 +24,12 @@ import org.apache.fluss.server.utils.ResourceGuard;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.IOUtils;
 
-import org.fluss.rocksdb.AbstractCompactionFilter;
-import org.fluss.rocksdb.AbstractCompactionFilterFactory;
-import org.fluss.rocksdb.ColumnFamilyHandle;
-import org.fluss.rocksdb.ColumnFamilyOptions;
-import org.fluss.rocksdb.NativeLibraryLoader;
-import org.fluss.rocksdb.RocksDB;
+import io.github.fluss_contrib.rocksdb.AbstractCompactionFilter;
+import io.github.fluss_contrib.rocksdb.AbstractCompactionFilterFactory;
+import io.github.fluss_contrib.rocksdb.ColumnFamilyHandle;
+import io.github.fluss_contrib.rocksdb.ColumnFamilyOptions;
+import io.github.fluss_contrib.rocksdb.NativeLibraryLoader;
+import io.github.fluss_contrib.rocksdb.RocksDB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

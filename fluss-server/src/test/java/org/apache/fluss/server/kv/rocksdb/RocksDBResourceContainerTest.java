@@ -20,16 +20,16 @@ package org.apache.fluss.server.kv.rocksdb;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 
-import org.fluss.rocksdb.BlockBasedTableConfig;
-import org.fluss.rocksdb.BloomFilter;
-import org.fluss.rocksdb.ColumnFamilyOptions;
-import org.fluss.rocksdb.CompactionStyle;
-import org.fluss.rocksdb.CompressionType;
-import org.fluss.rocksdb.DBOptions;
-import org.fluss.rocksdb.InfoLogLevel;
-import org.fluss.rocksdb.ReadOptions;
-import org.fluss.rocksdb.WriteOptions;
-import org.fluss.rocksdb.util.SizeUnit;
+import io.github.fluss_contrib.rocksdb.BlockBasedTableConfig;
+import io.github.fluss_contrib.rocksdb.BloomFilter;
+import io.github.fluss_contrib.rocksdb.ColumnFamilyOptions;
+import io.github.fluss_contrib.rocksdb.CompactionStyle;
+import io.github.fluss_contrib.rocksdb.CompressionType;
+import io.github.fluss_contrib.rocksdb.DBOptions;
+import io.github.fluss_contrib.rocksdb.InfoLogLevel;
+import io.github.fluss_contrib.rocksdb.ReadOptions;
+import io.github.fluss_contrib.rocksdb.WriteOptions;
+import io.github.fluss_contrib.rocksdb.util.SizeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 

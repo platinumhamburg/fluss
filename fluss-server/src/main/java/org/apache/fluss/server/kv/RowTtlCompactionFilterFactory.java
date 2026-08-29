@@ -22,8 +22,8 @@ import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.server.utils.RowTtlUtils;
 import org.apache.fluss.utils.clock.Clock;
 
-import org.fluss.rocksdb.FlussTtlCompactionFilter;
-import org.fluss.rocksdb.RocksDB;
+import io.github.fluss_contrib.rocksdb.FlussTtlCompactionFilter;
+import io.github.fluss_contrib.rocksdb.RocksDB;
 
 import java.time.Duration;
 
