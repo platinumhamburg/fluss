@@ -24,10 +24,10 @@ import org.apache.fluss.server.kv.rocksdb.RocksDBKv;
 import org.apache.fluss.server.utils.ResourceGuard;
 import org.apache.fluss.utils.IOUtils;
 
-import org.fluss.rocksdb.ReadOptions;
-import org.fluss.rocksdb.RocksDBException;
-import org.fluss.rocksdb.RocksIterator;
-import org.fluss.rocksdb.Snapshot;
+import io.github.fluss_contrib.rocksdb.ReadOptions;
+import io.github.fluss_contrib.rocksdb.RocksDBException;
+import io.github.fluss_contrib.rocksdb.RocksIterator;
+import io.github.fluss_contrib.rocksdb.Snapshot;
 
 import javax.annotation.concurrent.NotThreadSafe;
 

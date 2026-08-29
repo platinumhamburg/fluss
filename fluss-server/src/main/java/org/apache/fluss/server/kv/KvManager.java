@@ -54,12 +54,12 @@ import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.function.SupplierWithException;
 import org.apache.fluss.utils.types.Tuple2;
 
-import org.fluss.rocksdb.Cache;
-import org.fluss.rocksdb.LRUCache;
-import org.fluss.rocksdb.RateLimiter;
-import org.fluss.rocksdb.RateLimiterMode;
-import org.fluss.rocksdb.RocksDB;
-import org.fluss.rocksdb.WriteBufferManager;
+import io.github.fluss_contrib.rocksdb.Cache;
+import io.github.fluss_contrib.rocksdb.LRUCache;
+import io.github.fluss_contrib.rocksdb.RateLimiter;
+import io.github.fluss_contrib.rocksdb.RateLimiterMode;
+import io.github.fluss_contrib.rocksdb.RocksDB;
+import io.github.fluss_contrib.rocksdb.WriteBufferManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
