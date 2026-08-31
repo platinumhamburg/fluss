@@ -183,7 +183,8 @@ public final class AuditLogger {
                         .flag("coverage_complete", stats.coverageComplete())
                         .flag("counters_consistent", stats.countersConsistent())
                         .flag("action_required", !stats.coverageComplete()),
-                "action=scope_plan databases={} tables={} partitions={} discovered_buckets={}"
+                "audit_version=1 stage=scope action=scope_plan databases={} tables={}"
+                        + " partitions={} discovered_buckets={}"
                         + " bucket_tasks={} orphan_dir_tasks={} skipped_no_remote_manifest={}"
                         + " skipped_empty_kv_active_set={} skipped_out_of_scope_root={}"
                         + " metadata_failures={} scope_targets={} target_buckets={}"
@@ -1120,7 +1121,8 @@ public final class AuditLogger {
                         .metric("delete_failures", counters.deleteFailures())
                         .metric("bytes_reclaimed", counters.bytesReclaimed())
                         .flag("dry_run", dryRun),
-                "action=summary scanned={} planned_files={} planned_dirs={} planned_bytes={}"
+                "audit_version=1 stage=summary action=summary scanned={} planned_files={}"
+                        + " planned_dirs={} planned_bytes={}"
                         + " deleted_total={} deleted_files={} empty_dirs_removed={}"
                         + " delete_failures={} bytes_reclaimed={} dry_run={}",
                 counters.scannedFiles(),
@@ -1204,7 +1206,8 @@ public final class AuditLogger {
                         .flag("physical_scan_complete", physicalScanComplete)
                         .flag("action_required", !coverageComplete)
                         .flag("dry_run", dryRun),
-                "action=coverage_summary no_remote_manifest_targets={}"
+                "audit_version=1 stage=summary action=coverage_summary"
+                        + " no_remote_manifest_targets={}"
                         + " empty_active_set_targets={} metadata_read_failed_targets={}"
                         + " directory_list_failed_targets={} rpc_failed_targets={}"
                         + " disappeared_targets={}"
@@ -1238,7 +1241,8 @@ public final class AuditLogger {
                         .flag("coverage_complete", summary.coverageComplete())
                         .flag("dry_run_counters_consistent", summary.dryRunCountersConsistent())
                         .flag("dry_run", summary.dryRun()),
-                "action=audit_integrity scope_counters_consistent={}"
+                "audit_version=1 stage=summary action=audit_integrity"
+                        + " scope_counters_consistent={}"
                         + " rule_counters_consistent={} counters_consistent={} coverage_complete={}"
                         + " dry_run_counters_consistent={} inconsistent_object_types={}"
                         + " inconsistent_scopes={} incomplete_scope_targets={} dry_run={}",
@@ -1367,7 +1371,8 @@ public final class AuditLogger {
                         .flag("all_scanned_newer_than_cutoff", allScannedNewerThanCutoff)
                         .flag("all_scanned_keep_active", allScannedKeepActive)
                         .flag("dry_run", dryRun),
-                "action={} {} scanned_files={} scanned_bytes={} keep_active_files={}"
+                "audit_version=1 stage=summary action={} {} scanned_files={} scanned_bytes={}"
+                        + " keep_active_files={}"
                         + " keep_active_bytes={} newer_than_cutoff_files={}"
                         + " newer_than_cutoff_bytes={} mtime_unavailable_files={}"
                         + " mtime_unavailable_bytes={} unknown_file_type_files={}"

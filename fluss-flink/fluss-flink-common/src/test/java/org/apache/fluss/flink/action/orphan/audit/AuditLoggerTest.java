@@ -187,7 +187,8 @@ class AuditLoggerTest {
 
             harness.assertEmission(
                     expected(
-                                    "action=scope_plan databases=1 tables=2 partitions=3"
+                                    "audit_version=1 stage=scope action=scope_plan"
+                                            + " databases=1 tables=2 partitions=3"
                                             + " discovered_buckets=4 bucket_tasks=5"
                                             + " orphan_dir_tasks=6 skipped_no_remote_manifest=7"
                                             + " skipped_empty_kv_active_set=8"
@@ -730,7 +731,8 @@ class AuditLoggerTest {
 
             harness.assertEmission(
                     expected(
-                                    "action=summary scanned=20 planned_files=7 planned_dirs=2"
+                                    "audit_version=1 stage=summary action=summary scanned=20"
+                                            + " planned_files=7 planned_dirs=2"
                                             + " planned_bytes=123 deleted_total=5 deleted_files=3"
                                             + " empty_dirs_removed=2 delete_failures=1"
                                             + " bytes_reclaimed=99 dry_run=true",
@@ -753,13 +755,14 @@ class AuditLoggerTest {
 
             harness.assertEmission(
                     expected(
-                                    ruleSummaryLegacy(
-                                            "table_rule_summary",
-                                            "database=db table=orders table_id=7"
-                                                    + " object_type=log_segment",
-                                            CleanupObjectType.LOG_SEGMENT,
-                                            counters,
-                                            true),
+                                    "audit_version=1 stage=summary "
+                                            + ruleSummaryLegacy(
+                                                    "table_rule_summary",
+                                                    "database=db table=orders table_id=7"
+                                                            + " object_type=log_segment",
+                                                    CleanupObjectType.LOG_SEGMENT,
+                                                    counters,
+                                                    true),
                                     AuditSeverity.INFO,
                                     AuditStage.SUMMARY,
                                     "table_rule_summary")
@@ -773,12 +776,13 @@ class AuditLoggerTest {
 
             harness.assertEmission(
                     expected(
-                                    ruleSummaryLegacy(
-                                            "summary_by_rule",
-                                            "scope=global object_type=kv_shared_sst",
-                                            CleanupObjectType.KV_SHARED_SST,
-                                            counters,
-                                            false),
+                                    "audit_version=1 stage=summary "
+                                            + ruleSummaryLegacy(
+                                                    "summary_by_rule",
+                                                    "scope=global object_type=kv_shared_sst",
+                                                    CleanupObjectType.KV_SHARED_SST,
+                                                    counters,
+                                                    false),
                                     AuditSeverity.INFO,
                                     AuditStage.SUMMARY,
                                     "summary_by_rule")
@@ -792,7 +796,8 @@ class AuditLoggerTest {
 
             harness.assertEmission(
                     expected(
-                                    "action=coverage_summary no_remote_manifest_targets=2"
+                                    "audit_version=1 stage=summary action=coverage_summary"
+                                            + " no_remote_manifest_targets=2"
                                             + " empty_active_set_targets=3"
                                             + " metadata_read_failed_targets=4"
                                             + " directory_list_failed_targets=5"
@@ -822,7 +827,8 @@ class AuditLoggerTest {
 
             harness.assertEmission(
                     expected(
-                                    "action=audit_integrity scope_counters_consistent="
+                                    "audit_version=1 stage=summary action=audit_integrity"
+                                            + " scope_counters_consistent="
                                             + integritySummary.scopeCountersConsistent()
                                             + " rule_counters_consistent="
                                             + integritySummary.ruleCountersConsistent()
@@ -1063,12 +1069,13 @@ class AuditLoggerTest {
         try (ParityHarness harness = new ParityHarness(AuditStage.SUMMARY, null, null, null)) {
             harness.assertEmission(
                     expected(
-                                    ruleSummaryLegacy(
-                                            "summary_by_rule",
-                                            "scope=global object_type=log_segment",
-                                            CleanupObjectType.LOG_SEGMENT,
-                                            allNewer,
-                                            true),
+                                    "audit_version=1 stage=summary "
+                                            + ruleSummaryLegacy(
+                                                    "summary_by_rule",
+                                                    "scope=global object_type=log_segment",
+                                                    CleanupObjectType.LOG_SEGMENT,
+                                                    allNewer,
+                                                    true),
                                     AuditSeverity.INFO,
                                     AuditStage.SUMMARY,
                                     "summary_by_rule")
