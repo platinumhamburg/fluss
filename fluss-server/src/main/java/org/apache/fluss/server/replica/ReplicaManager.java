@@ -1787,7 +1787,17 @@ public class ReplicaManager implements ServerReconfigurable {
                 }
                 limitBytes = Math.max(0, limitBytes - recordBatchSize);
                 FetchLogResultForBucket fetchLogResult;
-                if (fetchedData.hasFilteredEndOffset()) {
+                if (readInfo.hasMinRetainOffset()) {
+                    fetchLogResult =
+                            new FetchLogResultForBucket(
+                                    tb,
+                                    fetchedData.getRecords(),
+                                    readInfo.getHighWatermark(),
+                                    fetchedData.hasFilteredEndOffset()
+                                            ? fetchedData.getFilteredEndOffset()
+                                            : -1L,
+                                    readInfo.getMinRetainOffset());
+                } else if (fetchedData.hasFilteredEndOffset()) {
                     fetchLogResult =
                             new FetchLogResultForBucket(
                                     tb,

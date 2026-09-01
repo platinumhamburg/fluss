@@ -344,6 +344,11 @@ final class ReplicaFetcherThread extends ShutdownableThread {
                 }
             }
 
+            Replica replica = replicaManager.getReplicaOrException(tableBucket);
+            if (replica.isKvTable() && replicaData.hasMinRetainOffset()) {
+                replica.getLogTablet().updateMinRetainOffset(replicaData.getMinRetainOffset());
+            }
+
             if (nextFetchOffset != -1L && fairBucketStatusMap.contains(tableBucket)) {
                 BucketFetchStatus newFetchStatus =
                         new BucketFetchStatus(

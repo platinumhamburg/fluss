@@ -242,6 +242,11 @@ public class CommonRpcMessageUtils {
             }
         }
 
+        if (!fetchLogResultForBucket.failed() && respForBucket.hasMinRetainOffset()) {
+            fetchLogResultForBucket =
+                    fetchLogResultForBucket.withMinRetainOffset(respForBucket.getMinRetainOffset());
+        }
+
         return fetchLogResultForBucket;
     }
 
