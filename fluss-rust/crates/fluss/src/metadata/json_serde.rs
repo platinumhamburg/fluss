@@ -543,6 +543,23 @@ impl JsonSerde for Schema {
             }
         }
 
+        if let Some(highest_field_id_node) = node.get(Self::HIGHEST_FIELD_ID) {
+            let highest_field_id =
+                highest_field_id_node
+                    .as_i64()
+                    .ok_or_else(|| Error::JsonSerdeError {
+                        message: format!("{} must be an integer", Self::HIGHEST_FIELD_ID),
+                    })?;
+            let highest_field_id =
+                i32::try_from(highest_field_id).map_err(|_| Error::JsonSerdeError {
+                    message: format!(
+                        "{} value {highest_field_id} does not fit in i32",
+                        Self::HIGHEST_FIELD_ID
+                    ),
+                })?;
+            schema_builder = schema_builder.highest_field_id(highest_field_id);
+        }
+
         schema_builder.build()
     }
 }
@@ -982,6 +999,44 @@ mod tests {
             vec![0, 1],
         );
         assert_eq!(round_tripped, original);
+    }
+
+    #[test]
+    fn schema_deserialization_preserves_highest_field_id_above_maximum() {
+        let json = json!({
+            "version": 1,
+            "columns": [
+                {"name": "id", "data_type": {"type": "INTEGER"}, "id": 0},
+                {"name": "name", "data_type": {"type": "STRING"}, "id": 1}
+            ],
+            "highest_field_id": 10
+        });
+
+        let schema = Schema::deserialize_json(&json).unwrap();
+        assert_eq!(schema.highest_field_id(), 10);
+    }
+
+    #[test]
+    fn schema_deserialization_clamps_highest_field_id_to_computed_minimum() {
+        let json = json!({
+            "version": 1,
+            "columns": [
+                {"name": "id", "data_type": {"type": "INTEGER"}, "id": 0},
+                {"name": "name", "data_type": {"type": "STRING"}, "id": 1}
+            ],
+            "highest_field_id": 0
+        });
+
+        let schema = Schema::deserialize_json(&json).unwrap();
+        assert_eq!(schema.highest_field_id(), 1);
+
+        let empty_json = json!({
+            "version": 1,
+            "columns": [],
+            "highest_field_id": -3
+        });
+        let empty_schema = Schema::deserialize_json(&empty_json).unwrap();
+        assert_eq!(empty_schema.highest_field_id(), -1);
     }
 
     #[test]
