@@ -527,7 +527,7 @@ impl JsonSerde for Schema {
                 );
             }
 
-            schema_builder = schema_builder.primary_key(primary_keys);
+            schema_builder = schema_builder.primary_key(primary_keys)?;
         }
 
         if let Some(auto_increment_node) = node.get(Self::AUTO_INCREMENT_COLUMN_NAME) {
@@ -780,6 +780,7 @@ mod tests {
             .column("id", DataTypes::int())
             .column("seq", DataTypes::bigint())
             .primary_key(["id"])
+            .unwrap()
             .enable_auto_increment("seq")
             .unwrap()
             .build()
@@ -806,6 +807,7 @@ mod tests {
         let schema = Schema::builder()
             .column("id", DataTypes::int())
             .primary_key(["id"])
+            .unwrap()
             .build()
             .unwrap();
 

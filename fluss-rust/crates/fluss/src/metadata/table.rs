@@ -292,7 +292,7 @@ impl SchemaBuilder {
         self
     }
 
-    pub fn primary_key<I, S>(self, column_names: I) -> Self
+    pub fn primary_key<I, S>(self, column_names: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -308,12 +308,18 @@ impl SchemaBuilder {
         mut self,
         constraint_name: N,
         column_names: Vec<P>,
-    ) -> Self {
+    ) -> Result<Self> {
+        if self.primary_key.is_some() {
+            return Err(IllegalArgument {
+                message: "Multiple primary keys are not supported.".to_string(),
+            });
+        }
+
         self.primary_key = Some(PrimaryKey::new(
             constraint_name.into(),
             column_names.into_iter().map(|s| s.into()).collect(),
         ));
-        self
+        Ok(self)
     }
 
     /// Declares a column to be auto-incremented. With an auto-increment column in the table,
@@ -540,6 +546,19 @@ impl SchemaBuilder {
         let Some(pk) = primary_key else {
             return Ok(columns.to_vec());
         };
+
+        if pk.column_names.is_empty() {
+            return Err(Error::invalid_table(
+                "Primary key constraint must be defined for at least a single column.",
+            ));
+        }
+
+        let primary_key_names: Vec<_> = pk.column_names.iter().collect();
+        if let Some(duplicates) = Self::find_duplicates(&primary_key_names) {
+            return Err(Error::invalid_table(format!(
+                "Primary key constraint must not contain duplicate columns. Found: {duplicates:?}"
+            )));
+        }
 
         let pk_set: HashSet<_> = pk.column_names.iter().collect();
         let all_columns: HashSet<_> = columns.iter().map(|c| &c.name).collect();
@@ -1665,6 +1684,48 @@ mod tests {
     use crate::metadata::DataTypes;
 
     #[test]
+    fn invalid_primary_keys_are_rejected() {
+        for (primary_keys, expected_message) in [
+            (
+                Vec::<&str>::new(),
+                "Primary key constraint must be defined for at least a single column.",
+            ),
+            (
+                vec!["id", "id"],
+                "Primary key constraint must not contain duplicate columns.",
+            ),
+        ] {
+            let err = Schema::builder()
+                .column("id", DataTypes::int())
+                .primary_key(primary_keys)
+                .unwrap()
+                .build()
+                .unwrap_err();
+
+            assert!(
+                err.to_string().contains(expected_message),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_primary_keys_are_rejected() {
+        let err = Schema::builder()
+            .column("id", DataTypes::int())
+            .primary_key(["id"])
+            .unwrap()
+            .primary_key_named("another_pk", vec!["id"])
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Multiple primary keys are not supported."),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn auto_increment_column_requires_a_primary_key_table() {
         let err = Schema::builder()
             .column("id", DataTypes::int())
@@ -1686,6 +1747,7 @@ mod tests {
             .column("id", DataTypes::bigint())
             .column("name", DataTypes::string())
             .primary_key(["id"])
+            .unwrap()
             .enable_auto_increment("id")
             .unwrap()
             .build()
@@ -1703,6 +1765,7 @@ mod tests {
             .column("id", DataTypes::int())
             .column("seq", DataTypes::string())
             .primary_key(["id"])
+            .unwrap()
             .enable_auto_increment("seq")
             .unwrap()
             .build()
@@ -1718,6 +1781,7 @@ mod tests {
                 .column("id", DataTypes::int())
                 .column("seq", accepted)
                 .primary_key(["id"])
+                .unwrap()
                 .enable_auto_increment("seq")
                 .unwrap()
                 .build()
@@ -1783,6 +1847,7 @@ mod tests {
             .column("id", DataTypes::int())
             .column("name", DataTypes::string())
             .primary_key(vec!["id".to_string()])
+            .unwrap()
             .build()
             .unwrap();
 
