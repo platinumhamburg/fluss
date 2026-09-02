@@ -81,6 +81,18 @@ public class BucketMetadata {
         return replicas;
     }
 
+    /**
+     * Returns the in-sync replicas (ISR) for this bucket.
+     *
+     * <p>An empty list has no presence semantics by itself: it can represent legacy metadata that
+     * did not carry authoritative ISR information, a known absence of leader/ISR state, or an
+     * authoritative state whose ISR is empty. Callers that need to distinguish these cases must
+     * also inspect {@link #getBucketEpoch()}: {@code null} means legacy metadata, {@link
+     * #NO_LEADER_ISR_STATE_EPOCH} means that no leader/ISR state exists, and any other value is the
+     * generation of an authoritative leader/ISR state.
+     *
+     * @return the immutable ISR list
+     */
     public List<Integer> getIsr() {
         return isr;
     }
