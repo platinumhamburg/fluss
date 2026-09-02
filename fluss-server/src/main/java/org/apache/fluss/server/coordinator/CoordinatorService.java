@@ -50,6 +50,7 @@ import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DatabaseChange;
 import org.apache.fluss.metadata.DatabaseDescriptor;
 import org.apache.fluss.metadata.DeleteBehavior;
+import org.apache.fluss.metadata.LakeTableUtil;
 import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
@@ -518,13 +519,17 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
 
         // before create table in fluss, we may create in lake
         if (isDataLakeEnabled(tableDescriptor)) {
+            TablePath lakeTablePath =
+                    LakeTableUtil.resolveLakeTablePath(
+                            tablePath, Configuration.fromMap(tableDescriptor.getProperties()));
             try {
                 checkNotNull(lakeCatalogContainer.getLakeCatalog())
                         .createTable(
-                                tablePath,
+                                lakeTablePath,
                                 tableDescriptor,
                                 new DefaultLakeCatalogContext(
                                         true,
+                                        null,
                                         currentSession().getPrincipal(),
                                         null,
                                         tableDescriptor));
@@ -1684,16 +1689,19 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     static class DefaultLakeCatalogContext implements LakeCatalog.Context {
 
         private final boolean isCreatingFlussTable;
+        @Nullable private final TablePath currentLakeTablePath;
         private final FlussPrincipal flussPrincipal;
         @Nullable private final TableDescriptor currentTable;
         private final TableDescriptor expectedTable;
 
         public DefaultLakeCatalogContext(
                 boolean isCreatingFlussTable,
+                @Nullable TablePath currentLakeTablePath,
                 FlussPrincipal flussPrincipal,
                 @Nullable TableDescriptor currentTable,
                 TableDescriptor expectedTable) {
             this.isCreatingFlussTable = isCreatingFlussTable;
+            this.currentLakeTablePath = currentLakeTablePath;
             this.flussPrincipal = flussPrincipal;
             if (!isCreatingFlussTable) {
                 checkNotNull(
@@ -1717,6 +1725,12 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         @Override
         public TableDescriptor getCurrentTable() {
             return currentTable;
+        }
+
+        @Nullable
+        @Override
+        public TablePath getCurrentLakeTablePath() {
+            return currentLakeTablePath;
         }
 
         @Override
