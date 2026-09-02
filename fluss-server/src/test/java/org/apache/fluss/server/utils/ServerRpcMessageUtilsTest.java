@@ -27,16 +27,16 @@ import org.apache.fluss.rpc.entity.LookupResultForBucket;
 import org.apache.fluss.rpc.entity.PutKvResultForBucket;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
 import org.apache.fluss.rpc.messages.LookupResponse;
-import org.apache.fluss.rpc.messages.PbFetchLogRespForBucket;
 import org.apache.fluss.rpc.messages.PbBucketMetadata;
+import org.apache.fluss.rpc.messages.PbFetchLogRespForBucket;
 import org.apache.fluss.rpc.messages.PbPartitionMetadata;
 import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
 import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
 import org.apache.fluss.rpc.messages.PbTableMetadata;
 import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.messages.PutKvResponse;
-import org.apache.fluss.rpc.util.CommonRpcMessageUtils;
 import org.apache.fluss.rpc.messages.UpdateMetadataRequest;
+import org.apache.fluss.rpc.util.CommonRpcMessageUtils;
 import org.apache.fluss.server.entity.PutKvDataForBucket;
 import org.apache.fluss.server.metadata.BucketMetadata;
 import org.apache.fluss.server.metadata.ClusterMetadata;
@@ -66,7 +66,7 @@ class ServerRpcMessageUtilsTest {
     void testFetchLogResponseContainsMinRetainOffset() {
         TableBucket tableBucket = new TableBucket(1L, 0);
         FetchLogResultForBucket result =
-                new FetchLogResultForBucket(tableBucket, MemoryLogRecords.EMPTY, 10L, -1L, 8L);
+                FetchLogResultForBucket.records(tableBucket, MemoryLogRecords.EMPTY, 10L, -1L, 8L);
 
         FetchLogResponse response =
                 ServerRpcMessageUtils.makeFetchLogResponse(
@@ -87,8 +87,8 @@ class ServerRpcMessageUtilsTest {
                 ServerRpcMessageUtils.makeFetchLogResponse(
                         Collections.singletonMap(
                                 tableBucket,
-                                new FetchLogResultForBucket(
-                                        tableBucket, MemoryLogRecords.EMPTY, 10L)));
+                                FetchLogResultForBucket.records(
+                                        tableBucket, MemoryLogRecords.EMPTY, 10L, -1L, -1L)));
         PbFetchLogRespForBucket bucketResponseWithoutMinRetainOffset =
                 responseWithoutMinRetainOffset
                         .getTablesRespsList()

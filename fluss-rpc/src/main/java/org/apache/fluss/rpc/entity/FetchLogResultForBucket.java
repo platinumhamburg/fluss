@@ -39,76 +39,6 @@ public class FetchLogResultForBucket extends ResultForBucket {
     private final long filteredEndOffset;
     private final long minRetainOffset;
 
-    public FetchLogResultForBucket(
-            TableBucket tableBucket, LogRecords records, long highWatermark) {
-        this(
-                tableBucket,
-                null,
-                checkNotNull(records, "records can not be null"),
-                highWatermark,
-                -1L,
-                -1L,
-                ApiError.NONE);
-    }
-
-    public FetchLogResultForBucket(
-            TableBucket tableBucket,
-            LogRecords records,
-            long highWatermark,
-            long filteredEndOffset) {
-        this(
-                tableBucket,
-                null,
-                checkNotNull(records, "records can not be null"),
-                highWatermark,
-                filteredEndOffset,
-                -1L,
-                ApiError.NONE);
-    }
-
-    /** Creates a successful local fetch result carrying the KV snapshot retention boundary. */
-    public FetchLogResultForBucket(
-            TableBucket tableBucket,
-            LogRecords records,
-            long highWatermark,
-            long filteredEndOffset,
-            long minRetainOffset) {
-        this(
-                tableBucket,
-                null,
-                checkNotNull(records, "records can not be null"),
-                highWatermark,
-                filteredEndOffset,
-                checkMinRetainOffset(minRetainOffset),
-                ApiError.NONE);
-    }
-
-    public FetchLogResultForBucket(TableBucket tableBucket, ApiError error) {
-        this(tableBucket, null, null, -1L, -1L, -1L, error);
-    }
-
-    public FetchLogResultForBucket(
-            TableBucket tableBucket, RemoteLogFetchInfo remoteLogFetchInfo, long highWatermark) {
-        this(
-                tableBucket,
-                checkNotNull(remoteLogFetchInfo, "remote log fetch info can not be null"),
-                null,
-                highWatermark,
-                -1L,
-                -1L,
-                ApiError.NONE);
-    }
-
-    /**
-     * Create a filtered empty response with the correct next fetch offset. This is used when all
-     * batches are filtered out but we need to inform the client about the correct offset to
-     * continue fetching from.
-     */
-    public FetchLogResultForBucket(
-            TableBucket tableBucket, long highWatermark, long filteredEndOffset) {
-        this(tableBucket, null, null, highWatermark, filteredEndOffset, -1L, ApiError.NONE);
-    }
-
     private FetchLogResultForBucket(
             TableBucket tableBucket,
             @Nullable RemoteLogFetchInfo remoteLogFetchInfo,
@@ -125,21 +55,47 @@ public class FetchLogResultForBucket extends ResultForBucket {
         this.minRetainOffset = minRetainOffset;
     }
 
-    /** Returns a successful fetch result carrying the KV snapshot retention boundary. */
-    public FetchLogResultForBucket withMinRetainOffset(long minRetainOffset) {
-        checkArgument(minRetainOffset >= 0, "Min retain offset must be non-negative.");
-        if (failed()) {
-            throw new IllegalStateException(
-                    "Min retain offset cannot be attached to a failed fetch result.");
-        }
+    /** Creates a successful local fetch result. */
+    public static FetchLogResultForBucket records(
+            TableBucket tableBucket,
+            LogRecords records,
+            long highWatermark,
+            long filteredEndOffset,
+            long minRetainOffset) {
+        checkArgument(minRetainOffset >= -1L, "Min retain offset must be at least -1.");
         return new FetchLogResultForBucket(
-                getTableBucket(),
-                remoteLogFetchInfo,
-                records,
+                tableBucket,
+                null,
+                checkNotNull(records, "records can not be null"),
                 highWatermark,
                 filteredEndOffset,
                 minRetainOffset,
                 ApiError.NONE);
+    }
+
+    /** Creates a successful remote fetch result. */
+    public static FetchLogResultForBucket remote(
+            TableBucket tableBucket, RemoteLogFetchInfo remoteLogFetchInfo, long highWatermark) {
+        return new FetchLogResultForBucket(
+                tableBucket,
+                checkNotNull(remoteLogFetchInfo, "remote log fetch info can not be null"),
+                null,
+                highWatermark,
+                -1L,
+                -1L,
+                ApiError.NONE);
+    }
+
+    /** Creates a successful empty fetch result. */
+    public static FetchLogResultForBucket empty(
+            TableBucket tableBucket, long highWatermark, long filteredEndOffset) {
+        return new FetchLogResultForBucket(
+                tableBucket, null, null, highWatermark, filteredEndOffset, -1L, ApiError.NONE);
+    }
+
+    /** Creates a failed fetch result. */
+    public static FetchLogResultForBucket error(TableBucket tableBucket, ApiError error) {
+        return new FetchLogResultForBucket(tableBucket, null, null, -1L, -1L, -1L, error);
     }
 
     /**
@@ -196,11 +152,6 @@ public class FetchLogResultForBucket extends ResultForBucket {
 
     /** Returns the KV snapshot retention boundary included in this fetch result. */
     public long getMinRetainOffset() {
-        return minRetainOffset;
-    }
-
-    private static long checkMinRetainOffset(long minRetainOffset) {
-        checkArgument(minRetainOffset >= 0, "Min retain offset must be non-negative.");
         return minRetainOffset;
     }
 }

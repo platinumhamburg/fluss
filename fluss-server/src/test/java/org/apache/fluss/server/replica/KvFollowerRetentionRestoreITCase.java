@@ -29,6 +29,7 @@ import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.utils.clock.ManualClock;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -48,11 +49,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 /** IT case for restoring a follower's KV log retention boundary after restart. */
 class KvFollowerRetentionRestoreITCase {
 
+    private static final Duration LOG_TTL = Duration.ofHours(1);
+    private static final ManualClock MANUAL_CLOCK = new ManualClock(System.currentTimeMillis());
+
     @RegisterExtension
     public static final FlussClusterExtension FLUSS_CLUSTER_EXTENSION =
             FlussClusterExtension.builder()
                     .setNumOfTabletServers(2)
                     .setClusterConf(initConfig())
+                    .setClock(MANUAL_CLOCK)
                     .build();
 
     @Test
@@ -62,7 +67,7 @@ class KvFollowerRetentionRestoreITCase {
                 TableDescriptor.builder()
                         .schema(DATA1_SCHEMA_PK)
                         .distributedBy(1, "a")
-                        .property(ConfigOptions.TABLE_LOG_TTL, Duration.ofMillis(1))
+                        .property(ConfigOptions.TABLE_LOG_TTL, LOG_TTL)
                         .build();
         long tableId = createTable(FLUSS_CLUSTER_EXTENSION, tablePath, tableDescriptor);
         TableBucket tableBucket = new TableBucket(tableId, 0);
@@ -103,10 +108,9 @@ class KvFollowerRetentionRestoreITCase {
                     assertThat(followerReplica.getLocalLogEndOffset()).isEqualTo(logEndOffset);
                     assertThat(followerReplica.getLogTablet().getHighWatermark())
                             .isEqualTo(logEndOffset);
-                    assertThat(followerReplica.getLogTablet().getSegments().size())
-                            .isGreaterThan(1);
+                    assertThat(followerReplica.getLogTablet().getMinRetainOffset()).isZero();
+                    assertThat(followerReplica.getLogTablet().getSegments().size()).isEqualTo(4);
                 });
-        int segmentsBeforeRestart = followerReplica.getLogTablet().getSegments().size();
 
         // The stopped follower misses the snapshot notification that advances minRetainOffset.
         FLUSS_CLUSTER_EXTENSION.stopTabletServer(follower);
@@ -118,6 +122,7 @@ class KvFollowerRetentionRestoreITCase {
                 () ->
                         assertThat(leaderReplica.getLogTablet().getMinRetainOffset())
                                 .isEqualTo(logEndOffset));
+        MANUAL_CLOCK.advanceTime(LOG_TTL.plusMillis(1));
 
         // Do not write after the snapshot. The restarted follower must recover the retention
         // boundary from a successful empty fetch response.
@@ -131,8 +136,9 @@ class KvFollowerRetentionRestoreITCase {
                     assertThat(restartedFollower.getLocalLogEndOffset()).isEqualTo(logEndOffset);
                     assertThat(restartedFollower.getLogTablet().getMinRetainOffset())
                             .isEqualTo(logEndOffset);
-                    assertThat(restartedFollower.getLogTablet().getSegments().size())
-                            .isLessThan(segmentsBeforeRestart);
+                    // since minRetainOffset is equal to logEndOffset, the follower should have
+                    // cleaned up all segments except the last one.
+                    assertThat(restartedFollower.getLogTablet().getSegments().size()).isEqualTo(1);
                     assertThat(restartedFollower.getLocalLogStartOffset()).isPositive();
                 });
         assertThat(leaderReplica.getLocalLogEndOffset()).isEqualTo(logEndOffset);

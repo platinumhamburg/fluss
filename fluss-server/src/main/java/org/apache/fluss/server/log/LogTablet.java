@@ -672,6 +672,16 @@ public final class LogTablet {
         }
     }
 
+    /**
+     * Advances the minimum retain offset monotonically.
+     *
+     * <p>Updates may arrive concurrently from replica recovery, coordinator snapshot notifications,
+     * and follower fetch processing, while log cleanup reads the value from a different thread.
+     * {@link AtomicLong} provides cross-thread visibility and makes the check-and-update atomic.
+     * The CAS loop implements a monotonic maximum: if another updater changes the value after it
+     * was read, the loop reloads the latest value and retries only when this update is still
+     * larger. This prevents a delayed, smaller offset from overwriting a newer retention boundary.
+     */
     public void updateMinRetainOffset(long minRetainOffset) {
         long currentMinRetainOffset = this.minRetainOffset.get();
         while (minRetainOffset > currentMinRetainOffset) {

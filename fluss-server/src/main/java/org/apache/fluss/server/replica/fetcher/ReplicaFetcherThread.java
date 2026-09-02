@@ -344,6 +344,9 @@ final class ReplicaFetcherThread extends ShutdownableThread {
                 }
             }
 
+            // Propagate the leader's KV snapshot retention boundary to the follower even when the
+            // successful response contains no records, so obsolete local log segments can be
+            // cleaned up.
             Replica replica = replicaManager.getReplicaOrException(tableBucket);
             if (replica.isKvTable() && replicaData.hasMinRetainOffset()) {
                 replica.getLogTablet().updateMinRetainOffset(replicaData.getMinRetainOffset());

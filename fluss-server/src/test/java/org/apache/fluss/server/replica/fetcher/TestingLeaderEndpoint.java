@@ -207,18 +207,17 @@ public class TestingLeaderEndpoint implements LeaderEndpoint {
                         ByteBuffer buffer = ByteBuffer.allocate(fileRecords.sizeInBytes());
                         unchecked(() -> fileRecords.readInto(buffer, 0)).run();
                         MemoryLogRecords memRecords = MemoryLogRecords.pointToByteBuffer(buffer);
+                        long filteredEndOffset =
+                                value.hasFilteredEndOffset() ? value.getFilteredEndOffset() : -1L;
+                        long minRetainOffset =
+                                value.hasMinRetainOffset() ? value.getMinRetainOffset() : -1L;
                         FetchLogResultForBucket memoryResult =
-                                value.hasMinRetainOffset()
-                                        ? new FetchLogResultForBucket(
-                                                tb,
-                                                memRecords,
-                                                value.getHighWatermark(),
-                                                value.hasFilteredEndOffset()
-                                                        ? value.getFilteredEndOffset()
-                                                        : -1L,
-                                                value.getMinRetainOffset())
-                                        : new FetchLogResultForBucket(
-                                                tb, memRecords, value.getHighWatermark());
+                                FetchLogResultForBucket.records(
+                                        tb,
+                                        memRecords,
+                                        value.getHighWatermark(),
+                                        filteredEndOffset,
+                                        minRetainOffset);
                         result.put(tb, memoryResult);
                     } else {
                         result.put(tb, value);
