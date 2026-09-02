@@ -650,6 +650,15 @@ public class ServerRpcMessageUtils {
                 pbBucketMetadata.addReplicaId(replica);
             }
 
+            Integer bucketEpoch = bucketMetadata.getBucketEpoch();
+            if (bucketEpoch != null) {
+                pbBucketMetadata.setBucketEpoch(bucketEpoch);
+            }
+
+            for (Integer isrId : bucketMetadata.getIsr()) {
+                pbBucketMetadata.addIsr(isrId);
+            }
+
             pbBucketMetadataList.add(pbBucketMetadata);
         }
         return pbBucketMetadataList;
@@ -690,7 +699,9 @@ public class ServerRpcMessageUtils {
                 pbBucketMetadata.hasLeaderEpoch() ? pbBucketMetadata.getLeaderEpoch() : null,
                 Arrays.stream(pbBucketMetadata.getReplicaIds())
                         .boxed()
-                        .collect(Collectors.toList()));
+                        .collect(Collectors.toList()),
+                Arrays.stream(pbBucketMetadata.getIsrs()).boxed().collect(Collectors.toList()),
+                pbBucketMetadata.hasBucketEpoch() ? pbBucketMetadata.getBucketEpoch() : null);
     }
 
     private static PartitionMetadata toPartitionMetadata(PbPartitionMetadata pbPartitionMetadata) {

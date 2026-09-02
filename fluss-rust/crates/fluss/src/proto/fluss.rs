@@ -1153,9 +1153,14 @@ pub struct PbBucketMetadata {
     pub leader_id: ::core::option::Option<i32>,
     #[prost(int32, repeated, tag = "3")]
     pub replica_id: ::prost::alloc::vec::Vec<i32>,
-    /// TODO: Add isr here.
     #[prost(int32, optional, tag = "4")]
     pub leader_epoch: ::core::option::Option<i32>,
+    /// Generation of the complete leader/ISR state.
+    /// Absence indicates legacy metadata; -1 indicates no leader/ISR state exists.
+    #[prost(int32, optional, tag = "5")]
+    pub bucket_epoch: ::core::option::Option<i32>,
+    #[prost(int32, repeated, tag = "6")]
+    pub isr: ::prost::alloc::vec::Vec<i32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PbProduceLogReqForBucket {
