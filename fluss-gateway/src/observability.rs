@@ -20,9 +20,11 @@
 //! [`METRIC_DEFINITIONS`] lists implemented metric families with their kinds, units, descriptions,
 //! and label sets. Families for future capabilities are added alongside their implementations.
 //!
-//! Labels describe an operation or a bounded outcome. `cluster`, sourced from validated configuration, is the
-//! only resource-name label the gateway itself emits.
+//! Family-specific labels describe an operation or a bounded outcome. `cluster`, sourced from
+//! validated configuration, is the only resource-name label the gateway itself emits. Configured
+//! process identity is attached to every family as a global label.
 
+use crate::config::ServerConfig;
 use log::{LevelFilter, Log, Metadata, Record};
 use metrics::Unit;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
@@ -51,6 +53,11 @@ impl Log for StderrLogger {
 
 static LOGGER: StderrLogger = StderrLogger;
 static METRICS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+
+const GATEWAY_ID_LABEL: &str = "gateway_id";
+const HOST_LABEL: &str = "host";
+#[cfg(test)]
+const IDENTITY_LABELS: &[&str] = &[GATEWAY_ID_LABEL, HOST_LABEL];
 
 /// Buckets for the duration histograms, spanning a fast local answer to a request that runs into the
 /// configured deadline.
@@ -197,20 +204,32 @@ pub fn init_logging() {
 }
 
 /// Installs the process-wide Prometheus recorder before the Fluss client creates metric handles.
-pub fn init_metrics(enabled: bool) -> Result<(), String> {
-    if !enabled || METRICS_HANDLE.get().is_some() {
+pub fn init_metrics(server: &ServerConfig) -> Result<(), String> {
+    if !server.metrics.enabled || METRICS_HANDLE.get().is_some() {
         return Ok(());
     }
-    let recorder = PrometheusBuilder::new()
-        .set_buckets(DURATION_BUCKETS)
-        .map_err(|error| format!("failed to configure histogram buckets: {error}"))?
-        .build_recorder();
+    let recorder = prometheus_builder(server)?.build_recorder();
     let handle = recorder.handle();
     metrics::set_global_recorder(recorder)
         .map_err(|error| format!("failed to install Prometheus recorder: {error}"))?;
     let _ = METRICS_HANDLE.set(handle);
     describe_metrics();
     Ok(())
+}
+
+fn prometheus_builder(server: &ServerConfig) -> Result<PrometheusBuilder, String> {
+    let mut builder = PrometheusBuilder::new()
+        .set_buckets(DURATION_BUCKETS)
+        .map_err(|error| format!("failed to configure histogram buckets: {error}"))?;
+    for (key, value) in [
+        (GATEWAY_ID_LABEL, server.gateway_id.as_deref()),
+        (HOST_LABEL, server.host.as_deref()),
+    ] {
+        if let Some(value) = value {
+            builder = builder.add_global_label(key, value.to_string());
+        }
+    }
+    Ok(builder)
 }
 
 /// Records one completed REST request against the matched route template, never the raw URI.
@@ -429,6 +448,10 @@ fn parse_level(value: &str) -> LevelFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics::{Key, Recorder};
+
+    static METADATA: metrics::Metadata =
+        metrics::Metadata::new(module_path!(), metrics::Level::INFO, Some(module_path!()));
 
     #[test]
     fn parses_supported_global_levels() {
@@ -439,6 +462,24 @@ mod tests {
         assert_eq!(parse_level("debug"), LevelFilter::Debug);
         assert_eq!(parse_level("trace"), LevelFilter::Trace);
         assert_eq!(parse_level("module=debug"), LevelFilter::Info);
+    }
+
+    #[test]
+    fn configured_gateway_identity_is_applied_to_every_metric() {
+        let server = ServerConfig {
+            gateway_id: Some("gateway-production".to_string()),
+            host: Some("2001:db8::10".to_string()),
+            ..ServerConfig::default()
+        };
+        let recorder = prometheus_builder(&server).unwrap().build_recorder();
+        recorder
+            .register_counter(&Key::from_name("test_counter"), &METADATA)
+            .increment(1);
+
+        let rendered = recorder.handle().render();
+        for label in ["gateway_id=\"gateway-production\"", "host=\"2001:db8::10\""] {
+            assert!(rendered.contains(label), "missing {label} in {rendered}");
+        }
     }
 
     /// Allowed metric families, including those reserved for future capabilities.
@@ -518,6 +559,11 @@ mod tests {
                 assert!(
                     !FORBIDDEN.contains(label),
                     "metric {} has forbidden label {label}",
+                    definition.name
+                );
+                assert!(
+                    !IDENTITY_LABELS.contains(label),
+                    "metric {} shadows global identity label {label}",
                     definition.name
                 );
             }
