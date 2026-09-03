@@ -30,6 +30,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metrics.registry.NOPMetricRegistry;
 import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
@@ -57,6 +58,7 @@ import org.apache.fluss.server.metadata.ClusterMetadata;
 import org.apache.fluss.server.metadata.ServerInfo;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
+import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.server.storage.LocalDiskManager;
 import org.apache.fluss.server.testutils.ServerTestTags;
@@ -157,6 +159,7 @@ public class ReplicaTestBase {
     protected TabletServerMetadataCache serverMetadataCache;
     protected TestingCompletedKvSnapshotCommitter snapshotReporter;
     protected TestCoordinatorGateway testCoordinatorGateway;
+    private TabletServerMetricGroup tabletServerMetricGroup;
     private FlussScheduler scheduler;
     private ExecutorService ioExecutor;
 
@@ -207,8 +210,7 @@ public class ReplicaTestBase {
         conf.setString(ConfigOptions.COORDINATOR_HOST, "localhost");
         conf.set(ConfigOptions.REMOTE_DATA_DIR, tempDir.getAbsolutePath() + "/remote_data_dir");
         conf.set(ConfigOptions.SERVER_IO_POOL_SIZE, 2);
-        // set snapshot interval to 1 seconds for test purpose
-        conf.set(ConfigOptions.KV_SNAPSHOT_INTERVAL, Duration.ofSeconds(1));
+        conf.set(ConfigOptions.KV_SNAPSHOT_INTERVAL, getKvSnapshotInterval(testInfo));
 
         conf.set(ConfigOptions.CLIENT_WRITER_BUFFER_MEMORY_SIZE, MemorySize.parse("10kb"));
         conf.set(ConfigOptions.CLIENT_WRITER_BUFFER_PAGE_SIZE, MemorySize.parse("512b"));
@@ -221,6 +223,9 @@ public class ReplicaTestBase {
         ioExecutor = Executors.newSingleThreadExecutor();
 
         manualClock = new ManualClock(System.currentTimeMillis());
+        tabletServerMetricGroup =
+                new TabletServerMetricGroup(
+                        NOPMetricRegistry.INSTANCE, "fluss", "rack", "host", TABLET_SERVER_ID);
         localDiskManager = LocalDiskManager.create(conf);
         logManager =
                 LogManager.create(
@@ -228,7 +233,7 @@ public class ReplicaTestBase {
                         zkClient,
                         scheduler,
                         manualClock,
-                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        tabletServerMetricGroup,
                         localDiskManager);
         logManager.startup();
 
@@ -237,7 +242,7 @@ public class ReplicaTestBase {
                         conf,
                         zkClient,
                         logManager,
-                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        tabletServerMetricGroup,
                         localDiskManager,
                         createTestKvFlushScheduler(conf),
                         manualClock);
@@ -269,6 +274,10 @@ public class ReplicaTestBase {
     // Kept for subclasses that still define @BeforeEach setup() and call super.setup().
     // The actual initialization already happens in setup(TestInfo).
     protected void setup() throws Exception {}
+
+    protected Duration getKvSnapshotInterval(TestInfo testInfo) {
+        return Duration.ofSeconds(1);
+    }
 
     private void initMetadataCache(TabletServerMetadataCache metadataCache) {
         metadataCache.updateClusterMetadata(
@@ -364,11 +373,12 @@ public class ReplicaTestBase {
                 zkClient,
                 TABLET_SERVER_ID,
                 serverMetadataCache,
+                null,
                 rpcClient,
                 coordinatorGateway,
                 snapshotReporter,
                 NOPErrorHandler.INSTANCE,
-                TestingMetricGroups.TABLET_SERVER_METRICS,
+                tabletServerMetricGroup,
                 TestingMetricGroups.USER_METRICS,
                 remoteLogManager,
                 scannerManager,
@@ -420,6 +430,10 @@ public class ReplicaTestBase {
 
         if (ioExecutor != null) {
             ioExecutor.shutdown();
+        }
+
+        if (tabletServerMetricGroup != null) {
+            tabletServerMetricGroup.close();
         }
 
         // clear zk environment.
@@ -546,11 +560,43 @@ public class ReplicaTestBase {
         return makeReplica(physicalTablePath, tableBucket, true, null);
     }
 
+    /**
+     * Test-only overload that lets callers inject a custom {@link TableInfo} (e.g. one carrying
+     * declared {@link Schema.Index}es) so behavior of leader-promotion paths that depend on the
+     * schema can be exercised without the heavyweight {@link
+     * org.apache.fluss.server.testutils.FlussClusterExtension} fixture.
+     */
+    protected Replica makeKvReplica(
+            PhysicalTablePath physicalTablePath, TableBucket tableBucket, TableInfo tableInfo)
+            throws Exception {
+        return makeReplica(physicalTablePath, tableBucket, true, null, tableInfo);
+    }
+
+    protected Replica makeKvReplica(
+            PhysicalTablePath physicalTablePath,
+            TableBucket tableBucket,
+            SnapshotContext snapshotContext,
+            TableInfo tableInfo)
+            throws Exception {
+        return makeReplica(physicalTablePath, tableBucket, true, snapshotContext, tableInfo);
+    }
+
     private Replica makeReplica(
             PhysicalTablePath physicalTablePath,
             TableBucket tableBucket,
             boolean isPkTable,
             @Nullable SnapshotContext snapshotContext)
+            throws Exception {
+        return makeReplica(
+                physicalTablePath, tableBucket, isPkTable, snapshotContext, DATA1_TABLE_INFO);
+    }
+
+    private Replica makeReplica(
+            PhysicalTablePath physicalTablePath,
+            TableBucket tableBucket,
+            boolean isPkTable,
+            @Nullable SnapshotContext snapshotContext,
+            TableInfo tableInfo)
             throws Exception {
         if (snapshotContext == null) {
             snapshotContext =
@@ -579,12 +625,16 @@ public class ReplicaTestBase {
                 replicaManager.getAdjustIsrManager(),
                 snapshotContext,
                 serverMetadataCache,
+                null,
                 NOPErrorHandler.INSTANCE,
                 metricGroup,
-                DATA1_TABLE_INFO,
+                tableInfo,
                 manualClock,
                 remoteLogManager,
-                scannerManager);
+                scannerManager,
+                replicaManager.getIndexReplicatorPool(),
+                replicaManager.getIndexSendBuffer(),
+                replicaManager.getServerMetricGroup());
     }
 
     private void initRemoteLogEnv() throws Exception {

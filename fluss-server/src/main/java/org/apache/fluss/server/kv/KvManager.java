@@ -36,6 +36,7 @@ import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.server.TabletManagerBase;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.ZkSequenceGeneratorFactory;
@@ -54,12 +55,14 @@ import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.types.Tuple2;
 
-import org.rocksdb.Cache;
-import org.rocksdb.LRUCache;
-import org.rocksdb.RateLimiter;
-import org.rocksdb.RateLimiterMode;
-import org.rocksdb.RocksDB;
-import org.rocksdb.WriteBufferManager;
+import io.github.fluss_contrib.rocksdb.AbstractCompactionFilter;
+import io.github.fluss_contrib.rocksdb.AbstractCompactionFilterFactory;
+import io.github.fluss_contrib.rocksdb.Cache;
+import io.github.fluss_contrib.rocksdb.LRUCache;
+import io.github.fluss_contrib.rocksdb.RateLimiter;
+import io.github.fluss_contrib.rocksdb.RateLimiterMode;
+import io.github.fluss_contrib.rocksdb.RocksDB;
+import io.github.fluss_contrib.rocksdb.WriteBufferManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -74,6 +77,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.ToLongFunction;
 
 import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
@@ -420,6 +424,33 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
             ArrowCompressionInfo arrowCompressionInfo,
             @Nullable Runnable flushCompleteListener)
             throws Exception {
+        return getOrCreateKv(
+                tablePath,
+                tableBucket,
+                logTablet,
+                kvFormat,
+                schemaGetter,
+                tableConfig,
+                arrowCompressionInfo,
+                flushCompleteListener,
+                null,
+                null);
+    }
+
+    public KvTablet getOrCreateKv(
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogTablet logTablet,
+            KvFormat kvFormat,
+            SchemaGetter schemaGetter,
+            TableConfig tableConfig,
+            ArrowCompressionInfo arrowCompressionInfo,
+            @Nullable Runnable flushCompleteListener,
+            @Nullable
+                    AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
+                            compactionFilterFactory,
+            @Nullable ToLongFunction<BinaryRow> tagExtractor)
+            throws Exception {
         return inLock(
                 tabletCreationOrDeletionLock,
                 () -> {
@@ -459,7 +490,9 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                                     flushCompleteListener,
                                     autoIncrementManager,
                                     clock,
-                                    tableConfig);
+                                    tableConfig,
+                                    compactionFilterFactory,
+                                    tagExtractor);
                     currentKvs.put(tableBucket, tablet);
 
                     LOG.info(
@@ -531,6 +564,18 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
     public KvTablet loadKv(
             File tabletDir, SchemaGetter schemaGetter, @Nullable Runnable flushCompleteListener)
             throws Exception {
+        return loadKv(tabletDir, schemaGetter, flushCompleteListener, null, null);
+    }
+
+    public KvTablet loadKv(
+            File tabletDir,
+            SchemaGetter schemaGetter,
+            @Nullable Runnable flushCompleteListener,
+            @Nullable
+                    AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
+                            compactionFilterFactory,
+            @Nullable ToLongFunction<BinaryRow> tagExtractor)
+            throws Exception {
         Tuple2<PhysicalTablePath, TableBucket> pathAndBucket = FlussPaths.parseTabletDir(tabletDir);
         PhysicalTablePath physicalTablePath = pathAndBucket.f0;
         TableBucket tableBucket = pathAndBucket.f1;
@@ -582,7 +627,9 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                         flushCompleteListener,
                         autoIncrementManager,
                         clock,
-                        tableConfig);
+                        tableConfig,
+                        compactionFilterFactory,
+                        tagExtractor);
         if (this.currentKvs.containsKey(tableBucket)) {
             throw new IllegalStateException(
                     String.format(

@@ -39,8 +39,8 @@ import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.FileUtils;
 import org.apache.fluss.utils.types.Tuple2;
 
-import org.rocksdb.RocksDB;
-import org.rocksdb.RocksIterator;
+import io.github.fluss_contrib.rocksdb.RocksDB;
+import io.github.fluss_contrib.rocksdb.RocksIterator;
 
 import javax.annotation.Nullable;
 
@@ -130,6 +130,7 @@ public class KvTestUtils {
                                         snapshotId)),
                 KvSnapshotHandle.create(Collections.emptyList(), Collections.emptyList(), 0),
                 0,
+                null,
                 null,
                 null);
     }

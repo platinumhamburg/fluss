@@ -20,6 +20,7 @@ package org.apache.fluss.server.metadata;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.cluster.TabletServerInfo;
+import org.apache.fluss.metadata.PartitionTombstone;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
@@ -39,9 +40,12 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -70,6 +74,9 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
     private final MetadataManager metadataManager;
 
     private final ServerSchemaCache serverSchemaCache;
+
+    private final ConcurrentHashMap<Long, PartitionTombstone> partitionTombstones =
+            new ConcurrentHashMap<>();
 
     public TabletServerMetadataCache(MetadataManager metadataManager) {
         this.serverMetadataSnapshot = ServerMetadataSnapshot.empty();
@@ -111,6 +118,10 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
 
     public Optional<TablePath> getTablePath(long tableId) {
         return serverMetadataSnapshot.getTablePath(tableId);
+    }
+
+    public OptionalLong getTableId(TablePath tablePath) {
+        return serverMetadataSnapshot.getTableId(tablePath);
     }
 
     public Optional<PhysicalTablePath> getPhysicalTablePath(long partitionId) {
@@ -178,6 +189,38 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
         return serverMetadataSnapshot.contains(tableBucket);
     }
 
+    public PartitionTombstone getPartitionTombstone(long mainTableId) {
+        return partitionTombstones.getOrDefault(mainTableId, PartitionTombstone.EMPTY);
+    }
+
+    public Optional<PartitionTombstone> getInitializedPartitionTombstone(long mainTableId) {
+        return Optional.ofNullable(partitionTombstones.get(mainTableId));
+    }
+
+    public OptionalInt getBucketLeader(long tableId, int bucketId) {
+        Map<Integer, BucketMetadata> buckets =
+                serverMetadataSnapshot.getBucketMetadataMapForTables().get(tableId);
+        if (buckets == null) {
+            return OptionalInt.empty();
+        }
+        BucketMetadata bucket = buckets.get(bucketId);
+        return bucket == null ? OptionalInt.empty() : bucket.getLeaderId();
+    }
+
+    public void updatePartitionTombstone(long mainTableId, PartitionTombstone tombstone) {
+        Objects.requireNonNull(tombstone, "tombstone");
+        partitionTombstones.compute(
+                mainTableId,
+                (ignored, current) ->
+                        current == null || tombstone.getVersion() >= current.getVersion()
+                                ? tombstone
+                                : current);
+    }
+
+    private void removePartitionTombstone(long mainTableId) {
+        partitionTombstones.remove(mainTableId);
+    }
+
     /**
      * Applies a partial cluster metadata update.
      *
@@ -222,6 +265,7 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                             Long removedTableId = tableIdByPath.remove(tablePath);
                             if (removedTableId != null) {
                                 bucketMetadataMapForTables.remove(removedTableId);
+                                removePartitionTombstone(removedTableId);
                                 deletedTableIds.add(removedTableId);
                             }
                         } else if (tablePath == DELETED_TABLE_PATH) {
@@ -229,6 +273,7 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                                     .getTablePath(tableId)
                                     .ifPresent(tableIdByPath::remove);
                             bucketMetadataMapForTables.remove(tableId);
+                            removePartitionTombstone(tableId);
                             deletedTableIds.add(tableId);
                         } else {
                             tableIdByPath.put(tablePath, tableId);
@@ -299,6 +344,9 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                                     partitionIdByPath,
                                     bucketMetadataMapForTables,
                                     bucketMetadataMapForPartitions);
+                    clusterMetadata
+                            .getPartitionTombstones()
+                            .forEach(this::updatePartitionTombstone);
                     return deletedTableIds;
                 });
     }

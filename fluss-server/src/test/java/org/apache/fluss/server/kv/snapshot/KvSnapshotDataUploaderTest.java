@@ -34,6 +34,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -101,6 +102,36 @@ class KvSnapshotDataUploaderTest {
             FsPath fsPath = new FsPath(kvFileHandle.getFilePath());
             FSDataInputStream inputStream = fsPath.getFileSystem().open(fsPath);
             assertContentEqual(path, inputStream);
+        }
+    }
+
+    @Test
+    void testUploadEmptyFileCreatesZeroLengthHandle() throws Exception {
+        File snapshotSharedFolder = new File(temporaryFolder.toFile(), "shared");
+        FsPath snapshotSharedDirectory = FsPath.fromLocalFile(snapshotSharedFolder);
+        SnapshotLocation snapshotLocation =
+                new SnapshotLocation(
+                        LocalFileSystem.getSharedInstance(),
+                        snapshotSharedDirectory,
+                        snapshotSharedDirectory,
+                        1024);
+
+        Path emptyFile = Files.createFile(temporaryFolder.resolve("empty"));
+        KvSnapshotDataUploader snapshotUploader = new KvSnapshotDataUploader(downLoaderThreadPool);
+        List<KvFileHandleAndLocalPath> uploadedFiles =
+                snapshotUploader.uploadFilesToSnapshotLocation(
+                        Collections.singletonList(emptyFile),
+                        snapshotLocation,
+                        SnapshotFileScope.SHARED,
+                        new CloseableRegistry(),
+                        new CloseableRegistry());
+
+        assertThat(uploadedFiles).hasSize(1);
+        KvFileHandle kvFileHandle = uploadedFiles.get(0).getKvFileHandle();
+        assertThat(kvFileHandle.getSize()).isEqualTo(0L);
+        FsPath uploadedPath = new FsPath(kvFileHandle.getFilePath());
+        try (FSDataInputStream inputStream = uploadedPath.getFileSystem().open(uploadedPath)) {
+            assertContentEqual(emptyFile, inputStream);
         }
     }
 

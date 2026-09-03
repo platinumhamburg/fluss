@@ -25,6 +25,7 @@ import org.apache.fluss.cluster.Cluster;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.FlussRuntimeException;
+import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.memory.LazyMemorySegmentPool;
 import org.apache.fluss.memory.MemorySegment;
@@ -691,8 +692,14 @@ public final class RecordAccumulator {
             if (!tableIdOpt.isPresent()) {
                 unknownLeaderTables.add(targetPath);
             } else {
-                TableBucket tableBucket =
-                        cluster.getTableBucket(tableIdOpt.get(), targetPath, bucketId);
+                TableBucket tableBucket;
+                try {
+                    tableBucket = cluster.getTableBucket(tableIdOpt.get(), targetPath, bucketId);
+                } catch (PartitionNotExistException ignored) {
+                    bucketAndWriteBatches.partitionId = null;
+                    unknownLeaderTables.add(targetPath);
+                    return nextReadyCheckDelayMs;
+                }
 
                 // If this bucket is throttled, don't mark its node as ready.
                 // Instead, factor the remaining throttle time into the next check delay.

@@ -63,6 +63,7 @@ public class CompletedSnapshotJsonSerde
     // for the next log offset when the snapshot is triggered;
     private static final String LOG_OFFSET = "log_offset";
     private static final String ROW_COUNT = "row_count";
+    private static final String INDEX_PUSHED_OFFSET = "index_pushed_offset";
     private static final String AUTO_INC_ID_RANGE = "auto_inc_id_range";
     private static final String AUTO_INC_COLUMN_ID = "column_id";
     private static final String AUTO_INC_ID_START = "start";
@@ -120,6 +121,12 @@ public class CompletedSnapshotJsonSerde
         // serialize row count if exists
         if (completedSnapshot.getRowCount() != null) {
             generator.writeNumberField(ROW_COUNT, completedSnapshot.getRowCount());
+        }
+
+        // serialize index pushed offset if exists
+        if (completedSnapshot.getIndexPushedOffset() != null) {
+            generator.writeNumberField(
+                    INDEX_PUSHED_OFFSET, completedSnapshot.getIndexPushedOffset());
         }
 
         // serialize auto-increment id range for each auto-increment column
@@ -200,6 +207,11 @@ public class CompletedSnapshotJsonSerde
             rowCount = node.get(ROW_COUNT).asLong();
         }
 
+        Long indexPushedOffset = null;
+        if (node.has(INDEX_PUSHED_OFFSET)) {
+            indexPushedOffset = node.get(INDEX_PUSHED_OFFSET).asLong();
+        }
+
         List<AutoIncIDRange> autoIncIDRanges = null;
         if (node.has(AUTO_INC_ID_RANGE)) {
             autoIncIDRanges = new ArrayList<>();
@@ -218,6 +230,7 @@ public class CompletedSnapshotJsonSerde
                 kvSnapshotHandle,
                 logOffset,
                 rowCount,
+                indexPushedOffset,
                 autoIncIDRanges);
     }
 
