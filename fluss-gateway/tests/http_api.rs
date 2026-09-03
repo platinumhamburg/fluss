@@ -79,7 +79,7 @@ async fn an_unknown_route_returns_the_shared_error_envelope() {
 /// The duration families are exported as Prometheus histograms, which aggregate across gateway instances.
 /// Without explicit buckets the exporter emits pre-computed summary quantiles instead, which do not.
 #[tokio::test]
-async fn request_durations_are_exported_as_histograms() {
+async fn metrics_endpoint_exports_histograms_and_gateway_identity() {
     let gateway = support::start_gateway_with_metrics().await;
     let api = Api::new(format!("http://{}", gateway.local_addr()));
     let metrics_address = gateway
@@ -102,6 +102,12 @@ async fn request_durations_are_exported_as_histograms() {
         exposition.contains("fluss_gateway_rest_request_duration_seconds_bucket"),
         "histogram buckets are exported: {exposition}"
     );
+    for label in [
+        "gateway_id=\"gateway-production\"",
+        "instance_id=\"gateway-1\"",
+    ] {
+        assert!(exposition.contains(label), "missing {label}: {exposition}");
+    }
 
     gateway.shutdown().await.expect("clean shutdown");
 }

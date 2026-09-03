@@ -20,9 +20,9 @@
 //! [`METRIC_DEFINITIONS`] lists implemented metric families with their kinds, units, descriptions,
 //! and label sets. Families for future capabilities are added alongside their implementations.
 //!
-//! Family-specific labels describe an operation or a bounded outcome. `cluster`, sourced from
-//! validated configuration, is the only resource-name label the gateway itself emits. Configured
-//! process identity is attached to every family as a global label.
+//! Labels describe an operation or a bounded outcome. `cluster`, sourced from validated configuration, is the
+//! only resource-name label the gateway itself emits. Configured Gateway and instance identities are attached
+//! to every family as global labels.
 
 use crate::config::ServerConfig;
 use log::{LevelFilter, Log, Metadata, Record};
@@ -55,9 +55,9 @@ static LOGGER: StderrLogger = StderrLogger;
 static METRICS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
 const GATEWAY_ID_LABEL: &str = "gateway_id";
-const HOST_LABEL: &str = "host";
+const INSTANCE_ID_LABEL: &str = "instance_id";
 #[cfg(test)]
-const IDENTITY_LABELS: &[&str] = &[GATEWAY_ID_LABEL, HOST_LABEL];
+const IDENTITY_LABELS: &[&str] = &[GATEWAY_ID_LABEL, INSTANCE_ID_LABEL];
 
 /// Buckets for the duration histograms, spanning a fast local answer to a request that runs into the
 /// configured deadline.
@@ -223,7 +223,7 @@ fn prometheus_builder(server: &ServerConfig) -> Result<PrometheusBuilder, String
         .map_err(|error| format!("failed to configure histogram buckets: {error}"))?;
     for (key, value) in [
         (GATEWAY_ID_LABEL, server.gateway_id.as_deref()),
-        (HOST_LABEL, server.host.as_deref()),
+        (INSTANCE_ID_LABEL, server.instance_id.as_deref()),
     ] {
         if let Some(value) = value {
             builder = builder.add_global_label(key, value.to_string());
@@ -448,10 +448,6 @@ fn parse_level(value: &str) -> LevelFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use metrics::{Key, Recorder};
-
-    static METADATA: metrics::Metadata =
-        metrics::Metadata::new(module_path!(), metrics::Level::INFO, Some(module_path!()));
 
     #[test]
     fn parses_supported_global_levels() {
@@ -462,24 +458,6 @@ mod tests {
         assert_eq!(parse_level("debug"), LevelFilter::Debug);
         assert_eq!(parse_level("trace"), LevelFilter::Trace);
         assert_eq!(parse_level("module=debug"), LevelFilter::Info);
-    }
-
-    #[test]
-    fn configured_gateway_identity_is_applied_to_every_metric() {
-        let server = ServerConfig {
-            gateway_id: Some("gateway-production".to_string()),
-            host: Some("2001:db8::10".to_string()),
-            ..ServerConfig::default()
-        };
-        let recorder = prometheus_builder(&server).unwrap().build_recorder();
-        recorder
-            .register_counter(&Key::from_name("test_counter"), &METADATA)
-            .increment(1);
-
-        let rendered = recorder.handle().render();
-        for label in ["gateway_id=\"gateway-production\"", "host=\"2001:db8::10\""] {
-            assert!(rendered.contains(label), "missing {label} in {rendered}");
-        }
     }
 
     /// Allowed metric families, including those reserved for future capabilities.
