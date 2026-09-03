@@ -2195,8 +2195,8 @@ public class ConfigOptions {
                     .withDescription(
                             "The shared soft memory limit for RocksDB memtables across all KV tablets "
                                     + "in the TabletServer. Reaching the limit makes RocksDB flush memtables "
-                                    + "more aggressively, but it does not impose a hard memory limit or stall "
-                                    + "writers. Set to 0 to disable the shared write buffer manager. "
+                                    + "more aggressively, but it is not a hard limit on process memory. "
+                                    + "Set to 0 to disable the shared write buffer manager. "
                                     + "The default is 0. Changes require a TabletServer restart.");
 
     // --------------------------------------------------------------------------

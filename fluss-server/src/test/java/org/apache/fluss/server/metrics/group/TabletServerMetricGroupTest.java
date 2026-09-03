@@ -54,7 +54,6 @@ class TabletServerMetricGroupTest {
                         PhysicalTablePath.of(tablePath), new TableBucket(1L, 1), true)
                 .registerRocksDBStatistics(secondStatistics);
         metricGroup.setSharedBlockCacheMetrics(() -> 100L, () -> 5L, 256L);
-        metricGroup.setSharedWriteBufferMetrics(() -> 40L, 128L);
 
         assertThat(gaugeValue(metricGroup, MetricNames.ROCKSDB_MEMORY_USAGE_TOTAL)).isEqualTo(130L);
         assertThat(gaugeValue(metricGroup, MetricNames.ROCKSDB_SHARED_BLOCK_CACHE_USAGE))
@@ -63,6 +62,15 @@ class TabletServerMetricGroupTest {
                 .isEqualTo(5L);
         assertThat(gaugeValue(metricGroup, MetricNames.ROCKSDB_SHARED_BLOCK_CACHE_CAPACITY))
                 .isEqualTo(256L);
+    }
+
+    @Test
+    void testSharedWriteBufferMetrics() {
+        TabletServerMetricGroup metricGroup =
+                new TabletServerMetricGroup(
+                        NOPMetricRegistry.INSTANCE, "cluster", "rack", "host", 0);
+        metricGroup.setSharedWriteBufferMetrics(() -> 40L, 128L);
+
         assertThat(gaugeValue(metricGroup, MetricNames.ROCKSDB_SHARED_WRITE_BUFFER_USAGE))
                 .isEqualTo(40L);
         assertThat(gaugeValue(metricGroup, MetricNames.ROCKSDB_SHARED_WRITE_BUFFER_CAPACITY))
