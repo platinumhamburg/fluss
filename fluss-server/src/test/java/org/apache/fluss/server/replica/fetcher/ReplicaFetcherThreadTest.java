@@ -682,6 +682,7 @@ public class ReplicaFetcherThreadTest {
                     zkClient,
                     serverId,
                     metadataCache,
+                    null,
                     rpcClient,
                     new TestCoordinatorGateway(),
                     new TestingCompletedKvSnapshotCommitter(),

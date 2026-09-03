@@ -173,6 +173,8 @@ public class FlinkTableSource
 
     private final Map<String, String> tableOptions;
 
+    @Nullable private final int[][] secondaryIndexes;
+
     @Nullable private LakeSource<LakeSplit> lakeSource;
     @Nullable private Predicate logRecordBatchFilter;
 
@@ -199,7 +201,8 @@ public class FlinkTableSource
             boolean isDataLakeEnabled,
             @Nullable MergeEngineType mergeEngineType,
             Map<String, String> tableOptions,
-            LeaseContext leaseContext) {
+            LeaseContext leaseContext,
+            @Nullable int[][] secondaryIndexes) {
         this(
                 tablePath,
                 flussConfig,
@@ -219,7 +222,8 @@ public class FlinkTableSource
                 isDataLakeEnabled,
                 mergeEngineType,
                 tableOptions,
-                leaseContext);
+                leaseContext,
+                secondaryIndexes);
     }
 
     /**
@@ -266,7 +270,8 @@ public class FlinkTableSource
                 isDataLakeEnabled,
                 mergeEngineType,
                 tableOptions,
-                leaseContext);
+                leaseContext,
+                null);
     }
 
     public FlinkTableSource(
@@ -288,7 +293,8 @@ public class FlinkTableSource
             boolean isDataLakeEnabled,
             @Nullable MergeEngineType mergeEngineType,
             Map<String, String> tableOptions,
-            LeaseContext leaseContext) {
+            LeaseContext leaseContext,
+            @Nullable int[][] secondaryIndexes) {
         this.tablePath = tablePath;
         this.flussConfig = flussConfig;
         this.tableOutputType = tableOutputType;
@@ -310,6 +316,7 @@ public class FlinkTableSource
         this.leaseContext = leaseContext;
         this.mergeEngineType = mergeEngineType;
         this.tableOptions = tableOptions;
+        this.secondaryIndexes = secondaryIndexes;
         if (isDataLakeEnabled) {
             this.lakeSource =
                     checkNotNull(
@@ -353,6 +360,7 @@ public class FlinkTableSource
         this.limit = source.limit;
         this.partitionFilters = source.partitionFilters;
         this.tableOptions = new HashMap<>(source.tableOptions);
+        this.secondaryIndexes = source.secondaryIndexes;
         this.lakeSource = source.lakeSource == null ? null : source.lakeSource.copy();
         this.logRecordBatchFilter = source.logRecordBatchFilter;
         this.watermarkStrategy = source.watermarkStrategy;
@@ -605,7 +613,8 @@ public class FlinkTableSource
                         bucketKeyIndexes,
                         partitionKeyIndexes,
                         tableOutputType,
-                        projectedFields);
+                        projectedFields,
+                        secondaryIndexes);
         this.lookupInputPartitioner = createLookupInputPartitioner(lookupNormalizer);
         if (lookupAsync) {
             AsyncLookupFunction asyncLookupFunction =
