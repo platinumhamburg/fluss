@@ -20,6 +20,8 @@ package org.apache.fluss.client.table;
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.client.FlussConnection;
 import org.apache.fluss.client.lookup.Lookup;
+import org.apache.fluss.client.lookup.Lookuper;
+import org.apache.fluss.client.lookup.SecondaryIndexLookuper;
 import org.apache.fluss.client.lookup.TableLookup;
 import org.apache.fluss.client.metadata.ClientSchemaGetter;
 import org.apache.fluss.client.table.scanner.Scan;
@@ -28,9 +30,20 @@ import org.apache.fluss.client.table.writer.Append;
 import org.apache.fluss.client.table.writer.TableAppend;
 import org.apache.fluss.client.table.writer.TableUpsert;
 import org.apache.fluss.client.table.writer.Upsert;
+import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.row.GenericRow;
+import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.row.encode.CompactedKeyEncoder;
+import org.apache.fluss.types.DataType;
+import org.apache.fluss.types.RowType;
+import org.apache.fluss.utils.IndexTableUtils;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.function.Function;
 
 import static org.apache.fluss.utils.Preconditions.checkState;
 
@@ -85,10 +98,131 @@ public class FlussTable implements Table {
     @Override
     public Upsert newUpsert() {
         checkState(
+                !tableInfo.isIndexTable(),
+                "Table %s is an internal secondary index table and doesn't support public UpsertWriter.",
+                tablePath);
+        checkState(
                 hasPrimaryKey,
                 "Table %s is not a Primary Key Table and doesn't support UpsertWriter.",
                 tablePath);
         return new TableUpsert(tablePath, tableInfo, conn.getOrCreateWriterClient());
+    }
+
+    /**
+     * Returns a {@link Lookuper} for the named secondary index that performs a two-hop lookup with
+     * stale-pointer recheck:
+     *
+     * <ul>
+     *   <li>Hop 1: prefix-scan the Index Table by the user-provided index-column key to retrieve
+     *       candidate {@code (idxCols, basePK)} rows.
+     *   <li>Hop 2: deduplicate candidates by logical {@code basePK}, then point-get the main table
+     *       once per distinct key. Rows that have been deleted upstream are dropped (empty main
+     *       lookup result).
+     *   <li>Recheck: re-evaluate the index columns of every surviving main row against the lookup
+     *       key values captured at lookup entry; rows that no longer match are discarded as stale
+     *       index pointers.
+     * </ul>
+     *
+     * <p>The returned lookuper can be reused by concurrent callers.
+     *
+     * @param indexName the name of the secondary index as declared via {@code Schema.Builder.index}
+     * @return a {@link SecondaryIndexLookuper} wired against this table and its Index Table
+     * @throws IllegalArgumentException if no secondary index with the given name is declared on
+     *     this table.
+     */
+    @Override
+    public Lookuper getSecondaryIndexLookuper(String indexName) {
+        Schema mainSchema = tableInfo.getSchema();
+        Schema.Index index = findIndexOrThrow(mainSchema, tablePath, indexName);
+        List<String> idxCols = index.getColumnNames();
+
+        // Resolve the Index Table handle via the connection.
+        TablePath indexTablePath =
+                TablePath.of(
+                        tablePath.getDatabaseName(),
+                        IndexTableUtils.indexTableName(tablePath.getTableName(), indexName));
+        Table indexTable = conn.getTable(indexTablePath);
+
+        // Hop 1: PrefixKeyLookuper on the DATA namespace of the Index Table.
+        Lookuper indexTablePrefixLookuper =
+                indexTable
+                        .newLookup()
+                        .lookupBy(
+                                Arrays.asList(
+                                        IndexTableUtils.RECORD_KIND_SYSTEM_COLUMN,
+                                        IndexTableUtils.ROUTING_KEY_SYSTEM_COLUMN))
+                        .createLookuper();
+        CompactedKeyEncoder logicalIndexKeyEncoder =
+                new CompactedKeyEncoder(mainSchema.getRowType().project(idxCols));
+        Function<InternalRow, InternalRow> indexLookupKeyEncoder =
+                lookupKey ->
+                        GenericRow.of(
+                                IndexTableUtils.DATA_RECORD_KIND,
+                                logicalIndexKeyEncoder.encodeKey(lookupKey));
+
+        // Hop 2: PrimaryKeyLookuper on this (main) table.
+        Lookuper mainTablePointLookuper = this.newLookup().createLookuper();
+
+        // Recheck wiring: index-column positions / getters in the lookup-key row vs the main row.
+        RowType mainRowType = mainSchema.getRowType();
+        int n = idxCols.size();
+        InternalRow.FieldGetter[] idxColumnGettersInLookupKey = new InternalRow.FieldGetter[n];
+        InternalRow.FieldGetter[] idxColumnGettersInMainRow = new InternalRow.FieldGetter[n];
+        DataType[] idxColumnTypes = new DataType[n];
+        for (int i = 0; i < n; i++) {
+            int posInMain = mainRowType.getFieldIndex(idxCols.get(i));
+            DataType t = mainRowType.getTypeAt(posInMain);
+            idxColumnTypes[i] = t;
+            // The lookup-key row carries idx columns in declaration order at positions 0..n-1.
+            idxColumnGettersInLookupKey[i] = InternalRow.createFieldGetter(t, i);
+            // The main row carries each idx column at its position in the main schema.
+            idxColumnGettersInMainRow[i] = InternalRow.createFieldGetter(t, posInMain);
+        }
+
+        // basePK extractor: copy base-PK columns out of the Index Table row into a fresh
+        // GenericRow whose layout matches the main table's primary-key columns (and therefore the
+        // shape expected by the PrimaryKeyLookuper above). Index Table column ordering can dedup
+        // overlap between idx columns and PK columns, so we look up each base-PK position by name
+        // in the Index Table's RowType.
+        RowType indexRowType = indexTable.getTableInfo().getSchema().getRowType();
+        List<String> basePk = mainSchema.getPrimaryKeyColumnNames();
+        int pkSize = basePk.size();
+        final InternalRow.FieldGetter[] basePkGettersInIndexRow =
+                new InternalRow.FieldGetter[pkSize];
+        for (int i = 0; i < pkSize; i++) {
+            int posInIndex = indexRowType.getFieldIndex(basePk.get(i));
+            basePkGettersInIndexRow[i] =
+                    InternalRow.createFieldGetter(indexRowType.getTypeAt(posInIndex), posInIndex);
+        }
+        Function<InternalRow, GenericRow> basePkExtractor =
+                indexRow -> {
+                    GenericRow pk = new GenericRow(pkSize);
+                    for (int i = 0; i < pkSize; i++) {
+                        pk.setField(i, basePkGettersInIndexRow[i].getFieldOrNull(indexRow));
+                    }
+                    return pk;
+                };
+
+        return new SecondaryIndexLookuper(
+                indexTablePrefixLookuper,
+                mainTablePointLookuper,
+                indexLookupKeyEncoder,
+                idxColumnGettersInLookupKey,
+                idxColumnGettersInMainRow,
+                idxColumnTypes,
+                basePkExtractor,
+                conn.getOrCreateLookupClient().getLookupContinuationExecutor());
+    }
+
+    private static Schema.Index findIndexOrThrow(
+            Schema schema, TablePath tablePath, String indexName) {
+        for (Schema.Index i : schema.getIndexes()) {
+            if (i.getIndexName().equals(indexName)) {
+                return i;
+            }
+        }
+        throw new IllegalArgumentException(
+                "Unknown secondary index '" + indexName + "' on table " + tablePath);
     }
 
     @Override

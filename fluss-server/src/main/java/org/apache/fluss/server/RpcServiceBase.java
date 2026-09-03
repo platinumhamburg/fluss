@@ -28,6 +28,7 @@ import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.exception.SecurityDisabledException;
 import org.apache.fluss.exception.SecurityTokenException;
+import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.exception.TableNotPartitionedException;
 import org.apache.fluss.exception.UnsupportedVersionException;
 import org.apache.fluss.fs.FileSystem;
@@ -98,6 +99,7 @@ import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
+import org.apache.fluss.utils.IndexTableUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -189,6 +191,9 @@ public abstract class RpcServiceBase extends RpcGatewayService implements AdminR
     /** Returns table information for a table id known by the concrete server role. */
     protected abstract TableInfo getTableInfo(long tableId);
 
+    /** Returns the cached table path for a table id known by the concrete server role. */
+    protected abstract TablePath getTablePath(long tableId);
+
     public void authorizeDatabase(OperationType operationType, String databaseName) {
         if (authorizer != null) {
             authorizer.authorize(currentSession(), operationType, Resource.database(databaseName));
@@ -197,8 +202,30 @@ public abstract class RpcServiceBase extends RpcGatewayService implements AdminR
 
     public void authorizeTable(OperationType operationType, TablePath tablePath) {
         if (authorizer != null) {
-            authorizer.authorize(currentSession(), operationType, Resource.table(tablePath));
+            authorizer.authorize(
+                    currentSession(),
+                    operationType,
+                    Resource.table(getAuthorizationTablePath(operationType, tablePath)));
         }
+    }
+
+    protected TablePath getAuthorizationTablePath(
+            OperationType operationType, TablePath tablePath) {
+        if (operationType != OperationType.READ && operationType != OperationType.DESCRIBE) {
+            return tablePath;
+        }
+        if (!IndexTableUtils.isIndexTableName(tablePath.getTableName())) {
+            return tablePath;
+        }
+        try {
+            TableInfo tableInfo = metadataManager.getTable(tablePath);
+            if (tableInfo.isIndexTable() && tableInfo.getMainTableId().isPresent()) {
+                return getTablePath(tableInfo.getMainTableId().getAsLong());
+            }
+        } catch (TableNotExistException ignored) {
+            // Preserve normal authorization and not-found behavior for missing tables.
+        }
+        return tablePath;
     }
 
     @Override
@@ -618,7 +645,9 @@ public abstract class RpcServiceBase extends RpcGatewayService implements AdminR
                             session,
                             OperationType.DESCRIBE,
                             Resource.table(
-                                    pbTablePath.getDatabaseName(), pbTablePath.getTableName()))) {
+                                    getAuthorizationTablePath(
+                                            OperationType.DESCRIBE,
+                                            ServerRpcMessageUtils.toTablePath(pbTablePath))))) {
                 authorizedTables.add(ServerRpcMessageUtils.toTablePath(pbTablePath));
             }
         }

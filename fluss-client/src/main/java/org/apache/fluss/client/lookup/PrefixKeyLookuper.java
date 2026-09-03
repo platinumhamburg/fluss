@@ -30,7 +30,7 @@ import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.types.RowType;
 
 import javax.annotation.Nullable;
-import javax.annotation.concurrent.NotThreadSafe;
+import javax.annotation.concurrent.ThreadSafe;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -45,7 +45,7 @@ import static org.apache.fluss.client.utils.ClientUtils.getPartitionId;
  * An implementation of {@link Lookuper} that lookups by prefix key. A prefix key is a prefix subset
  * of the primary key.
  */
-@NotThreadSafe
+@ThreadSafe
 class PrefixKeyLookuper extends AbstractLookuper implements Lookuper {
 
     /** Encode bucket key from prefix lookup key row. */

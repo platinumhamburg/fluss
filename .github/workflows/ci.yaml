@@ -22,6 +22,7 @@ on:
       - main
       - release-**
       - ci-**
+      - index-preview
     paths-ignore:
       - 'website/**'
       - 'helm/**'

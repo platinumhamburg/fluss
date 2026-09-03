@@ -34,6 +34,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.record.KvRecordBatch;
+import org.apache.fluss.row.BinaryRow;
 import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.row.encode.ValueDecoder;
@@ -67,12 +68,12 @@ import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.clock.SystemClock;
 
-import org.rocksdb.AbstractCompactionFilter;
-import org.rocksdb.AbstractCompactionFilterFactory;
-import org.rocksdb.RateLimiter;
-import org.rocksdb.ReadOptions;
-import org.rocksdb.RocksIterator;
-import org.rocksdb.Snapshot;
+import io.github.fluss_contrib.rocksdb.AbstractCompactionFilter;
+import io.github.fluss_contrib.rocksdb.AbstractCompactionFilterFactory;
+import io.github.fluss_contrib.rocksdb.RateLimiter;
+import io.github.fluss_contrib.rocksdb.ReadOptions;
+import io.github.fluss_contrib.rocksdb.RocksIterator;
+import io.github.fluss_contrib.rocksdb.Snapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -92,6 +93,7 @@ import java.util.Optional;
 import java.util.concurrent.Executor;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.ToLongFunction;
 
 import static org.apache.fluss.server.kv.KvStateAccessor.HISTORICAL_TOMBSTONE;
 import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
@@ -297,7 +299,9 @@ public final class KvTablet {
                 null,
                 autoIncrementManager,
                 SystemClock.getInstance(),
-                new TableConfig(new Configuration()));
+                new TableConfig(new Configuration()),
+                null,
+                null);
     }
 
     public static KvTablet create(
@@ -337,11 +341,62 @@ public final class KvTablet {
                 changelogImage,
                 sharedRateLimiter,
                 kvFlushScheduler,
+                flushCompleteListener,
+                autoIncrementManager,
+                clock,
+                tableConfig,
+                null,
+                null);
+    }
+
+    public static KvTablet create(
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogTablet logTablet,
+            File kvTabletDir,
+            Configuration serverConf,
+            TabletServerMetricGroup serverMetricGroup,
+            BufferAllocator arrowBufferAllocator,
+            MemorySegmentPool memorySegmentPool,
+            KvFormat kvFormat,
+            RowMerger rowMerger,
+            ArrowCompressionInfo arrowCompressionInfo,
+            SchemaGetter schemaGetter,
+            ChangelogImage changelogImage,
+            RateLimiter sharedRateLimiter,
+            KvFlushScheduler kvFlushScheduler,
+            @Nullable Runnable flushCompleteListener,
+            AutoIncrementManager autoIncrementManager,
+            Clock clock,
+            TableConfig tableConfig,
+            @Nullable
+                    AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
+                            compactionFilterFactory,
+            @Nullable ToLongFunction<BinaryRow> tagExtractor)
+            throws IOException {
+        return create(
+                tablePath,
+                tableBucket,
+                logTablet,
+                kvTabletDir,
+                serverConf,
+                serverMetricGroup,
+                arrowBufferAllocator,
+                memorySegmentPool,
+                kvFormat,
+                rowMerger,
+                arrowCompressionInfo,
+                schemaGetter,
+                changelogImage,
+                sharedRateLimiter,
+                kvFlushScheduler,
                 false,
                 flushCompleteListener,
                 autoIncrementManager,
                 clock,
-                tableConfig);
+                tableConfig,
+                compactionFilterFactory,
+                tagExtractor);
     }
 
     private static KvTablet create(
@@ -364,29 +419,41 @@ public final class KvTablet {
             @Nullable Runnable flushCompleteListener,
             AutoIncrementManager autoIncrementManager,
             Clock clock,
-            TableConfig tableConfig)
+            TableConfig tableConfig,
+            @Nullable
+                    AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
+                            customCompactionFilterFactory,
+            @Nullable ToLongFunction<BinaryRow> customTagExtractor)
             throws IOException {
         checkNotNull(tableConfig, "tableConfig must not be null.");
         Optional<Duration> rowTtl = tableConfig.getKvTTL();
         KvValueLayout kvValueLayout = KvValueLayout.fromTableConfig(tableConfig);
         @Nullable
         RowTtlTimestampProvider rowTtlTimestampProvider =
-                kvValueLayout.hasValueTag()
+                rowTtl.isPresent()
                         ? RowTtlTimestampProvider.create(
                                 tableConfig, schemaGetter, ZoneId.systemDefault())
                         : null;
+        ToLongFunction<BinaryRow> tagExtractor =
+                customTagExtractor != null ? customTagExtractor : rowTtlTimestampProvider;
+        checkState(
+                kvValueLayout.hasValueTag() == (tagExtractor != null),
+                "KV value layout tag configuration is inconsistent for %s.",
+                tableBucket);
         ValueEncoder valueEncoder =
-                rowTtlTimestampProvider == null
+                tagExtractor == null
                         ? ValueEncoder.forLayout(kvValueLayout)
-                        : ValueEncoder.forLayout(kvValueLayout, rowTtlTimestampProvider);
+                        : ValueEncoder.forLayout(kvValueLayout, tagExtractor);
         ValueDecoder valueDecoder = new ValueDecoder(schemaGetter, kvFormat, kvValueLayout);
         @Nullable
         AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
                 compactionFilterFactory =
-                        rowTtl.isPresent()
-                                ? RowTtlCompactionFilterFactory.create(
-                                        kvValueLayout, rowTtl.get(), clock)
-                                : null;
+                        customCompactionFilterFactory != null
+                                ? customCompactionFilterFactory
+                                : rowTtl.isPresent()
+                                        ? RowTtlCompactionFilterFactory.create(
+                                                kvValueLayout, rowTtl.get(), clock)
+                                        : null;
         RocksDBKv kv =
                 buildRocksDBKv(serverConf, kvTabletDir, sharedRateLimiter, compactionFilterFactory);
 
@@ -469,7 +536,9 @@ public final class KvTablet {
                 null,
                 autoIncrementManager,
                 clock,
-                tableConfig);
+                tableConfig,
+                null,
+                null);
     }
 
     private static RocksDBKv buildRocksDBKv(
@@ -568,6 +637,20 @@ public final class KvTablet {
         if (this.rowCount != ROW_COUNT_DISABLED) {
             this.rowCount = rowCount;
         }
+    }
+
+    /**
+     * Installs a value filter used by Index Table replicas to skip entries whose source partition
+     * has been tombstoned. The filter is evaluated during point-lookup and prefix-scan paths.
+     *
+     * @param filter returns {@code true} when the value should be dropped
+     */
+    private static final java.util.function.Predicate<byte[]> NO_OP_VALUE_FILTER = v -> false;
+
+    private volatile java.util.function.Predicate<byte[]> valueFilter = NO_OP_VALUE_FILTER;
+
+    public void setValueFilter(@Nullable java.util.function.Predicate<byte[]> filter) {
+        this.valueFilter = filter == null ? NO_OP_VALUE_FILTER : filter;
     }
 
     // row_count is volatile, so it's safe to read without lock
@@ -1074,7 +1157,7 @@ public final class KvTablet {
                 kvLock,
                 () -> {
                     rocksDBKv.checkIfRocksDBClosed();
-                    return toValueBodySlices(rocksDBKv.multiGet(keys));
+                    return toValueBodySlices(rocksDBKv.multiGet(keys), true);
                 });
     }
 
@@ -1099,6 +1182,9 @@ public final class KvTablet {
                     for (byte[] key : keys) {
                         KvPreWriteBuffer.Key lookupKey = kvStateAccessor.encodeKey(key, null);
                         byte[] rawValue = kvStateAccessor.lookup(lookupKey).value();
+                        if (rawValue != null && valueFilter.test(rawValue)) {
+                            rawValue = null;
+                        }
                         values.add(kvValueLayout.toValueBodySlice(rawValue));
                     }
                     return values;
@@ -1130,7 +1216,7 @@ public final class KvTablet {
                 kvLock,
                 () -> {
                     rocksDBKv.checkIfRocksDBClosed();
-                    return toValueBodySlices(rocksDBKv.prefixLookup(prefixKey));
+                    return toValueBodySlices(rocksDBKv.prefixLookup(prefixKey), false);
                 });
     }
 
@@ -1139,13 +1225,19 @@ public final class KvTablet {
                 kvLock,
                 () -> {
                     rocksDBKv.checkIfRocksDBClosed();
-                    return toValueBodySlices(rocksDBKv.limitScan(limit));
+                    return toValueBodySlices(rocksDBKv.limitScan(limit), false);
                 });
     }
 
-    private List<ByteArraySlice> toValueBodySlices(List<byte[]> values) {
+    private List<ByteArraySlice> toValueBodySlices(List<byte[]> values, boolean preservePositions) {
         List<ByteArraySlice> valueBodySlices = new ArrayList<>(values.size());
         for (byte[] value : values) {
+            if (value != null && valueFilter.test(value)) {
+                if (preservePositions) {
+                    valueBodySlices.add(null);
+                }
+                continue;
+            }
             valueBodySlices.add(kvValueLayout.toValueBodySlice(value));
         }
         return valueBodySlices;

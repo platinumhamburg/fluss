@@ -1013,7 +1013,7 @@ abstract class FlinkTableSourceITCase extends AbstractTestBase {
         assertThatThrownBy(() -> tEnv.executeSql(dimJoinQuery))
                 .hasStackTraceContaining(
                         "The Fluss lookup function supports lookup tables where"
-                                + " the lookup keys include all primary keys or all bucket keys."
+                                + " the lookup keys include all primary keys, all bucket keys, or match a secondary index."
                                 + " Can't find expected key 'name' in lookup keys [id]");
     }
 
