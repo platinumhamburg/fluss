@@ -214,6 +214,7 @@ impl<'de> Deserialize<'de> for ByteSize {
 
 const INSTANCE_ID_KEY: &str = "gateway.instance-id";
 const GATEWAY_ID_KEY: &str = "gateway.id";
+const HOST_KEY: &str = "gateway.host";
 const REST_LISTEN_KEY: &str = "gateway.rest.listen";
 const REST_HEADER_READ_TIMEOUT_KEY: &str = "gateway.rest.header-read-timeout";
 const REST_REQUEST_TIMEOUT_KEY: &str = "gateway.rest.request-timeout";
@@ -431,6 +432,7 @@ macro_rules! typed_entry {
 const CONFIG_ENTRIES: &[GatewayConfigEntry] = &[
     typed_entry!(GatewayConfigEntry, INSTANCE_ID_KEY, optional server.instance_id),
     typed_entry!(GatewayConfigEntry, GATEWAY_ID_KEY, optional server.gateway_id),
+    typed_entry!(GatewayConfigEntry, HOST_KEY, optional server.host),
     typed_entry!(
         GatewayConfigEntry,
         REST_LISTEN_KEY,
@@ -578,6 +580,8 @@ pub struct ServerConfig {
     pub instance_id: Option<String>,
     /// Optional identity shared by all processes serving one logical Gateway.
     pub gateway_id: Option<String>,
+    /// Optional network location exposed as the `host` metric label.
+    pub host: Option<String>,
     pub rest: RestServerConfig,
     pub metrics: MetricsServerConfig,
 }
@@ -1090,12 +1094,17 @@ impl GatewayConfig {
                 ));
             }
         }
-        if server.gateway_id.as_deref().is_some_and(|value| {
-            value.trim().is_empty() || value.len() > 253 || value.chars().any(char::is_control)
-        }) {
-            problems.push(format!(
-                "{GATEWAY_ID_KEY} must be 1-253 bytes and contain no control characters"
-            ));
+        for (key, value) in [
+            (GATEWAY_ID_KEY, server.gateway_id.as_deref()),
+            (HOST_KEY, server.host.as_deref()),
+        ] {
+            if value.is_some_and(|value| {
+                value.trim().is_empty() || value.len() > 253 || value.chars().any(char::is_control)
+            }) {
+                problems.push(format!(
+                    "{key} must be 1-253 bytes and contain no control characters"
+                ));
+            }
         }
         if server.metrics.enabled && addresses_overlap(rest_address, server.metrics.bind_address) {
             problems.push(format!(
@@ -1799,6 +1808,7 @@ mod tests {
             r#"
     gateway.instance-id: gateway-1
     gateway.id: gateway-production
+    gateway.host: 192.0.2.10
     gateway.rest.listen: 0.0.0.0:8080
     gateway.rest.write.max-request-bytes: 32MiB
     gateway.rest.request-timeout: 30s
@@ -1816,6 +1826,7 @@ mod tests {
             config.server.gateway_id.as_deref(),
             Some("gateway-production")
         );
+        assert_eq!(config.server.host.as_deref(), Some("192.0.2.10"));
         assert_eq!(
             config.server.rest.bind_address,
             "0.0.0.0:8080".parse().unwrap()
@@ -2011,6 +2022,10 @@ mod tests {
                 "gateway-production".to_string(),
             ),
             (
+                "FLUSS_GATEWAY__HOST".to_string(),
+                "2001:db8::10".to_string(),
+            ),
+            (
                 "FLUSS_GATEWAY__REST__LISTEN".to_string(),
                 "127.0.0.1:18080".to_string(),
             ),
@@ -2050,6 +2065,7 @@ mod tests {
             config.server.gateway_id.as_deref(),
             Some("gateway-production")
         );
+        assert_eq!(config.server.host.as_deref(), Some("2001:db8::10"));
         assert_eq!(
             config.server.rest.bind_address,
             "127.0.0.1:18080".parse().unwrap()
@@ -2444,15 +2460,15 @@ mod tests {
     }
 
     #[test]
-    fn malformed_gateway_id_rejected() {
-        for value in ["", "   ", "line\\u0007break"] {
-            let error = load_file(&format!("{GATEWAY_ID_KEY}: \"{value}\"\n")).unwrap_err();
-            assert!(
-                problems(error)
-                    .iter()
-                    .any(|problem| problem.contains(GATEWAY_ID_KEY)),
-                "{GATEWAY_ID_KEY} accepted {value:?}"
-            );
+    fn malformed_metric_identity_rejected() {
+        for key in [GATEWAY_ID_KEY, HOST_KEY] {
+            for value in ["", "   ", "line\\u0007break"] {
+                let error = load_file(&format!("{key}: \"{value}\"\n")).unwrap_err();
+                assert!(
+                    problems(error).iter().any(|problem| problem.contains(key)),
+                    "{key} accepted {value:?}"
+                );
+            }
         }
     }
 

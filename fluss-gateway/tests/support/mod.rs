@@ -154,6 +154,7 @@ pub async fn start_gateway_with_metrics() -> RunningGateway {
     let mut config = gateway_config(true);
     config.server.gateway_id = Some("gateway-production".to_string());
     config.server.instance_id = Some("gateway-1".to_string());
+    config.server.host = Some("192.0.2.10".to_string());
     fluss_gateway::lifecycle::start(config)
         .await
         .expect("gateway starts")

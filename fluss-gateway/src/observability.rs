@@ -56,8 +56,9 @@ static METRICS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
 const GATEWAY_ID_LABEL: &str = "gateway_id";
 const INSTANCE_ID_LABEL: &str = "instance_id";
+const HOST_LABEL: &str = "host";
 #[cfg(test)]
-const IDENTITY_LABELS: &[&str] = &[GATEWAY_ID_LABEL, INSTANCE_ID_LABEL];
+const IDENTITY_LABELS: &[&str] = &[GATEWAY_ID_LABEL, INSTANCE_ID_LABEL, HOST_LABEL];
 
 /// Buckets for the duration histograms, spanning a fast local answer to a request that runs into the
 /// configured deadline.
@@ -224,6 +225,7 @@ fn prometheus_builder(server: &ServerConfig) -> Result<PrometheusBuilder, String
     for (key, value) in [
         (GATEWAY_ID_LABEL, server.gateway_id.as_deref()),
         (INSTANCE_ID_LABEL, server.instance_id.as_deref()),
+        (HOST_LABEL, server.host.as_deref()),
     ] {
         if let Some(value) = value {
             builder = builder.add_global_label(key, value.to_string());

@@ -105,6 +105,7 @@ async fn metrics_endpoint_exports_histograms_and_gateway_identity() {
     for label in [
         "gateway_id=\"gateway-production\"",
         "instance_id=\"gateway-1\"",
+        "host=\"192.0.2.10\"",
     ] {
         assert!(exposition.contains(label), "missing {label}: {exposition}");
     }
