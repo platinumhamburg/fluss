@@ -794,6 +794,70 @@ class CoordinatorEventProcessorTest {
     }
 
     @Test
+    void testMetricsRemainCollectableAfterDropTableFailure() throws Exception {
+        eventProcessor.shutdown();
+
+        FailingUpdateMetadataChannelManager failingChannelManager =
+                new FailingUpdateMetadataChannelManager();
+        testCoordinatorChannelManager = failingChannelManager;
+        eventProcessor = buildCoordinatorEventProcessor();
+        eventProcessor.startup();
+        completedSnapshotStoreManager = eventProcessor.completedSnapshotStoreManager();
+
+        TablePath tablePath = TablePath.of(defaultDatabase, "test_metrics_during_drop_table");
+        initCoordinatorChannel();
+        TableAssignment tableAssignment =
+                generateAssignment(
+                        N_BUCKETS,
+                        REPLICATION_FACTOR,
+                        new TabletServerInfo[] {
+                            new TabletServerInfo(0, "rack0"),
+                            new TabletServerInfo(1, "rack1"),
+                            new TabletServerInfo(2, "rack2")
+                        });
+        long tableId =
+                metadataManager.createTable(
+                        tablePath, remoteDataDir, TEST_TABLE, tableAssignment, false);
+        verifyTableCreated(tableId, tableAssignment, N_BUCKETS, REPLICATION_FACTOR);
+
+        List<TableBucket> tableBuckets = allTableBuckets(tableId, N_BUCKETS);
+        List<AbstractMetricGroup> bucketMetricGroups = new ArrayList<>();
+        List<Gauge<?>> inFlightGauges = new ArrayList<>();
+        for (TableBucket tableBucket : tableBuckets) {
+            completedSnapshotStoreManager.getOrCreateCompletedSnapshotStore(tablePath, tableBucket);
+            AbstractMetricGroup bucketMetricGroup =
+                    (AbstractMetricGroup)
+                            TestingMetricGroups.COORDINATOR_METRICS.getTableBucketMetricGroup(
+                                    tablePath, tableBucket);
+            assertThat(bucketMetricGroup).isNotNull();
+            bucketMetricGroups.add(bucketMetricGroup);
+            inFlightGauges.add(
+                    (Gauge<?>) bucketMetricGroup.getMetrics().get(MetricNames.KV_NUM_SNAPSHOTS));
+            inFlightGauges.add(
+                    (Gauge<?>)
+                            bucketMetricGroup.getMetrics().get(MetricNames.KV_ALL_SNAPSHOT_SIZE));
+        }
+        assertThat(inFlightGauges).doesNotContainNull();
+
+        failingChannelManager.failNextUpdateMetadata();
+        metadataManager.dropTable(tablePath, false);
+        failingChannelManager.awaitFailure();
+        fromCtx(context -> null);
+
+        assertThat(completedSnapshotStoreManager.getBucketCompletedSnapshotStores()).isEmpty();
+        assertThat(bucketMetricGroups).allMatch(AbstractMetricGroup::isClosed);
+        assertThat(tableBuckets)
+                .allSatisfy(
+                        tableBucket ->
+                                assertThat(
+                                                TestingMetricGroups.COORDINATOR_METRICS
+                                                        .getTableBucketMetricGroup(
+                                                                tablePath, tableBucket))
+                                        .isNull());
+        assertThatCode(() -> inFlightGauges.forEach(Gauge::getValue)).doesNotThrowAnyException();
+    }
+
+    @Test
     void testMetricsRemainCollectableAfterDropPartitionFailure() throws Exception {
         eventProcessor.shutdown();
 
