@@ -87,6 +87,7 @@ async fn metrics_endpoint_exports_histograms_and_gateway_identity() {
         .expect("the metrics listener is bound");
 
     api.get_ok("/health").await;
+    metrics::counter!("test_external_component_requests_total").increment(1);
     let exposition = Api::new(format!("http://{metrics_address}"))
         .get("/metrics")
         .await
@@ -102,12 +103,25 @@ async fn metrics_endpoint_exports_histograms_and_gateway_identity() {
         exposition.contains("fluss_gateway_rest_request_duration_seconds_bucket"),
         "histogram buckets are exported: {exposition}"
     );
-    for label in [
+    let identity_labels = [
         "gateway_id=\"gateway-production\"",
         "instance_id=\"gateway-1\"",
         "host=\"192.0.2.10\"",
-    ] {
-        assert!(exposition.contains(label), "missing {label}: {exposition}");
+    ];
+    let samples = exposition
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    assert!(
+        samples
+            .iter()
+            .any(|line| line.starts_with("test_external_component_requests_total")),
+        "external component metric is exported: {exposition}"
+    );
+    for sample in samples {
+        for label in identity_labels {
+            assert!(sample.contains(label), "missing {label}: {sample}");
+        }
     }
 
     gateway.shutdown().await.expect("clean shutdown");
