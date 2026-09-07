@@ -121,6 +121,7 @@ import org.apache.fluss.server.storage.DiskUsageMonitor;
 import org.apache.fluss.server.storage.LocalDiskManager;
 import org.apache.fluss.server.utils.FatalErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
 import org.apache.fluss.utils.ByteArraySlice;
@@ -1436,6 +1437,7 @@ public class ReplicaManager implements ServerReconfigurable {
             TableBucket tb = data.getTableBucket();
             try {
                 Replica replica = getReplicaOrException(tb);
+                initializeSnapshotOnlyLocalTail(replica);
                 // register replica to remote log manager first.
                 remoteLogManager.registerReplica(replica);
 
@@ -1551,6 +1553,24 @@ public class ReplicaManager implements ServerReconfigurable {
 
         // add fetcher for those follower replicas.
         addFetcherForReplicas(replicasBecomeFollower, result);
+    }
+
+    /** Initializes a new local log from a snapshot when no remote log prefix exists. */
+    private void initializeSnapshotOnlyLocalTail(Replica replica) throws Exception {
+        if (!replica.isKvTable()
+                || replica.isHistoricalPartition()
+                || replica.getLocalLogEndOffset() != 0L
+                || replica.getLogHighWatermark() != 0L) {
+            return;
+        }
+        Optional<BucketSnapshot> snapshot =
+                zkClient.getTableBucketLatestSnapshot(replica.getTableBucket());
+        if (snapshot.isPresent()
+                && snapshot.get().getLogOffset() > 0L
+                && !zkClient.getRemoteLogManifestHandle(replica.getTableBucket()).isPresent()) {
+            logManager.initializeEmptyLocalTail(
+                    replica.getTableBucket(), snapshot.get().getLogOffset());
+        }
     }
 
     private void addFetcherForReplicas(
