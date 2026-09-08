@@ -674,19 +674,15 @@ final class ReplicaTest extends ReplicaTestBase {
     }
 
     @Test
-    void testSnapshotLookupFailureAllowsSameLeaderEpochRetry(@TempDir File snapshotDir)
+    void testSnapshotLookupFailurePreventsEmptyRecovery(@TempDir File snapshotDir)
             throws Exception {
-        AtomicBoolean failLookup = new AtomicBoolean(false);
         TestSnapshotContext context =
                 new TestSnapshotContext(snapshotDir.getPath()) {
                     @Override
                     public FunctionWithException<TableBucket, CompletedSnapshot, Exception>
                             getLatestCompletedSnapshotProvider() {
                         return bucket -> {
-                            if (failLookup.get()) {
-                                throw new IOException("Snapshot metadata unavailable");
-                            }
-                            return null;
+                            throw new IOException("Snapshot metadata unavailable");
                         };
                     }
                 };
@@ -695,16 +691,11 @@ final class ReplicaTest extends ReplicaTestBase {
                         DATA1_PHYSICAL_TABLE_PATH_PK,
                         new TableBucket(DATA1_TABLE_ID_PK, 1),
                         context);
-        makeKvReplicaAsLeader(replica, 0);
-        failLookup.set(true);
-        assertThatThrownBy(() -> makeKvReplicaAsLeader(replica, 1))
-                .isInstanceOf(KvStorageException.class);
-        assertThat(replica.isLeader()).isFalse();
+        assertThatThrownBy(() -> makeKvReplicaAsLeader(replica, 0))
+                .isInstanceOf(KvStorageException.class)
+                .hasRootCauseMessage("Snapshot metadata unavailable");
+        assertThat(replica.getKvTablet()).isNull();
         assertThat(replica.getLocalLogEndOffset()).isZero();
-        failLookup.set(false);
-        makeKvReplicaAsLeader(replica, 1);
-        assertThat(replica.isLeader()).isTrue();
-        assertThat(replica.getKvTablet()).isNotNull();
     }
 
     @Test
@@ -770,7 +761,7 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThat(replica.getLocalLogEndOffset()).isZero();
         assertThat(replica.getLogHighWatermark()).isZero();
         failDownload.set(false);
-        makeKvReplicaAsLeader(replica, 2);
+        makeKvReplicaAsLeader(replica, 3);
         assertThat(replica.getLocalLogEndOffset()).isEqualTo(10_017L);
         assertThat(replica.getLogHighWatermark()).isEqualTo(10_017L);
         assertThat(replica.getLeaderEndOffsetSnapshot()).isEqualTo(10_017L);

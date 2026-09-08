@@ -471,15 +471,8 @@ public final class Replica {
                             int requestLeaderEpoch = data.getLeaderEpoch();
                             if (requestLeaderEpoch > leaderEpoch) {
                                 boolean isNewLeader = !isLeader();
-                                int previousLeaderEpoch = leaderEpoch;
                                 leaderEpoch = requestLeaderEpoch;
-                                leaderReplicaIdOpt.set(null);
-                                try {
-                                    onBecomeNewLeader();
-                                } catch (RuntimeException e) {
-                                    leaderEpoch = previousLeaderEpoch;
-                                    throw e;
-                                }
+                                onBecomeNewLeader();
                                 leaderReplicaIdOpt.set(localTabletServerId);
                                 // onBecomeNewLeader may recover a KV snapshot, so start the ISR lag
                                 // grace period after it completes.
