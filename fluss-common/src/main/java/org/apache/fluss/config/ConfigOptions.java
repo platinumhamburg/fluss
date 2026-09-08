@@ -1074,6 +1074,16 @@ public class ConfigOptions {
                             "Number of reader worker threads in the server-global index replicator pool. "
                                     + "The value must be positive.");
 
+    public static final ConfigOption<MemorySize> INDEX_REPLICATION_SOURCE_MAX_BYTES =
+            key("index.replication.source.max-bytes")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("2mb"))
+                    .withDescription(
+                            "Preferred maximum source WAL bytes read per index replication window. "
+                                    + "The first complete log record batch may exceed this limit to ensure progress. "
+                                    + "This is independent of the encoded index request target size. "
+                                    + "The value must be positive and at most 2147483647 bytes.");
+
     public static final ConfigOption<Integer> INDEX_REPLICATION_SENDER_THREADS =
             key("index.replication.sender.threads")
                     .intType()
@@ -1101,7 +1111,7 @@ public class ConfigOptions {
     public static final ConfigOption<MemorySize> INDEX_REPLICATION_BUFFER_MAX_BYTES =
             key("index.replication.buffer.max-bytes")
                     .memoryType()
-                    .defaultValue(MemorySize.parse("256mb"))
+                    .defaultValue(MemorySize.parse("512mb"))
                     .withDescription(
                             "Maximum retained payload bytes across one TabletServer. "
                                     + "The value must be positive.");

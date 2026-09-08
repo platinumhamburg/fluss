@@ -183,7 +183,6 @@ public class ReplicaManager implements ServerReconfigurable {
     private static final Logger LOG = LoggerFactory.getLogger(ReplicaManager.class);
 
     public static final String HIGH_WATERMARK_CHECKPOINT_FILE_NAME = "high-watermark-checkpoint";
-    private static final int INDEX_REPLICATION_MAX_WINDOW_BYTES = 256 * 1024;
     private static final long INDEX_REPLICATION_WORKER_BACKOFF_MS = 50L;
     private static final long INDEX_REPLICATION_RETRY_MAX_BACKOFF_MS = 10_000L;
 
@@ -346,6 +345,13 @@ public class ReplicaManager implements ServerReconfigurable {
         this.metadataCache = metadataCache;
         this.metadataProvider = metadataProvider;
         this.rpcClient = rpcClient;
+        long sourceMaxBytes = conf.get(ConfigOptions.INDEX_REPLICATION_SOURCE_MAX_BYTES).getBytes();
+        checkArgument(
+                sourceMaxBytes > 0 && sourceMaxBytes <= Integer.MAX_VALUE,
+                "%s must be between 1 and %s bytes, but was %s",
+                ConfigOptions.INDEX_REPLICATION_SOURCE_MAX_BYTES.key(),
+                Integer.MAX_VALUE,
+                sourceMaxBytes);
         this.indexSendBuffer =
                 new IndexSendBuffer(
                         conf.get(ConfigOptions.INDEX_REPLICATION_MAIN_BUCKET_BUFFER_MAX_BYTES)
@@ -354,7 +360,7 @@ public class ReplicaManager implements ServerReconfigurable {
         this.indexReplicatorPool =
                 new IndexReplicatorPool(
                         conf.getInt(ConfigOptions.INDEX_REPLICATION_READER_THREADS),
-                        INDEX_REPLICATION_MAX_WINDOW_BYTES,
+                        (int) sourceMaxBytes,
                         conf.get(ConfigOptions.INDEX_REPLICATION_REQUEST_TARGET_BYTES).getBytes(),
                         INDEX_REPLICATION_WORKER_BACKOFF_MS,
                         ioExecutor);
@@ -870,6 +876,7 @@ public class ReplicaManager implements ServerReconfigurable {
         LOG.debug(
                 "Put records to local kv storage and wait generate cdc log in {} ms",
                 System.currentTimeMillis() - startTime);
+        completeDelayedFetches(kvPutResult.values());
 
         // maybe do delay write operation to write cdc log to be replicated to other follower
         // replicas.
@@ -902,7 +909,19 @@ public class ReplicaManager implements ServerReconfigurable {
                 results.put(target, new PutKvResultForBucket(target, ApiError.fromThrowable(e)));
             }
         }
+        completeDelayedFetches(results.values());
         maybeAddDelayedWrite(timeoutMs, requiredAcks, entries.size(), results, responseCallback);
+    }
+
+    private void completeDelayedFetches(Collection<PutKvResultForBucket> results) {
+        // Follower fetches wait for LEO, not HW. Check after releasing all replica/storage locks:
+        // completing a fetch re-enters replica reads and may update follower state and ISR.
+        for (PutKvResultForBucket result : results) {
+            if (result.succeeded() && result.getWriteLogEndOffset() >= 0) {
+                delayedFetchLogManager.checkAndComplete(
+                        new DelayedTableBucketKey(result.getTableBucket()));
+            }
+        }
     }
 
     /** Puts records to historical partition leaders. */

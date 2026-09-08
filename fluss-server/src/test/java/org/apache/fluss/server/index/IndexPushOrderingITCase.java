@@ -19,6 +19,7 @@ package org.apache.fluss.server.index;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.metadata.IndexType;
 import org.apache.fluss.metadata.IndexVisibility;
 import org.apache.fluss.metadata.Schema;
@@ -79,6 +80,7 @@ class IndexPushOrderingITCase {
         conf.setInt(ConfigOptions.DEFAULT_REPLICATION_FACTOR, REPLICATION_FACTOR);
         conf.set(ConfigOptions.KV_SNAPSHOT_INTERVAL, Duration.ofHours(1));
         conf.set(ConfigOptions.INDEX_REPLICATION_RETRY_BACKOFF, Duration.ofMillis(10));
+        conf.set(ConfigOptions.INDEX_REPLICATION_SOURCE_MAX_BYTES, MemorySize.parse("64b"));
         // Stopping the target bucket's replicas may also take down a source follower, so the source
         // high watermark only advances once that follower drops out of the ISR.
         conf.set(ConfigOptions.LOG_REPLICA_MAX_LAG_TIME, Duration.ofSeconds(2));
