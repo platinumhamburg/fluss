@@ -503,8 +503,15 @@ public final class Replica {
                             int requestLeaderEpoch = data.getLeaderEpoch();
                             if (requestLeaderEpoch > leaderEpoch) {
                                 boolean isNewLeader = !isLeader();
+                                int previousLeaderEpoch = leaderEpoch;
                                 leaderEpoch = requestLeaderEpoch;
-                                onBecomeNewLeader();
+                                leaderReplicaIdOpt.set(null);
+                                try {
+                                    onBecomeNewLeader();
+                                } catch (RuntimeException e) {
+                                    leaderEpoch = previousLeaderEpoch;
+                                    throw e;
+                                }
                                 leaderReplicaIdOpt.set(localTabletServerId);
                                 // onBecomeNewLeader may recover a KV snapshot, so start the ISR lag
                                 // grace period after it completes.
@@ -644,8 +651,6 @@ public final class Replica {
         // Clear standby flag — a leader is never a standby replica.
         isStandbyReplica = false;
 
-        updateLeaderEndOffsetSnapshot();
-
         if (isDataLakeEnabled()) {
             registerLakeTieringMetrics();
         }
@@ -658,6 +663,8 @@ public final class Replica {
             // now, we can create a new kv tablet
             createKv();
         }
+
+        updateLeaderEndOffsetSnapshot();
     }
 
     private void registerLakeTieringMetrics() {
@@ -781,6 +788,15 @@ public final class Replica {
                 break;
             } catch (Exception e) {
                 lastError = e;
+                if (kvTablet != null) {
+                    try {
+                        checkNotNull(kvManager).dropKv(tableBucket);
+                        kvTablet = null;
+                    } catch (Exception cleanupError) {
+                        e.addSuppressed(cleanupError);
+                        break;
+                    }
+                }
                 LOG.warn(
                         "Failed to init kv tablet for bucket {} on attempt {}/{}.",
                         tableBucket,
@@ -903,6 +919,20 @@ public final class Replica {
 
                 checkNotNull(kvTablet, "kv tablet should not be null.");
                 restoreStartOffset = completedSnapshot.getLogOffset();
+                if (restoreStartOffset > 0L
+                        && !snapshotContext
+                                .getZooKeeperClient()
+                                .getRemoteLogManifestHandle(tableBucket)
+                                .isPresent()) {
+                    if (logTablet.localLogEndOffset() == 0L) {
+                        logManager.initializeEmptyLocalTail(tableBucket, restoreStartOffset);
+                    }
+                    checkState(
+                            logTablet.localLogEndOffset() >= restoreStartOffset,
+                            "Local log ends before snapshot offset %s for %s without remote logs.",
+                            restoreStartOffset,
+                            tableBucket);
+                }
                 rowCount =
                         supportsExactRowCount(tableConfig) ? completedSnapshot.getRowCount() : null;
                 // currently, we only support one auto-increment column.
@@ -1027,13 +1057,9 @@ public final class Replica {
             return Optional.ofNullable(
                     snapshotContext.getLatestCompletedSnapshotProvider().apply(tableBucket));
         } catch (Exception e) {
-            LOG.warn(
-                    "Get latest completed snapshot for {} of table {} failed.",
-                    tableBucket,
-                    physicalPath,
-                    e);
+            throw new KvStorageException(
+                    "Failed to get the latest completed snapshot for " + tableBucket + '.', e);
         }
-        return Optional.empty();
     }
 
     private void recoverKvTablet(
