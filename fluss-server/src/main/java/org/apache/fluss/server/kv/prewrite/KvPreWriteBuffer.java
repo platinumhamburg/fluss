@@ -27,12 +27,10 @@ import org.apache.fluss.utils.MurmurHashUtils;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
-import java.util.Deque;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedList;
@@ -97,9 +95,6 @@ public class KvPreWriteBuffer {
     // a linked list for all kv entries
     private final LinkedList<KvEntry> allKvEntries = new LinkedList<>();
 
-    // Exclusive ends of WAL batches whose KV updates have not yet completed flushing.
-    private final Deque<Long> batchEndOffsets = new ArrayDeque<>();
-
     // metrics related.
     private final Counter truncateAsDuplicatedCount;
     private final Counter truncateAsErrorCount;
@@ -115,12 +110,14 @@ public class KvPreWriteBuffer {
         truncateAsErrorCount = serverMetricGroup.kvTruncateAsErrorCount();
     }
 
-    /** Registers the exclusive end of a successfully appended or recovered WAL batch. */
+    /** Marks the last KV mutation when it ends a successfully appended or recovered WAL batch. */
     public void registerBatchEnd(long batchEndOffset) {
-        checkArgument(
-                batchEndOffsets.isEmpty() || batchEndOffset > batchEndOffsets.peekLast(),
-                "WAL batch ends must increase.");
-        batchEndOffsets.addLast(batchEndOffset);
+        KvEntry last = allKvEntries.peekLast();
+        // Empty batches have no mutation to mark. Their offsets are covered by the flush target
+        // or a later batch; never infer a boundary from a gap between KV mutations.
+        if (last != null && last.logSequenceNumber + 1 == batchEndOffset) {
+            last.batchEnd = true;
+        }
     }
 
     /**
@@ -207,9 +204,6 @@ public class KvPreWriteBuffer {
             truncateAsErrorCount.inc();
         }
 
-        while (!batchEndOffsets.isEmpty() && batchEndOffsets.peekLast() > targetLogSequenceNumber) {
-            batchEndOffsets.removeLast();
-        }
         Iterator<KvEntry> descIter = allKvEntries.descendingIterator();
         while (descIter.hasNext()) {
             KvEntry entry = descIter.next();
@@ -271,18 +265,7 @@ public class KvPreWriteBuffer {
             entries.add(entry);
             rowCountDiff += rowCountDelta(entry);
         }
-        List<Long> preparedBatchEnds = new ArrayList<>();
-        for (Long batchEnd : batchEndOffsets) {
-            if (batchEnd >= exclusiveUpToLogSequenceNumber) {
-                break;
-            }
-            preparedBatchEnds.add(batchEnd);
-        }
-        // The requested flush target is itself a WAL batch boundary. Keeping it also covers
-        // ranges with no KV mutations, including empty WAL batches.
-        preparedBatchEnds.add(exclusiveUpToLogSequenceNumber);
-        return new PreparedFlush(
-                exclusiveUpToLogSequenceNumber, entries, rowCountDiff, preparedBatchEnds);
+        return new PreparedFlush(exclusiveUpToLogSequenceNumber, entries, rowCountDiff);
     }
 
     /** Completes a prepared async flush and removes flushed entries from the buffer. */
@@ -307,10 +290,6 @@ public class KvPreWriteBuffer {
         }
         if (allKvEntries.isEmpty()) {
             maxLogSequenceNumber = -1;
-        }
-        while (!batchEndOffsets.isEmpty()
-                && batchEndOffsets.peekFirst() <= preparedFlush.exclusiveUpToLogSequenceNumber) {
-            batchEndOffsets.removeFirst();
         }
         return preparedFlush.rowCountDiff;
     }
@@ -394,6 +373,7 @@ public class KvPreWriteBuffer {
         private final Key key;
         private final Value value;
         private final long logSequenceNumber;
+        private boolean batchEnd;
 
         // the previous mapped value in the buffer before this key-value put; null once the
         // referenced entry has been flushed (see completeFlush)
@@ -502,17 +482,12 @@ public class KvPreWriteBuffer {
         private final long exclusiveUpToLogSequenceNumber;
         private final List<KvEntry> entries;
         private final int rowCountDiff;
-        private final List<Long> batchEndOffsets;
 
         private PreparedFlush(
-                long exclusiveUpToLogSequenceNumber,
-                List<KvEntry> entries,
-                int rowCountDiff,
-                List<Long> batchEndOffsets) {
+                long exclusiveUpToLogSequenceNumber, List<KvEntry> entries, int rowCountDiff) {
             this.exclusiveUpToLogSequenceNumber = exclusiveUpToLogSequenceNumber;
             this.entries = entries;
             this.rowCountDiff = rowCountDiff;
-            this.batchEndOffsets = batchEndOffsets;
         }
 
         public long exclusiveUpToLogSequenceNumber() {
@@ -541,25 +516,17 @@ public class KvPreWriteBuffer {
          */
         public List<PreparedFlush> split(long maxBytesPerSegment, int maxRecordsPerSegment) {
             checkArgument(maxRecordsPerSegment > 0, "maxRecordsPerSegment must be positive.");
-            if (batchEndOffsets.size() == 1) {
-                return Collections.singletonList(this);
-            }
             List<PreparedFlush> segments = null;
             int segmentStart = 0;
-            int entryIndex = 0;
-            int segmentBatchStart = 0;
             long segmentBytes = 0;
             int segmentRowCountDiff = 0;
-            for (int batchIndex = 0; batchIndex < batchEndOffsets.size(); batchIndex++) {
-                long batchEnd = batchEndOffsets.get(batchIndex);
-                while (entryIndex < entries.size()
-                        && entries.get(entryIndex).getLogSequenceNumber() < batchEnd) {
-                    KvEntry entry = entries.get(entryIndex++);
-                    segmentBytes += entryBytes(entry.getKey(), entry.getValue());
-                    segmentRowCountDiff += rowCountDelta(entry);
-                }
-                if (entryIndex < entries.size()
-                        && (entryIndex - segmentStart >= maxRecordsPerSegment
+            for (int i = 0; i < entries.size(); i++) {
+                KvEntry entry = entries.get(i);
+                segmentBytes += entryBytes(entry.getKey(), entry.getValue());
+                segmentRowCountDiff += rowCountDelta(entry);
+                if (entry.batchEnd
+                        && i + 1 < entries.size()
+                        && (i + 1 - segmentStart >= maxRecordsPerSegment
                                 || (maxBytesPerSegment > 0
                                         && segmentBytes >= maxBytesPerSegment))) {
                     if (segments == null) {
@@ -567,12 +534,10 @@ public class KvPreWriteBuffer {
                     }
                     segments.add(
                             new PreparedFlush(
-                                    batchEnd,
-                                    entries.subList(segmentStart, entryIndex),
-                                    segmentRowCountDiff,
-                                    batchEndOffsets.subList(segmentBatchStart, batchIndex + 1)));
-                    segmentStart = entryIndex;
-                    segmentBatchStart = batchIndex + 1;
+                                    entry.logSequenceNumber + 1,
+                                    entries.subList(segmentStart, i + 1),
+                                    segmentRowCountDiff));
+                    segmentStart = i + 1;
                     segmentBytes = 0;
                     segmentRowCountDiff = 0;
                 }
@@ -584,8 +549,7 @@ public class KvPreWriteBuffer {
                     new PreparedFlush(
                             exclusiveUpToLogSequenceNumber,
                             entries.subList(segmentStart, entries.size()),
-                            segmentRowCountDiff,
-                            batchEndOffsets.subList(segmentBatchStart, batchEndOffsets.size())));
+                            segmentRowCountDiff));
             return segments;
         }
     }

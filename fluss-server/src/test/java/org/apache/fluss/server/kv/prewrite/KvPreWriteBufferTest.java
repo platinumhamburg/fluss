@@ -232,12 +232,12 @@ class KvPreWriteBufferTest {
         // +key0(lsn 0), +key1(lsn 1), +key2(lsn 2), +key3(lsn 3), -key2(lsn 4)
         for (int i = 0; i < 4; i++) {
             bufferInsert(buffer, "key" + i, "value" + i, i);
+            buffer.registerBatchEnd(i + 1);
         }
         bufferDelete(buffer, "key2", 4);
+        buffer.registerBatchEnd(5);
+        buffer.registerBatchEnd(10);
 
-        for (KvPreWriteBuffer.KvEntry entry : buffer.getAllKvEntries()) {
-            buffer.registerBatchEnd(entry.getLogSequenceNumber() + 1);
-        }
         PreparedFlush preparedFlush = buffer.prepareFlush(10);
         List<PreparedFlush> segments = preparedFlush.split(0, 2);
 
@@ -267,12 +267,12 @@ class KvPreWriteBufferTest {
         KvPreWriteBuffer buffer = new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
         // Entry payload sizes are 6, 5, and 5 bytes.
         bufferInsert(buffer, "a", "12345", 0);
+        buffer.registerBatchEnd(1);
         bufferInsert(buffer, "b", "1234", 1);
+        buffer.registerBatchEnd(2);
         bufferInsert(buffer, "c", "1234", 2);
+        buffer.registerBatchEnd(3);
 
-        for (KvPreWriteBuffer.KvEntry entry : buffer.getAllKvEntries()) {
-            buffer.registerBatchEnd(entry.getLogSequenceNumber() + 1);
-        }
         PreparedFlush preparedFlush = buffer.prepareFlush(3);
         List<PreparedFlush> segments = preparedFlush.split(10, Integer.MAX_VALUE);
 
@@ -291,11 +291,10 @@ class KvPreWriteBufferTest {
         KvPreWriteBuffer buffer = new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
         // The first entry is larger than the byte limit and must remain a non-empty singleton.
         bufferInsert(buffer, "a", "1234567890", 0);
+        buffer.registerBatchEnd(1);
         bufferInsert(buffer, "b", "123", 1);
+        buffer.registerBatchEnd(2);
 
-        for (KvPreWriteBuffer.KvEntry entry : buffer.getAllKvEntries()) {
-            buffer.registerBatchEnd(entry.getLogSequenceNumber() + 1);
-        }
         PreparedFlush preparedFlush = buffer.prepareFlush(2);
         List<PreparedFlush> segments = preparedFlush.split(10, Integer.MAX_VALUE);
 
@@ -311,13 +310,14 @@ class KvPreWriteBufferTest {
         KvPreWriteBuffer buffer = new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
         // Entry payload sizes are 2, 2, 11, and 5 bytes.
         bufferInsert(buffer, "a", "x", 0);
+        buffer.registerBatchEnd(1);
         bufferInsert(buffer, "b", "y", 1);
+        buffer.registerBatchEnd(2);
         bufferInsert(buffer, "c", "1234567890", 2);
+        buffer.registerBatchEnd(3);
         bufferInsert(buffer, "d", "1234", 3);
+        buffer.registerBatchEnd(4);
 
-        for (KvPreWriteBuffer.KvEntry entry : buffer.getAllKvEntries()) {
-            buffer.registerBatchEnd(entry.getLogSequenceNumber() + 1);
-        }
         PreparedFlush preparedFlush = buffer.prepareFlush(4);
         List<PreparedFlush> segments = preparedFlush.split(10, 2);
 
@@ -336,13 +336,14 @@ class KvPreWriteBufferTest {
         KvPreWriteBuffer buffer = new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
         // Entry payload sizes are 6, 5, 5, and 6 bytes.
         bufferInsert(buffer, "a", "12345", 0);
+        buffer.registerBatchEnd(1);
         bufferInsert(buffer, "b", "1234", 1);
+        buffer.registerBatchEnd(2);
         bufferInsert(buffer, "c", "1234", 2);
+        buffer.registerBatchEnd(3);
         bufferInsert(buffer, "d", "12345", 3);
+        buffer.registerBatchEnd(4);
 
-        for (KvPreWriteBuffer.KvEntry entry : buffer.getAllKvEntries()) {
-            buffer.registerBatchEnd(entry.getLogSequenceNumber() + 1);
-        }
         PreparedFlush preparedFlush = buffer.prepareFlush(4);
         List<PreparedFlush> segments = preparedFlush.split(10, Integer.MAX_VALUE);
         assertThat(segments).hasSize(2);
