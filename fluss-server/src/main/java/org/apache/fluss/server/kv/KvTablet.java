@@ -123,9 +123,9 @@ public final class KvTablet {
     private static final long ROW_COUNT_DISABLED = -1;
 
     /**
-     * Max records per native write of the asynchronous flush; mirrors the batching capacity of
+     * KV entry budget per native write of the asynchronous flush; mirrors the batching capacity of
      * {@code RocksDBWriteBatchWrapper} (hundreds of keys per write batch is RocksDB best practice).
-     * Together with {@code writeBatchSize} this bounds one atomic native write.
+     * A single WAL batch may exceed this budget to keep its KV mutations atomic.
      */
     private static final int MAX_RECORDS_PER_NATIVE_WRITE = 500;
 
@@ -177,6 +177,8 @@ public final class KvTablet {
     private volatile @Nullable FatalErrorHandler asyncFatalErrorHandler;
 
     private volatile long rowCount;
+
+    @Nullable private Runnable beforeNativeWrite;
 
     @GuardedBy("kvLock")
     private volatile boolean isClosed = false;
@@ -804,14 +806,25 @@ public final class KvTablet {
                                         tableBucket));
                     }
 
-                    return kvWriteProcessor.putAsLeader(
-                            kvRecords,
-                            targetColumns,
-                            mergeMode,
-                            kvStateAccessor,
-                            originalPartitionName,
-                            memoizedLakeLookup);
+                    LogAppendInfo appendInfo =
+                            kvWriteProcessor.putAsLeader(
+                                    kvRecords,
+                                    targetColumns,
+                                    mergeMode,
+                                    kvStateAccessor,
+                                    originalPartitionName,
+                                    memoizedLakeLookup);
+                    if (!appendInfo.duplicated()) {
+                        // KvWriteProcessor appends one WAL batch for each accepted KV batch.
+                        kvPreWriteBuffer.registerBatchEnd(appendInfo.lastOffset() + 1);
+                    }
+                    return appendInfo;
                 });
+    }
+
+    @VisibleForTesting
+    void setBeforeNativeWrite(@Nullable Runnable beforeNativeWrite) {
+        this.beforeNativeWrite = beforeNativeWrite;
     }
 
     @VisibleForTesting
@@ -958,11 +971,12 @@ public final class KvTablet {
     }
 
     /**
-     * Writes the prepared entries to RocksDB in segments of at most {@code
-     * MAX_RECORDS_PER_NATIVE_WRITE} records / {@code writeBatchSize} bytes. Each segment forms
-     * exactly one atomic native write (the writer has implicit flushes disabled) and is completed
-     * immediately after it lands, so {@code flushedLogOffset}/{@code rowCount} stay consistent with
-     * the RocksDB content even if a later segment is rejected by the no-slowdown gate.
+     * Writes the prepared entries to RocksDB in complete WAL batch groups targeting {@code
+     * MAX_RECORDS_PER_NATIVE_WRITE} records / {@code writeBatchSize} bytes. A single WAL batch may
+     * exceed these budgets. Each segment forms exactly one atomic native write (the writer has
+     * implicit flushes disabled) and is completed immediately after it lands, so {@code
+     * flushedLogOffset}/{@code rowCount} stay consistent with the RocksDB content even if a later
+     * segment is rejected by the no-slowdown gate.
      */
     @GuardedBy("kvLock")
     private void writePreparedFlush(PreparedFlush preparedFlush) throws Exception {
@@ -986,6 +1000,9 @@ public final class KvTablet {
                     } else {
                         kvBatchWriter.put(entry.getKey().get(), value.get());
                     }
+                }
+                if (beforeNativeWrite != null) {
+                    beforeNativeWrite.run();
                 }
                 kvBatchWriter.flush();
                 completeFlushedSegment(segment);

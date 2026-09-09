@@ -113,6 +113,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -1989,6 +1990,74 @@ class KvTabletTest {
         assertThat(kvTablet.getKvPreWriteBuffer().pendingFlushBytes()).isGreaterThan(0);
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testBackpressurePreservesCompleteWalBatch(boolean byteLimit) throws Exception {
+        if (byteLimit) {
+            conf.set(ConfigOptions.KV_WRITE_BATCH_SIZE, new MemorySize(64));
+        }
+        ManualKvFlushScheduler scheduler = new ManualKvFlushScheduler(conf);
+        PhysicalTablePath path = PhysicalTablePath.of(TablePath.of("testDb", "t1"));
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, path);
+        kvTablet =
+                createKvTablet(
+                        path,
+                        logTablet.getTableBucket(),
+                        logTablet,
+                        tmpKvDir,
+                        schemaGetter,
+                        new HashMap<>(),
+                        scheduler);
+        List<KvRecord> records = new ArrayList<>();
+        for (int i = 0; i < 600; i++) {
+            records.add(kvRecordFactory.ofRecord("key" + i, new Object[] {i, "value"}));
+        }
+        kvTablet.putAsLeader(kvRecordBatchFactory.ofRecords(records), null);
+        long firstBatchEnd = logTablet.localLogEndOffset();
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord("later", new Object[] {601, "later"})),
+                null);
+        long target = logTablet.localLogEndOffset();
+        AtomicInteger writes = new AtomicInteger();
+        kvTablet.setBeforeNativeWrite(
+                () -> {
+                    if (writes.incrementAndGet() == 2) {
+                        throw new StorageBackpressureException("Reject the second native write");
+                    }
+                });
+        kvTablet.requestFlush(
+                target,
+                failure -> {
+                    throw new AssertionError(failure);
+                });
+        kvTablet.runScheduledFlush();
+        assertThat(kvTablet.getFlushState()).isEqualTo(KvTablet.FlushState.STORAGE_BLOCKED);
+        assertThat(kvTablet.getFlushedLogOffset()).isEqualTo(firstBatchEnd);
+        assertThat(kvTablet.getRowCount()).isEqualTo(600);
+        assertThat(kvTablet.multiGet(Arrays.asList("key0".getBytes(), "key599".getBytes())))
+                .noneMatch(Objects::isNull);
+        assertThat(kvTablet.multiGet(Collections.singletonList("later".getBytes())).get(0))
+                .isNull();
+        logTablet.updateHighWatermark(kvTablet.getFlushedLogOffset());
+        assertThat(
+                        logTablet
+                                .read(0, Integer.MAX_VALUE, FetchIsolation.HIGH_WATERMARK, true)
+                                .getRecords()
+                                .batches())
+                .singleElement()
+                .satisfies(batch -> assertThat(batch.nextLogOffset()).isEqualTo(firstBatchEnd));
+        kvTablet.setBeforeNativeWrite(null);
+        kvTablet.requestFlushRetry();
+        kvTablet.runScheduledFlush();
+        assertThat(kvTablet.getFlushedLogOffset()).isEqualTo(target);
+        assertThat(kvTablet.getRowCount()).isEqualTo(601);
+        assertThat(kvTablet.getKvPreWriteBuffer().pendingFlushBytes()).isZero();
+        assertThat(kvTablet.multiGet(Collections.singletonList("later".getBytes())).get(0))
+                .isNotNull();
+    }
+
     @Test
     void testScheduledFlushWritesLargePreparedRangeInSegments() throws Exception {
         ManualKvFlushScheduler manualScheduler = new ManualKvFlushScheduler(conf);
@@ -2005,19 +2074,24 @@ class KvTabletTest {
                         new HashMap<>(),
                         manualScheduler);
 
-        // 1200 records force the prepared range to be written as multiple native segments
-        // (500 records each), exercising the per-segment completion of the scheduled flush.
+        // Three complete 400-entry WAL batches require three native writes with a 500-entry budget.
         int recordCount = 1200;
         List<KvRecord> records = new ArrayList<>(recordCount);
         for (int i = 0; i < recordCount; i++) {
             records.add(kvRecordFactory.ofRecord("key" + i, new Object[] {i, "v" + i}));
         }
-        kvTablet.putAsLeader(kvRecordBatchFactory.ofRecords(records), null);
+        for (int start = 0; start < recordCount; start += 400) {
+            kvTablet.putAsLeader(
+                    kvRecordBatchFactory.ofRecords(records.subList(start, start + 400)), null);
+        }
+        AtomicInteger nativeWrites = new AtomicInteger();
+        kvTablet.setBeforeNativeWrite(nativeWrites::incrementAndGet);
         long flushOffset = logTablet.localLogEndOffset();
 
         kvTablet.requestFlush(flushOffset, NOPErrorHandler.INSTANCE);
         kvTablet.runScheduledFlush();
 
+        assertThat(nativeWrites.get()).isEqualTo(3);
         assertThat(kvTablet.getFlushedLogOffset()).isEqualTo(flushOffset);
         assertThat(kvTablet.getRowCount()).isEqualTo(recordCount);
         assertThat(kvTablet.getKvPreWriteBuffer().pendingFlushBytes()).isEqualTo(0);

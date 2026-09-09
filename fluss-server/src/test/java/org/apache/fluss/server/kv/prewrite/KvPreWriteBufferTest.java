@@ -235,12 +235,14 @@ class KvPreWriteBufferTest {
         }
         bufferDelete(buffer, "key2", 4);
 
+        for (KvPreWriteBuffer.KvEntry entry : buffer.getAllKvEntries()) {
+            buffer.registerBatchEnd(entry.getLogSequenceNumber() + 1);
+        }
         PreparedFlush preparedFlush = buffer.prepareFlush(10);
         List<PreparedFlush> segments = preparedFlush.split(0, 2);
 
         assertThat(segments).hasSize(3);
-        // Every segment boundary is the lsn of the first entry of the next segment; the last
-        // segment keeps the original target so the full flush range gets published.
+        // Each entry here is a complete WAL batch. The last segment includes the empty tail.
         assertThat(segments.get(0).entries()).hasSize(2);
         assertThat(segments.get(0).exclusiveUpToLogSequenceNumber()).isEqualTo(2);
         assertThat(segments.get(1).entries()).hasSize(2);
@@ -268,6 +270,9 @@ class KvPreWriteBufferTest {
         bufferInsert(buffer, "b", "1234", 1);
         bufferInsert(buffer, "c", "1234", 2);
 
+        for (KvPreWriteBuffer.KvEntry entry : buffer.getAllKvEntries()) {
+            buffer.registerBatchEnd(entry.getLogSequenceNumber() + 1);
+        }
         PreparedFlush preparedFlush = buffer.prepareFlush(3);
         List<PreparedFlush> segments = preparedFlush.split(10, Integer.MAX_VALUE);
 
@@ -288,6 +293,9 @@ class KvPreWriteBufferTest {
         bufferInsert(buffer, "a", "1234567890", 0);
         bufferInsert(buffer, "b", "123", 1);
 
+        for (KvPreWriteBuffer.KvEntry entry : buffer.getAllKvEntries()) {
+            buffer.registerBatchEnd(entry.getLogSequenceNumber() + 1);
+        }
         PreparedFlush preparedFlush = buffer.prepareFlush(2);
         List<PreparedFlush> segments = preparedFlush.split(10, Integer.MAX_VALUE);
 
@@ -307,6 +315,9 @@ class KvPreWriteBufferTest {
         bufferInsert(buffer, "c", "12345", 2);
         bufferInsert(buffer, "d", "1234", 3);
 
+        for (KvPreWriteBuffer.KvEntry entry : buffer.getAllKvEntries()) {
+            buffer.registerBatchEnd(entry.getLogSequenceNumber() + 1);
+        }
         PreparedFlush preparedFlush = buffer.prepareFlush(4);
         List<PreparedFlush> segments = preparedFlush.split(10, 2);
 
@@ -329,6 +340,9 @@ class KvPreWriteBufferTest {
         bufferInsert(buffer, "c", "1234", 2);
         bufferInsert(buffer, "d", "12345", 3);
 
+        for (KvPreWriteBuffer.KvEntry entry : buffer.getAllKvEntries()) {
+            buffer.registerBatchEnd(entry.getLogSequenceNumber() + 1);
+        }
         PreparedFlush preparedFlush = buffer.prepareFlush(4);
         List<PreparedFlush> segments = preparedFlush.split(10, Integer.MAX_VALUE);
         assertThat(segments).hasSize(3);
@@ -347,6 +361,70 @@ class KvPreWriteBufferTest {
         assertThat(retry.entries()).hasSize(3);
         assertThat(retry.entries().get(0).getLogSequenceNumber()).isEqualTo(1);
         assertThat(retry.rowCountDiff()).isEqualTo(3);
+    }
+
+    @Test
+    void testSplitKeepsOversizedBatchAndEmptyTailTogether() {
+        KvPreWriteBuffer buffer = new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
+        buffer.registerBatchEnd(1);
+        bufferInsert(buffer, "a", "large-value", 1);
+        bufferInsert(buffer, "b", "large-value", 2);
+        buffer.registerBatchEnd(3);
+        buffer.registerBatchEnd(4);
+        bufferUpdate(buffer, "a", "new-value", 5);
+        buffer.registerBatchEnd(6);
+        buffer.registerBatchEnd(7);
+        List<PreparedFlush> segments = buffer.prepareFlush(7).split(2, 1);
+        assertThat(segments).hasSize(2);
+        assertThat(segments.get(0).exclusiveUpToLogSequenceNumber()).isEqualTo(4);
+        assertThat(segments.get(0).entries()).hasSize(2);
+        assertThat(buffer.completeFlush(segments.get(0))).isEqualTo(2);
+        buffer.abortFlush(segments.get(1));
+        List<PreparedFlush> retry = buffer.prepareFlush(7).split(2, 1);
+        assertThat(retry)
+                .singleElement()
+                .satisfies(
+                        segment -> {
+                            assertThat(segment.exclusiveUpToLogSequenceNumber()).isEqualTo(7);
+                            assertThat(segment.entries()).hasSize(1);
+                            assertThat(buffer.completeFlush(segment)).isZero();
+                        });
+        assertThat(buffer.pendingFlushBytes()).isZero();
+    }
+
+    @Test
+    void testTruncateAndReappendBatchBoundaries() {
+        KvPreWriteBuffer buffer = new KvPreWriteBuffer(TestingMetricGroups.TABLET_SERVER_METRICS);
+        bufferInsert(buffer, "a", "first", 0);
+        buffer.registerBatchEnd(1);
+        bufferUpdate(buffer, "a", "discarded", 2);
+        buffer.registerBatchEnd(3);
+        buffer.registerBatchEnd(4);
+        buffer.truncateTo(1, TruncateReason.ERROR);
+        assertThat(getValue(buffer, "a")).isEqualTo("first");
+        bufferUpdate(buffer, "a", "replacement", 2);
+        buffer.registerBatchEnd(3);
+        bufferInsert(buffer, "b", "second", 3);
+        buffer.registerBatchEnd(4);
+        List<PreparedFlush> segments = buffer.prepareFlush(4).split(0, 1);
+        assertThat(segments)
+                .extracting(PreparedFlush::exclusiveUpToLogSequenceNumber)
+                .containsExactly(1L, 3L, 4L);
+        assertThat(buffer.completeFlush(segments.get(0))).isEqualTo(1);
+        assertThat(getValue(buffer, "a")).isEqualTo("replacement");
+        assertThat(buffer.completeFlush(segments.get(1))).isZero();
+        assertThat(buffer.completeFlush(segments.get(2))).isEqualTo(1);
+        assertThat(buffer.getAllKvEntries()).isEmpty();
+        assertThat(buffer.pendingFlushBytes()).isZero();
+        // The next range must not contain completed boundaries, even when it starts empty.
+        buffer.registerBatchEnd(5);
+        bufferInsert(buffer, "c", "next", 5);
+        buffer.registerBatchEnd(6);
+        assertThat(buffer.prepareFlush(6).split(0, 1))
+                .singleElement()
+                .satisfies(
+                        segment ->
+                                assertThat(segment.exclusiveUpToLogSequenceNumber()).isEqualTo(6));
     }
 
     private static void bufferInsert(
