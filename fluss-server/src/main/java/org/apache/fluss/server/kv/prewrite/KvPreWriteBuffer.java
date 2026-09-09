@@ -533,10 +533,11 @@ public class KvPreWriteBuffer {
 
         /**
          * Splits the prepared prefix only between complete WAL batches. Each segment is one atomic
-         * native write and can therefore publish its end independently after success.
+         * native write and can therefore publish its end independently after success. Budgets are
+         * checked after adding each complete WAL batch.
          *
          * @param maxBytesPerSegment key/value payload budget, or non-positive for unlimited
-         * @param maxRecordsPerSegment KV entry budget; a single WAL batch may exceed either budget
+         * @param maxRecordsPerSegment KV entry budget; the final batch may exceed either budget
          */
         public List<PreparedFlush> split(long maxBytesPerSegment, int maxRecordsPerSegment) {
             checkArgument(maxRecordsPerSegment > 0, "maxRecordsPerSegment must be positive.");
@@ -551,37 +552,30 @@ public class KvPreWriteBuffer {
             int segmentRowCountDiff = 0;
             for (int batchIndex = 0; batchIndex < batchEndOffsets.size(); batchIndex++) {
                 long batchEnd = batchEndOffsets.get(batchIndex);
-                int batchStart = entryIndex;
-                long batchBytes = 0;
-                int batchRowCountDiff = 0;
                 while (entryIndex < entries.size()
                         && entries.get(entryIndex).getLogSequenceNumber() < batchEnd) {
                     KvEntry entry = entries.get(entryIndex++);
-                    batchBytes += entryBytes(entry.getKey(), entry.getValue());
-                    batchRowCountDiff += rowCountDelta(entry);
+                    segmentBytes += entryBytes(entry.getKey(), entry.getValue());
+                    segmentRowCountDiff += rowCountDelta(entry);
                 }
-                boolean hasEntries = batchStart > segmentStart;
-                if (hasEntries
-                        && entryIndex > batchStart
-                        && (entryIndex - segmentStart > maxRecordsPerSegment
+                if (entryIndex < entries.size()
+                        && (entryIndex - segmentStart >= maxRecordsPerSegment
                                 || (maxBytesPerSegment > 0
-                                        && batchBytes > maxBytesPerSegment - segmentBytes))) {
+                                        && segmentBytes >= maxBytesPerSegment))) {
                     if (segments == null) {
                         segments = new ArrayList<>();
                     }
                     segments.add(
                             new PreparedFlush(
-                                    batchEndOffsets.get(batchIndex - 1),
-                                    entries.subList(segmentStart, batchStart),
+                                    batchEnd,
+                                    entries.subList(segmentStart, entryIndex),
                                     segmentRowCountDiff,
-                                    batchEndOffsets.subList(segmentBatchStart, batchIndex)));
-                    segmentStart = batchStart;
-                    segmentBatchStart = batchIndex;
+                                    batchEndOffsets.subList(segmentBatchStart, batchIndex + 1)));
+                    segmentStart = entryIndex;
+                    segmentBatchStart = batchIndex + 1;
                     segmentBytes = 0;
                     segmentRowCountDiff = 0;
                 }
-                segmentBytes += batchBytes;
-                segmentRowCountDiff += batchRowCountDiff;
             }
             if (segments == null) {
                 return Collections.singletonList(this);

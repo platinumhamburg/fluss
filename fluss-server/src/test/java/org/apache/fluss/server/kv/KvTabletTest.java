@@ -2006,7 +2006,7 @@ class KvTabletTest {
                         new HashMap<>(),
                         manualScheduler);
 
-        // Three complete 400-entry WAL batches require three native writes with a 500-entry budget.
+        // The 500-entry budget groups complete 400-entry batches into writes of 800 and 400.
         int recordCount = 1200;
         List<KvRecord> records = new ArrayList<>(recordCount);
         for (int i = 0; i < recordCount; i++) {
@@ -2023,7 +2023,7 @@ class KvTabletTest {
         kvTablet.requestFlush(flushOffset, NOPErrorHandler.INSTANCE);
         kvTablet.runScheduledFlush();
 
-        assertThat(nativeWrites.get()).isEqualTo(3);
+        assertThat(nativeWrites.get()).isEqualTo(2);
         assertThat(kvTablet.getFlushedLogOffset()).isEqualTo(flushOffset);
         assertThat(kvTablet.getRowCount()).isEqualTo(recordCount);
         assertThat(kvTablet.getKvPreWriteBuffer().pendingFlushBytes()).isEqualTo(0);

@@ -125,7 +125,7 @@ public final class KvTablet {
     /**
      * KV entry budget per native write of the asynchronous flush; mirrors the batching capacity of
      * {@code RocksDBWriteBatchWrapper} (hundreds of keys per write batch is RocksDB best practice).
-     * A single WAL batch may exceed this budget to keep its KV mutations atomic.
+     * The budget is checked after each complete WAL batch to keep its KV mutations atomic.
      */
     private static final int MAX_RECORDS_PER_NATIVE_WRITE = 500;
 
@@ -972,9 +972,9 @@ public final class KvTablet {
 
     /**
      * Writes the prepared entries to RocksDB in complete WAL batch groups targeting {@code
-     * MAX_RECORDS_PER_NATIVE_WRITE} records / {@code writeBatchSize} bytes. A single WAL batch may
-     * exceed these budgets. Each segment forms exactly one atomic native write (the writer has
-     * implicit flushes disabled) and is completed immediately after it lands, so {@code
+     * MAX_RECORDS_PER_NATIVE_WRITE} records / {@code writeBatchSize} bytes. Budgets are checked
+     * after each complete WAL batch. Each segment forms exactly one atomic native write (the writer
+     * has implicit flushes disabled) and is completed immediately after it lands, so {@code
      * flushedLogOffset}/{@code rowCount} stay consistent with the RocksDB content even if a later
      * segment is rejected by the no-slowdown gate.
      */
