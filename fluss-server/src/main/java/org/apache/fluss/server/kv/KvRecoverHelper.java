@@ -254,7 +254,7 @@ public class KvRecoverHelper {
                                     autoIncIdRangeUpdater,
                                     resumeRecordConsumer);
                     if (fetchIsolation == FetchIsolation.LOG_END) {
-                        kvTablet.getKvPreWriteBuffer().registerBatchEnd(nextFetchOffset);
+                        kvTablet.getKvPreWriteBuffer().markWalBatchEnd(nextFetchOffset);
                     }
                 }
             }

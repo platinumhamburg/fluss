@@ -127,7 +127,7 @@ public final class KvTablet {
      * {@code RocksDBWriteBatchWrapper} (hundreds of keys per write batch is RocksDB best practice).
      * The budget is checked after each complete WAL batch to keep its KV mutations atomic.
      */
-    private static final int MAX_RECORDS_PER_NATIVE_WRITE = 500;
+    private static final int TARGET_ENTRIES_PER_NATIVE_WRITE = 500;
 
     private final PhysicalTablePath physicalPath;
     private final TableBucket tableBucket;
@@ -816,7 +816,7 @@ public final class KvTablet {
                                     memoizedLakeLookup);
                     if (!appendInfo.duplicated()) {
                         // KvWriteProcessor appends one WAL batch for each accepted KV batch.
-                        kvPreWriteBuffer.registerBatchEnd(appendInfo.lastOffset() + 1);
+                        kvPreWriteBuffer.markWalBatchEnd(appendInfo.lastOffset() + 1);
                     }
                     return appendInfo;
                 });
@@ -972,7 +972,7 @@ public final class KvTablet {
 
     /**
      * Writes the prepared entries to RocksDB in complete WAL batch groups targeting {@code
-     * MAX_RECORDS_PER_NATIVE_WRITE} records / {@code writeBatchSize} bytes. Budgets are checked
+     * TARGET_ENTRIES_PER_NATIVE_WRITE} entries / {@code writeBatchSize} bytes. Budgets are checked
      * after each complete WAL batch. Each segment forms exactly one atomic native write (the writer
      * has implicit flushes disabled) and is completed immediately after it lands, so {@code
      * flushedLogOffset}/{@code rowCount} stay consistent with the RocksDB content even if a later
@@ -981,7 +981,7 @@ public final class KvTablet {
     @GuardedBy("kvLock")
     private void writePreparedFlush(PreparedFlush preparedFlush) throws Exception {
         List<PreparedFlush> segments =
-                preparedFlush.split(writeBatchSize, MAX_RECORDS_PER_NATIVE_WRITE);
+                preparedFlush.split(writeBatchSize, TARGET_ENTRIES_PER_NATIVE_WRITE);
         int nextSegment = 0;
         try (ResourceGuard.Lease lease = rocksDBKv.getResourceGuard().acquireResource();
                 KvBatchWriter kvBatchWriter = createNoSlowdownKvBatchWriter()) {

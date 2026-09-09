@@ -110,13 +110,20 @@ public class KvPreWriteBuffer {
         truncateAsErrorCount = serverMetricGroup.kvTruncateAsErrorCount();
     }
 
-    /** Marks the last KV mutation when it ends a successfully appended or recovered WAL batch. */
-    public void registerBatchEnd(long batchEndOffset) {
+    /**
+     * Marks the last KV mutation when it ends a successfully appended or recovered WAL batch.
+     *
+     * <p>Call after applying each batch and before staging any mutation from the next batch. Empty
+     * batches do not mark an entry; their offsets are covered by the flush target or a later batch.
+     *
+     * @param batchEndOffset the exclusive end offset of the completed WAL batch
+     */
+    public void markWalBatchEnd(long batchEndOffset) {
         KvEntry last = allKvEntries.peekLast();
         // Empty batches have no mutation to mark. Their offsets are covered by the flush target
         // or a later batch; never infer a boundary from a gap between KV mutations.
         if (last != null && last.logSequenceNumber + 1 == batchEndOffset) {
-            last.batchEnd = true;
+            last.endOfWalBatch = true;
         }
     }
 
@@ -373,7 +380,7 @@ public class KvPreWriteBuffer {
         private final Key key;
         private final Value value;
         private final long logSequenceNumber;
-        private boolean batchEnd;
+        private boolean endOfWalBatch;
 
         // the previous mapped value in the buffer before this key-value put; null once the
         // referenced entry has been flushed (see completeFlush)
@@ -511,11 +518,11 @@ public class KvPreWriteBuffer {
          * native write and can therefore publish its end independently after success. Budgets are
          * checked after adding each complete WAL batch.
          *
-         * @param maxBytesPerSegment key/value payload budget, or non-positive for unlimited
-         * @param maxRecordsPerSegment KV entry budget; the final batch may exceed either budget
+         * @param targetBytesPerSegment key/value payload budget, or non-positive for unlimited
+         * @param targetEntriesPerSegment KV entry budget; the final batch may exceed either budget
          */
-        public List<PreparedFlush> split(long maxBytesPerSegment, int maxRecordsPerSegment) {
-            checkArgument(maxRecordsPerSegment > 0, "maxRecordsPerSegment must be positive.");
+        public List<PreparedFlush> split(long targetBytesPerSegment, int targetEntriesPerSegment) {
+            checkArgument(targetEntriesPerSegment > 0, "targetEntriesPerSegment must be positive.");
             List<PreparedFlush> segments = null;
             int segmentStart = 0;
             long segmentBytes = 0;
@@ -524,11 +531,11 @@ public class KvPreWriteBuffer {
                 KvEntry entry = entries.get(i);
                 segmentBytes += entryBytes(entry.getKey(), entry.getValue());
                 segmentRowCountDiff += rowCountDelta(entry);
-                if (entry.batchEnd
+                if (entry.endOfWalBatch
                         && i + 1 < entries.size()
-                        && (i + 1 - segmentStart >= maxRecordsPerSegment
-                                || (maxBytesPerSegment > 0
-                                        && segmentBytes >= maxBytesPerSegment))) {
+                        && (i + 1 - segmentStart >= targetEntriesPerSegment
+                                || (targetBytesPerSegment > 0
+                                        && segmentBytes >= targetBytesPerSegment))) {
                     if (segments == null) {
                         segments = new ArrayList<>();
                     }
