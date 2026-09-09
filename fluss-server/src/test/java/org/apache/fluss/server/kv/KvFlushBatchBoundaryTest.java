@@ -17,7 +17,9 @@
 
 package org.apache.fluss.server.kv;
 
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.exception.StorageBackpressureException;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.KvRecordBatch;
@@ -30,8 +32,9 @@ import org.apache.fluss.server.replica.ReplicaTestBase;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.utils.types.Tuple2;
 
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -66,8 +69,12 @@ class KvFlushBatchBoundaryTest extends ReplicaTestBase {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void testBackpressureAndRetryAfterWalRecovery(boolean recover) throws Exception {
+    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
+    void testBackpressureAndRetryAfterWalRecovery(boolean recover, boolean byteLimit)
+            throws Exception {
+        if (byteLimit) {
+            conf.set(ConfigOptions.KV_WRITE_BATCH_SIZE, new MemorySize(64));
+        }
         Replica replica = createLeader();
         try {
             appendBatches(replica);
@@ -106,21 +113,12 @@ class KvFlushBatchBoundaryTest extends ReplicaTestBase {
                     .forEach(batch -> ends.add(batch.nextLogOffset()));
             assertThat(ends).containsExactly(600L, 1800L, 1801L, 1802L);
         } finally {
-            try {
-                replica.delete();
-            } finally {
-                replicaManager
-                        .getServerMetricGroup()
-                        .removeTableBucketMetricGroup(
-                                DATA1_PHYSICAL_TABLE_PATH_PK.getTablePath(),
-                                new TableBucket(DATA1_TABLE_ID_PK, 1));
-            }
+            deleteReplica(replica);
         }
     }
 
-    @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void testFollowerTruncationPreservesCommittedBatch(boolean recover) throws Exception {
+    @Test
+    void testFollowerTruncationPreservesCommittedBatch() throws Exception {
         Replica replica = createLeader();
         try {
             appendBatches(replica);
@@ -140,26 +138,28 @@ class KvFlushBatchBoundaryTest extends ReplicaTestBase {
                                     .batches())
                     .singleElement()
                     .satisfies(batch -> assertThat(batch.nextLogOffset()).isEqualTo(hw));
-            if (recover) {
-                replica.makeLeader(state(2));
-                assertThat(replica.getKvTablet().getRowCount()).isEqualTo(600);
-                assertValue(replica.getKvTablet(), 0, "before");
-                replica.putRecordsToLeader(
-                        genKvRecordBatch(new Object[] {600, "tail"}), null, MergeMode.DEFAULT, 0);
-                replica.getKvTablet().runScheduledFlush();
-                assertThat(replica.getLogHighWatermark()).isEqualTo(601);
-                assertValue(replica.getKvTablet(), 600, "tail");
-            }
+            replica.makeLeader(state(2));
+            assertThat(replica.getKvTablet().getRowCount()).isEqualTo(600);
+            assertValue(replica.getKvTablet(), 0, "before");
+            replica.putRecordsToLeader(
+                    genKvRecordBatch(new Object[] {600, "tail"}), null, MergeMode.DEFAULT, 0);
+            replica.getKvTablet().runScheduledFlush();
+            assertThat(replica.getLogHighWatermark()).isEqualTo(601);
+            assertValue(replica.getKvTablet(), 600, "tail");
         } finally {
-            try {
-                replica.delete();
-            } finally {
-                replicaManager
-                        .getServerMetricGroup()
-                        .removeTableBucketMetricGroup(
-                                DATA1_PHYSICAL_TABLE_PATH_PK.getTablePath(),
-                                new TableBucket(DATA1_TABLE_ID_PK, 1));
-            }
+            deleteReplica(replica);
+        }
+    }
+
+    private void deleteReplica(Replica replica) throws Exception {
+        try {
+            replica.delete();
+        } finally {
+            replicaManager
+                    .getServerMetricGroup()
+                    .removeTableBucketMetricGroup(
+                            DATA1_PHYSICAL_TABLE_PATH_PK.getTablePath(),
+                            new TableBucket(DATA1_TABLE_ID_PK, 1));
         }
     }
 

@@ -119,8 +119,7 @@ public class KvPreWriteBuffer {
     public void registerBatchEnd(long batchEndOffset) {
         checkArgument(
                 batchEndOffsets.isEmpty() || batchEndOffset > batchEndOffsets.peekLast(),
-                "WAL batch ends must increase: %s",
-                batchEndOffset);
+                "WAL batch ends must increase.");
         batchEndOffsets.addLast(batchEndOffset);
     }
 
@@ -273,7 +272,7 @@ public class KvPreWriteBuffer {
             rowCountDiff += rowCountDelta(entry);
         }
         List<Long> preparedBatchEnds = new ArrayList<>();
-        for (long batchEnd : batchEndOffsets) {
+        for (Long batchEnd : batchEndOffsets) {
             if (batchEnd >= exclusiveUpToLogSequenceNumber) {
                 break;
             }
@@ -541,7 +540,10 @@ public class KvPreWriteBuffer {
          */
         public List<PreparedFlush> split(long maxBytesPerSegment, int maxRecordsPerSegment) {
             checkArgument(maxRecordsPerSegment > 0, "maxRecordsPerSegment must be positive.");
-            List<PreparedFlush> segments = new ArrayList<>();
+            if (batchEndOffsets.size() == 1) {
+                return Collections.singletonList(this);
+            }
+            List<PreparedFlush> segments = null;
             int segmentStart = 0;
             int entryIndex = 0;
             int segmentBatchStart = 0;
@@ -564,6 +566,9 @@ public class KvPreWriteBuffer {
                         && (entryIndex - segmentStart > maxRecordsPerSegment
                                 || (maxBytesPerSegment > 0
                                         && batchBytes > maxBytesPerSegment - segmentBytes))) {
+                    if (segments == null) {
+                        segments = new ArrayList<>();
+                    }
                     segments.add(
                             new PreparedFlush(
                                     batchEndOffsets.get(batchIndex - 1),
@@ -578,7 +583,7 @@ public class KvPreWriteBuffer {
                 segmentBytes += batchBytes;
                 segmentRowCountDiff += batchRowCountDiff;
             }
-            if (segments.isEmpty()) {
+            if (segments == null) {
                 return Collections.singletonList(this);
             }
             segments.add(
