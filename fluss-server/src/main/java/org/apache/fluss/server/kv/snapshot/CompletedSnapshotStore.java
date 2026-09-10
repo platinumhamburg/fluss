@@ -122,7 +122,8 @@ public class CompletedSnapshotStore {
      *
      * <p>Identity and ordering checks, persistent handle confirmation and retention updates are
      * serialized with ordinary snapshot additions. Even an already retained snapshot must have its
-     * handle confirmed under the supplied coordinator epoch before a retry succeeds.
+     * handle confirmed under the supplied coordinator epoch before a retry succeeds. Obsolete
+     * snapshot cleanup follows ordinary retention semantics and may be deferred on failure.
      */
     public void registerExternalSnapshot(final CompletedSnapshot snapshot, int coordinatorZkVersion)
             throws Exception {
