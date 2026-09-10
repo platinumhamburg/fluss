@@ -213,11 +213,12 @@ public class TestingLeaderEndpoint implements LeaderEndpoint {
                                 value.hasMinRetainOffset() ? value.getMinRetainOffset() : -1L;
                         FetchLogResultForBucket memoryResult =
                                 FetchLogResultForBucket.records(
-                                        tb,
-                                        memRecords,
-                                        value.getHighWatermark(),
-                                        filteredEndOffset,
-                                        minRetainOffset);
+                                                tb,
+                                                memRecords,
+                                                value.getHighWatermark(),
+                                                filteredEndOffset,
+                                                minRetainOffset)
+                                        .withEpochInfo(value.epochInfo());
                         result.put(tb, memoryResult);
                     } else {
                         result.put(tb, value);
