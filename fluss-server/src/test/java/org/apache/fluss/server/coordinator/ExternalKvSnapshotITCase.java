@@ -28,6 +28,7 @@ import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.metrics.ThreadSafeSimpleCounter;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrRequest;
@@ -239,7 +240,8 @@ class ExternalKvSnapshotITCase {
                                 guard,
                                 new KvSnapshotDataUploader(uploader),
                                 rocksDB.getRockDbDir(),
-                                -1L)) {
+                                -1L,
+                                new ThreadSafeSimpleCounter())) {
             files =
                     snapshot.asyncSnapshot(
                                     snapshot.syncPrepareResources(snapshotId),
