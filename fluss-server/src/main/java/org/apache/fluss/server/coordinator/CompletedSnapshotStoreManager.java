@@ -33,7 +33,6 @@ import org.apache.fluss.server.kv.snapshot.ZooKeeperCompletedSnapshotHandleStore
 import org.apache.fluss.server.metrics.group.CoordinatorMetricGroup;
 import org.apache.fluss.server.zk.ZkSequenceIDCounter;
 import org.apache.fluss.server.zk.ZooKeeperClient;
-import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.ZkData;
 
 import org.slf4j.Logger;
@@ -203,22 +202,9 @@ public class CompletedSnapshotStoreManager {
                         .getCurrent();
         checkArgument(
                 snapshot.getSnapshotID() < nextSnapshotId,
-                "External snapshot ID must be reserved from the target bucket counter.");
-        CompletedSnapshotStore store = getOrCreateCompletedSnapshotStore(tablePath, tableBucket);
-        checkArgument(
-                !store.getLatestSnapshot().isPresent()
-                        || store.getLatestSnapshot().get().getSnapshotID()
-                                <= snapshot.getSnapshotID()
-                        || store.getActiveSnapshotIds().contains(snapshot.getSnapshotID()),
-                "Cannot register an older snapshot that has already been subsumed.");
-        zooKeeperClient.registerExternalTableBucketSnapshot(
-                tableBucket,
-                new BucketSnapshot(
-                        handle.getSnapshotId(),
-                        handle.getLogOffset(),
-                        handle.getMetadataFilePath().toString()),
-                coordinatorZkVersion);
-        store.adoptAfterNodeConfirmed(snapshot);
+                "External snapshot ID must be below the target bucket counter.");
+        getOrCreateCompletedSnapshotStore(tablePath, tableBucket)
+                .registerExternalSnapshot(snapshot, coordinatorZkVersion);
     }
 
     public void removeCompletedSnapshotStoreByTableBuckets(Set<TableBucket> tableBuckets) {

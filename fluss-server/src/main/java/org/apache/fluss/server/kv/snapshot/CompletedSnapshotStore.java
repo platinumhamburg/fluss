@@ -42,8 +42,8 @@ import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.locks.ReentrantLock;
 
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
-import static org.apache.fluss.utils.Preconditions.checkState;
 import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
 /* This file is based on source code of Apache Flink Project (https://flink.apache.org/), licensed by the Apache
@@ -118,43 +118,48 @@ public class CompletedSnapshotStore {
     }
 
     /**
-     * Adopts a snapshot whose persistent snapshot node has already been confirmed.
+     * Registers an immutable external snapshot and includes it in ordinary snapshot retention.
      *
-     * <p>The operation is idempotent for an identical physical bucket and snapshot identity. A
-     * different snapshot using the same ID is rejected instead of replacing the confirmed node.
+     * <p>Identity and ordering checks, persistent handle confirmation and retention updates are
+     * serialized with ordinary snapshot additions. Even an already retained snapshot must have its
+     * handle confirmed under the supplied coordinator epoch before a retry succeeds.
      */
-    public void adoptAfterNodeConfirmed(final CompletedSnapshot snapshot) throws Exception {
+    public void registerExternalSnapshot(final CompletedSnapshot snapshot, int coordinatorZkVersion)
+            throws Exception {
         checkNotNull(snapshot, "Snapshot");
         inLock(
                 lock,
                 () -> {
-                    for (CompletedSnapshot existing : completedSnapshots) {
-                        if (existing.getSnapshotID() == snapshot.getSnapshotID()) {
-                            checkState(
-                                    existing.equals(snapshot),
-                                    "Conflicting snapshot identity for %s snapshot %s.",
-                                    snapshot.getTableBucket(),
-                                    snapshot.getSnapshotID());
-                            return;
+                    CompletedSnapshot existing = stillInUseSnapshots.get(snapshot.getSnapshotID());
+                    for (CompletedSnapshot retained : completedSnapshots) {
+                        if (retained.getSnapshotID() == snapshot.getSnapshotID()) {
+                            existing = retained;
+                            break;
                         }
                     }
-                    CompletedSnapshot stillInUse =
-                            stillInUseSnapshots.get(snapshot.getSnapshotID());
-                    if (stillInUse != null) {
-                        checkState(
-                                stillInUse.equals(snapshot),
+                    if (existing != null) {
+                        checkArgument(
+                                existing.equals(snapshot),
                                 "Conflicting snapshot identity for %s snapshot %s.",
                                 snapshot.getTableBucket(),
                                 snapshot.getSnapshotID());
-                        return;
+                    } else {
+                        checkArgument(
+                                completedSnapshots.isEmpty()
+                                        || completedSnapshots.peekLast().getSnapshotID()
+                                                < snapshot.getSnapshotID(),
+                                "Cannot register an older snapshot that has already been subsumed.");
                     }
-                    checkState(
-                            completedSnapshots.isEmpty()
-                                    || completedSnapshots.peekLast().getSnapshotID()
-                                            < snapshot.getSnapshotID(),
-                            "Cannot adopt an older snapshot %s.",
-                            snapshot.getSnapshotID());
-                    adoptConfirmedSnapshot(snapshot, snapshotsCleaner, () -> {});
+                    completedSnapshotHandleStore.registerExternal(
+                            snapshot.getTableBucket(),
+                            new CompletedSnapshotHandle(
+                                    snapshot.getSnapshotID(),
+                                    snapshot.getMetadataFilePath(),
+                                    snapshot.getLogOffset()),
+                            coordinatorZkVersion);
+                    if (existing == null) {
+                        adoptConfirmedSnapshot(snapshot, snapshotsCleaner, () -> {});
+                    }
                 });
     }
 
