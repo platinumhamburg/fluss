@@ -343,7 +343,7 @@ class CompletedSnapshotStoreManagerTest {
                                 manager.registerExternalSnapshot(
                                         DATA1_TABLE_PATH, bucket, handle, epoch))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("reserved");
+                .hasMessageContaining("below the target bucket counter");
         new ZkSequenceIDCounter(
                         zookeeperClient.getCuratorClient(),
                         ZkData.BucketSnapshotSequenceIdZNode.path(bucket))
@@ -531,6 +531,15 @@ class CompletedSnapshotStoreManagerTest {
             snapshotHandleMap
                     .computeIfAbsent(tableBucket, k -> new HashMap<>())
                     .put(snapshotId, completedSnapshotHandle);
+        }
+
+        @Override
+        public void registerExternal(
+                TableBucket tableBucket,
+                CompletedSnapshotHandle snapshotHandle,
+                int coordinatorZkVersion) {
+            throw new UnsupportedOperationException(
+                    "External snapshot registration is not supported.");
         }
 
         @Override
