@@ -699,6 +699,59 @@ final class ReplicaTest extends ReplicaTestBase {
     }
 
     @Test
+    void testRecoveryMetadataFailurePreservesLiveKv(@TempDir File snapshotDir) throws Exception {
+        TableBucket bucket = new TableBucket(DATA1_TABLE_ID_PK, 1);
+        AtomicBoolean failLookup = new AtomicBoolean(false);
+        ZooKeeperClient failingRemoteMetadata = spy(zkClient);
+        doThrow(new IOException("Remote manifest metadata unavailable"))
+                .when(failingRemoteMetadata)
+                .getRemoteLogManifestHandle(bucket);
+        TestSnapshotContext context =
+                new TestSnapshotContext(snapshotDir.getPath()) {
+                    @Override
+                    public ZooKeeperClient getZooKeeperClient() {
+                        return failingRemoteMetadata;
+                    }
+
+                    @Override
+                    public FunctionWithException<TableBucket, CompletedSnapshot, Exception>
+                            getLatestCompletedSnapshotProvider() {
+                        FunctionWithException<TableBucket, CompletedSnapshot, Exception> provider =
+                                super.getLatestCompletedSnapshotProvider();
+                        return target -> {
+                            if (failLookup.get()) {
+                                throw new IOException("Snapshot metadata unavailable");
+                            }
+                            return provider.apply(target);
+                        };
+                    }
+                };
+        Replica replica = makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, bucket, context);
+        makeKvReplicaAsLeader(replica, 0);
+        putRecordsToLeader(replica, genKvRecordBatch(Tuple2.of("k1", new Object[] {1, "a"})));
+        context.scheduledExecutorService.triggerAllNonPeriodicTasks();
+        context.testKvSnapshotStore.waitUntilSnapshotComplete(bucket, 0);
+        KvTablet liveKv = replica.getKvTablet();
+        long logEndOffset = replica.getLocalLogEndOffset();
+        failLookup.set(true);
+        assertThatThrownBy(() -> makeKvReplicaAsLeader(replica, 1))
+                .isInstanceOf(KvStorageException.class);
+        assertThat(replica.getLeaderEpoch()).isZero();
+        assertThat(replica.isLeader()).isTrue();
+        assertThat(replica.getKvTablet()).isSameAs(liveKv);
+        assertThat(replica.getLocalLogEndOffset()).isEqualTo(logEndOffset);
+        verifyGetKeyValues(
+                replica.getKvTablet(),
+                getKeyValuePairs(genKvRecords(Tuple2.of("k1", new Object[] {1, "a"}))));
+        failLookup.set(false);
+        makeKvReplicaAsLeader(replica, 1);
+        assertThat(replica.getLeaderEpoch()).isEqualTo(1);
+        verifyGetKeyValues(
+                replica.getKvTablet(),
+                getKeyValuePairs(genKvRecords(Tuple2.of("k1", new Object[] {1, "a"}))));
+    }
+
+    @Test
     void testSnapshotOnlyRecoveryInitializesLogAfterDownload(@TempDir File snapshotDir)
             throws Exception {
         TableBucket bucket = new TableBucket(DATA1_TABLE_ID_PK, 1);
@@ -721,18 +774,8 @@ final class ReplicaTest extends ReplicaTestBase {
         makeKvReplicaAsFollower(producer, 1);
         producer.truncateFullyAndStartAt(0L);
         AtomicBoolean failDownload = new AtomicBoolean(true);
-        ZooKeeperClient recoveringZk = spy(zkClient);
-        doThrow(new IOException("Remote manifest metadata unavailable"))
-                .doCallRealMethod()
-                .when(recoveringZk)
-                .getRemoteLogManifestHandle(bucket);
         TestSnapshotContext context =
                 new TestSnapshotContext(snapshotDir.getPath()) {
-                    @Override
-                    public ZooKeeperClient getZooKeeperClient() {
-                        return recoveringZk;
-                    }
-
                     @Override
                     public FunctionWithException<TableBucket, CompletedSnapshot, Exception>
                             getLatestCompletedSnapshotProvider() {
