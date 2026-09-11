@@ -55,6 +55,25 @@ class LeaderEpochHistoryTest {
     }
 
     @Test
+    void testResumingLatestEpochPreservesItsStartAcrossRestart() throws Exception {
+        File file = new File(directory, "epochs");
+        LeaderEpochHistory history = new LeaderEpochHistory(file);
+        history.assign(1, 0);
+        history.assign(2, 10);
+        history = new LeaderEpochHistory(file);
+        history.assign(2, 20);
+        history = new LeaderEpochHistory(file);
+        assertThat(history.epochForOffset(9, 20)).isEqualTo(1);
+        assertThat(history.epochForOffset(10, 20)).isEqualTo(2);
+        assertThat(history.endOffsetFor(1, 20).get().offset()).isEqualTo(10);
+        LeaderEpochHistory recovered = history;
+        assertThatThrownBy(() -> recovered.assign(1, 20))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> recovered.assign(2, 9))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
     void testEmptyEpochDoesNotChangeLastRecordEpoch() throws Exception {
         LeaderEpochHistory history = new LeaderEpochHistory(new File(directory, "epochs"));
         history.assign(1, 0);

@@ -65,7 +65,9 @@ final class LeaderEpochHistory {
         checkArgument(epoch >= 0 && startOffset >= 0, "Negative epoch or offset.");
         Long existing = epochs.get(epoch);
         if (existing != null) {
-            checkArgument(existing == startOffset, "Epoch already starts at %s", existing);
+            // A restarted leader can resume the latest epoch at a later log end.
+            checkArgument(epoch == epochs.lastKey(), "Epoch must not decrease.");
+            checkArgument(startOffset >= existing, "Epoch already starts at %s", existing);
             return;
         }
         checkArgument(epochs.isEmpty() || epoch > epochs.lastKey(), "Epoch must increase.");

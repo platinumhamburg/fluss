@@ -454,7 +454,8 @@ class LeaderMigrationWalTest {
                         servers.get(leader).conf,
                         servers.get(leader).manager,
                         new ServerNode(
-                                follower, "localhost", 10000 + follower, ServerType.TABLET_SERVER));
+                                follower, "localhost", 10000 + follower, ServerType.TABLET_SERVER),
+                        leader);
         LeaderEndpoint.FetchData data =
                 endpoint.fetchLog(
                                 new FetchLogContext(

@@ -503,8 +503,7 @@ public final class Replica {
 
                             int requestLeaderEpoch = data.getLeaderEpoch();
                             if (requestLeaderEpoch > leaderEpoch) {
-                                boolean resetFollowerOffsets =
-                                        logTablet.isLeaderEpochEnabled() || !isLeader();
+                                boolean resetFollowerOffsets = !isLeader();
                                 leaderEpoch = requestLeaderEpoch;
                                 onBecomeNewLeader();
                                 logTablet.assignLeaderEpoch(leaderEpoch);
