@@ -231,6 +231,21 @@ final class LogTabletTest extends LogTestBase {
     }
 
     @Test
+    void testRemoteCleanupResumesWhenHighWatermarkCatchesUp() throws Exception {
+        for (int i = 0; i < 4; i++) {
+            logTablet.appendAsLeader(genMemoryLogRecordsByObject(DATA1));
+            if (i < 3) {
+                logTablet.roll(Optional.empty());
+            }
+        }
+        logTablet.updateRemoteLogOffsets(0L, 30L, 30L);
+        assertThat(logTablet.logSegments()).hasSize(4);
+        logTablet.updateHighWatermark(30L);
+        assertThat(logTablet.logSegments()).hasSize(1);
+        assertThat(logTablet.localLogStartOffset()).isEqualTo(30L);
+    }
+
+    @Test
     void testRemoteLogOffsetsCanResetAfterEmptyManifest() {
         logTablet.updateRemoteLogOffsets(0L, 10L, 10L);
         assertThat(logTablet.canFetchFromRemoteLog(0L)).isTrue();

@@ -885,6 +885,14 @@ public final class LogTablet {
     }
 
     private void onHighWatermarkUpdated(long previousHighWatermark, long currentHighWatermark) {
+        long cleanupToOffset =
+                remoteLogEndOffset == -1L
+                        ? highestCopiedEndOffset
+                        : Math.min(remoteLogEndOffset, highestCopiedEndOffset);
+        if (previousHighWatermark < cleanupToOffset && currentHighWatermark >= cleanupToOffset) {
+            // Remote offsets may arrive before a follower learns the committed high watermark.
+            deleteSegmentsAlreadyExistsInRemote();
+        }
         if (!isDataLakeEnabled) {
             return;
         }
@@ -1150,8 +1158,7 @@ public final class LogTablet {
                             validRecords);
                 } catch (IOException e) {
                     leaderEpochHistory.markFailed(e);
-                    throw new LogStorageException(
-                            "Failed to append WAL for " + getTableBucket(), e);
+                    throw e;
                 }
                 updateHighWatermarkWithLogEndOffset();
 
