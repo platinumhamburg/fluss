@@ -63,9 +63,7 @@ public class MemoryAllocation implements MemorySegmentPool, AutoCloseable {
     @Override
     public void returnAll(List<MemorySegment> memory) {
         checkState(!closed, "Memory allocation is closed.");
-        if (memory.size() == pages.size()) {
-            pool.returnAll(memory);
-            pages.clear();
+        if (memory.size() == pages.size() && pages.containsAll(memory)) {
         } else {
             // The usual batch cleanup returns all pages. Individual returns are uncommon.
             for (MemorySegment page : memory) {
