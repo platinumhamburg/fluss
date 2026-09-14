@@ -22,7 +22,9 @@ import org.apache.fluss.annotation.Internal;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
 
 import static org.apache.fluss.utils.Preconditions.checkState;
 
@@ -63,14 +65,43 @@ public class MemoryAllocation implements MemorySegmentPool, AutoCloseable {
     @Override
     public void returnAll(List<MemorySegment> memory) {
         checkState(!closed, "Memory allocation is closed.");
-        if (memory.size() == pages.size() && pages.containsAll(memory)) {
-        } else {
-            // The usual batch cleanup returns all pages. Individual returns are uncommon.
-            for (MemorySegment page : memory) {
-                checkState(pages.remove(page), "Page does not belong to this allocation.");
-                pool.returnPage(page);
+        if (memory.isEmpty()) {
+            return;
+        }
+        checkState(memory.size() <= pages.size(), "Returned more pages than this allocation owns.");
+        if (ownsAllInOrder(memory)) {
+            pool.returnAll(memory);
+            pages.clear();
+            return;
+        }
+
+        // Validate the entire return before publishing any page to the pool.
+        Set<MemorySegment> returned = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (MemorySegment page : memory) {
+            checkState(returned.add(page), "Page is returned more than once.");
+        }
+        int owned = 0;
+        for (MemorySegment page : pages) {
+            if (returned.contains(page)) {
+                owned++;
             }
         }
+        checkState(owned == returned.size(), "Page does not belong to this allocation.");
+        pool.returnAll(memory);
+        pages.removeIf(returned::contains);
+    }
+
+    private boolean ownsAllInOrder(List<MemorySegment> memory) {
+        if (memory.size() != pages.size()) {
+            return false;
+        }
+        int index = 0;
+        for (MemorySegment page : memory) {
+            if (page != pages.get(index++)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     @Override

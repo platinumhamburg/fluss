@@ -22,9 +22,13 @@ import org.apache.fluss.exception.RecordTooLargeException;
 import org.apache.fluss.exception.TimeoutException;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -38,6 +42,75 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Regression tests for batch allocation progress and cleanup. */
 class MemoryAllocationTest {
+
+    @ParameterizedTest
+    @ValueSource(strings = {"ordered", "reversed", "partial", "single"})
+    void testReturnOwnedPages(String order) throws Exception {
+        try (LazyMemorySegmentPool pool = new LazyMemorySegmentPool(4, 128, 1000, 128);
+                MemoryAllocation allocation = pool.newAllocation();
+                MemoryAllocation other = pool.newAllocation()) {
+            List<MemorySegment> owned = allocation.allocatePages(3);
+            MemorySegment foreign = other.nextSegment();
+            List<MemorySegment> returned;
+            switch (order) {
+                case "ordered":
+                    returned = owned;
+                    break;
+                case "reversed":
+                    returned = Arrays.asList(owned.get(2), owned.get(1), owned.get(0));
+                    break;
+                case "partial":
+                    returned = Arrays.asList(owned.get(2), owned.get(0));
+                    break;
+                default:
+                    returned = Collections.singletonList(owned.get(1));
+            }
+            allocation.returnAll(returned);
+            assertThat(pool.freePages()).isEqualTo(returned.size());
+            List<MemorySegment> reused = allocation.allocatePages(returned.size());
+            assertThat(reused)
+                    .containsExactlyInAnyOrderElementsOf(returned)
+                    .doesNotContain(foreign);
+            allocation.close();
+            assertThat(pool.freePages()).isEqualTo(3);
+            other.close();
+            assertThat(pool.freePages()).isEqualTo(4);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"duplicate", "foreign", "partial-duplicate", "partial-foreign"})
+    void testInvalidReturnLeavesOwnershipUnchanged(String invalid) throws Exception {
+        try (LazyMemorySegmentPool pool = new LazyMemorySegmentPool(4, 128, 1000, 128);
+                MemoryAllocation allocation = pool.newAllocation();
+                MemoryAllocation other = pool.newAllocation()) {
+            List<MemorySegment> owned = allocation.allocatePages(3);
+            MemorySegment foreign = other.nextSegment();
+            List<MemorySegment> returned;
+            switch (invalid) {
+                case "duplicate":
+                    returned = Arrays.asList(owned.get(0), owned.get(0), owned.get(2));
+                    break;
+                case "foreign":
+                    returned = Arrays.asList(owned.get(0), owned.get(1), foreign);
+                    break;
+                case "partial-duplicate":
+                    returned = Arrays.asList(owned.get(0), owned.get(0));
+                    break;
+                default:
+                    returned = Arrays.asList(owned.get(0), foreign);
+            }
+            assertThatThrownBy(() -> allocation.returnAll(returned))
+                    .isInstanceOf(IllegalStateException.class);
+            assertThat(pool.freePages()).isZero();
+            allocation.returnAll(owned);
+            assertThat(pool.freePages()).isEqualTo(3);
+            allocation.close();
+            assertThat(pool.freePages()).isEqualTo(3);
+            other.returnPage(foreign);
+            assertThat(pool.freePages()).isEqualTo(4);
+        }
+    }
 
     @Test
     void testCumulativeAllocationExceedsCapacity() throws Exception {
