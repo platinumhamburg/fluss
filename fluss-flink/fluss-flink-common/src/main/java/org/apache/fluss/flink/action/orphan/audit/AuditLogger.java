@@ -233,4 +233,15 @@ public final class AuditLogger {
                 dryRun,
                 Instant.now());
     }
+
+    /** Scan a log bucket for which metadata reports no committed remote manifest. */
+    public void logScanLogBucketWithoutManifest(long tableId, Long partitionId, int bucketId) {
+        AUDIT.info(
+                "action=scan_log_bucket_without_manifest reason=no_remote_manifest"
+                        + " table_id={} partition_id={} bucket_id={} ts={}",
+                tableId,
+                partitionId,
+                bucketId,
+                Instant.now());
+    }
 }

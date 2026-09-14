@@ -435,8 +435,14 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
                                 logResult.readFailureReason(bucketId));
                         break;
                     case NOT_LISTED:
-                        audit.logSkipLogBucket(
-                                liveTable.tableId, partitionId, bucketId, "no_remote_manifest");
+                        logTabletDir =
+                                FlussPaths.remoteLogTabletDir(
+                                                remoteLogDir,
+                                                physicalPath(liveTable.tablePath, partitionInfo),
+                                                tableBucket)
+                                        .toString();
+                        audit.logScanLogBucketWithoutManifest(
+                                liveTable.tableId, partitionId, bucketId);
                         break;
                     default:
                         break;

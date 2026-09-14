@@ -275,15 +275,29 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
                                         && m.contains(activeSegment.toString()));
     }
 
+    @Test
+    void cleansOldLogSegmentWhenBucketHasNoRemoteManifest() throws Exception {
+        String dbName = newDatabaseName("nomanifest");
+        TablePath tablePath = createLogTable(dbName, "partial_first_tiering");
+        Path orphan = createOldSegmentFile(tablePath, "99999999999999999999.log");
+
+        runCleanerForDatabase(false, dbName);
+
+        assertThat(Files.exists(orphan)).isFalse();
+        assertThat(auditMessages())
+                .anyMatch(
+                        message ->
+                                message.contains("action=scan_log_bucket_without_manifest")
+                                        && message.contains("reason=no_remote_manifest"));
+    }
+
     /**
      * Seeds a remote log manifest + matching active segment under a freshly-allocated UUID so the
      * active-file cleanup reaches {@code ManifestReadStatus.RESOLVED} for bucket 0 of the given log
      * table. Returns the active segment's {@code .log} path so callers can assert it survives
      * cleanup.
      *
-     * <p>Without a manifest the bucket falls back to {@code ManifestReadStatus.NOT_LISTED} and the
-     * active-file cleanup skips the entire bucket (see §4.3.1 of the design doc) — which would
-     * prevent any orphan file under the bucket from being visited at all.
+     * <p>This helper gives tests a non-empty active log reference set.
      */
     private Path seedActiveBucketManifest(TablePath tablePath) throws Exception {
         TableInfo tableInfo = admin.getTableInfo(tablePath).get();
