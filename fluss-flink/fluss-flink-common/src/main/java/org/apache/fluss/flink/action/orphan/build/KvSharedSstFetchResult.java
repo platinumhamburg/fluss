@@ -46,6 +46,7 @@ import java.util.Set;
 public final class KvSharedSstFetchResult {
 
     private final boolean ok;
+    private final boolean snapshotRefreshFailed;
     private final boolean targetDisappeared;
     private final boolean metadataNotFound;
     private final Set<String> sharedSstFileNames;
@@ -55,9 +56,11 @@ public final class KvSharedSstFetchResult {
             boolean ok,
             boolean metadataNotFound,
             boolean targetDisappeared,
+            boolean snapshotRefreshFailed,
             Set<String> sharedSstFileNames,
             @Nullable String failureReason) {
         this.ok = ok;
+        this.snapshotRefreshFailed = snapshotRefreshFailed;
         this.targetDisappeared = targetDisappeared;
         this.metadataNotFound = metadataNotFound;
         this.sharedSstFileNames = Collections.unmodifiableSet(new HashSet<>(sharedSstFileNames));
@@ -66,7 +69,7 @@ public final class KvSharedSstFetchResult {
 
     /** All active snapshot metadata reads succeeded; the active set is complete. */
     public static KvSharedSstFetchResult ok(Set<String> sharedSstFileNames) {
-        return new KvSharedSstFetchResult(true, false, false, sharedSstFileNames, null);
+        return new KvSharedSstFetchResult(true, false, false, false, sharedSstFileNames, null);
     }
 
     /**
@@ -74,21 +77,34 @@ public final class KvSharedSstFetchResult {
      * must be skipped for this bucket.
      */
     public static KvSharedSstFetchResult failed(String reason) {
-        return new KvSharedSstFetchResult(false, false, false, Collections.emptySet(), reason);
+        return new KvSharedSstFetchResult(
+                false, false, false, false, Collections.emptySet(), reason);
     }
 
     /** Snapshot metadata disappeared after the active-snapshot view was obtained. */
     public static KvSharedSstFetchResult notFound(String reason) {
-        return new KvSharedSstFetchResult(false, true, false, Collections.emptySet(), reason);
+        return new KvSharedSstFetchResult(
+                false, true, false, false, Collections.emptySet(), reason);
     }
 
     /** The table or partition disappeared during snapshot refresh; stop enumerating it. */
     public static KvSharedSstFetchResult targetDisappeared(String reason) {
-        return new KvSharedSstFetchResult(false, false, true, Collections.emptySet(), reason);
+        return new KvSharedSstFetchResult(
+                false, false, true, false, Collections.emptySet(), reason);
     }
 
     public boolean targetDisappeared() {
         return targetDisappeared;
+    }
+
+    /** Snapshot list refresh failed before a complete replacement view could be obtained. */
+    public static KvSharedSstFetchResult refreshFailed(String reason) {
+        return new KvSharedSstFetchResult(
+                false, false, false, true, Collections.emptySet(), reason);
+    }
+
+    public boolean snapshotRefreshFailed() {
+        return snapshotRefreshFailed;
     }
 
     /** Whether all metadata reads completed successfully. */

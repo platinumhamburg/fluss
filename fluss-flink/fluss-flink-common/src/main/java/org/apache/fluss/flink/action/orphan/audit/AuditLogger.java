@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.action.orphan.audit;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
 import org.apache.fluss.fs.FsPath;
 
@@ -194,6 +195,23 @@ public final class AuditLogger {
                 Instant.now());
     }
 
+    /** Record a table or partition that disappeared after metadata scope enumeration. */
+    public void logScopeTargetDisappeared(
+            long tableId, Long partitionId, long expectedBuckets, Throwable cause) {
+        String reason =
+                cause instanceof PartitionNotExistException
+                        ? "partition_not_exist"
+                        : "table_not_exist";
+        AUDIT.info(
+                "action=scope_target_disappeared reason={} table_id={} partition_id={}"
+                        + " expected_buckets={} ts={}",
+                reason,
+                tableId,
+                partitionId,
+                expectedBuckets,
+                Instant.now());
+    }
+
     /**
      * Skip log cleanup for a single bucket whose remote manifest was not returned by the {@code
      * ListRemoteLogManifests} RPC (the bucket has not yet committed any remote manifest).
@@ -241,32 +259,6 @@ public final class AuditLogger {
                 tableId,
                 partitionId,
                 resolvedRoot,
-                Instant.now());
-    }
-
-    /**
-     * Final summary event emitted once at the end of a run, carrying the headline counters that
-     * operators query most often ("how many files were removed and how much space was reclaimed").
-     * Routed through the dedicated audit logger so the result is queryable from the same sink as
-     * the per-file {@code action=deleted} / {@code action=skip_*} lines.
-     */
-    public void logSummary(
-            long scanned,
-            long deletedFiles,
-            long emptyDirsRemoved,
-            long deleteFailures,
-            long bytesReclaimed,
-            boolean dryRun) {
-        AUDIT.info(
-                "action=summary scanned={} deleted_total={} deleted_files={} empty_dirs_removed={}"
-                        + " delete_failures={} bytes_reclaimed={} dry_run={} ts={}",
-                scanned,
-                deletedFiles + emptyDirsRemoved,
-                deletedFiles,
-                emptyDirsRemoved,
-                deleteFailures,
-                bytesReclaimed,
-                dryRun,
                 Instant.now());
     }
 

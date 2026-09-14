@@ -526,6 +526,7 @@ class ActiveRefsFetcherTest {
 
         assertThat(result.allMetadataReadOk()).isFalse();
         assertThat(result.failureReason()).contains("Failed to refresh active KV snapshots");
+        assertThat(result.snapshotRefreshFailed()).isTrue();
         assertThat(activeByBucket).containsEntry(0, Collections.singleton("snap-5"));
         assertThat(rpcCalls).hasValue(1);
     }

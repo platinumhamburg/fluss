@@ -360,7 +360,7 @@ public final class ActiveRefsFetcher {
             if (refreshed.listFailureCategory() == RpcErrorClassifier.Category.NOT_FOUND) {
                 return KvSharedSstFetchResult.targetDisappeared(refreshed.listFailureReason());
             }
-            return KvSharedSstFetchResult.failed(
+            return KvSharedSstFetchResult.refreshFailed(
                     "Failed to refresh active KV snapshots: " + refreshed.listFailureReason());
         }
 

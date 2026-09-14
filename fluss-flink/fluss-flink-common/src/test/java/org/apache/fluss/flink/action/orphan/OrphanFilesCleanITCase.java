@@ -164,6 +164,56 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
     private static final Duration OLD_ENOUGH = Duration.ofDays(2);
 
     @Test
+    void emptyScopeEmitsCompleteResultsForEverySubtask() throws Exception {
+        String runId = "empty-" + System.nanoTime();
+        runCleanerForDatabase(
+                true,
+                newDatabaseName("absent"),
+                "--parallelism",
+                "3",
+                "--conf",
+                "audit.run-id=" + runId,
+                "--conf",
+                "audit.cluster-id=test-cluster");
+        List<String> events =
+                auditMessages().stream()
+                        .filter(message -> message.contains("run_id=" + runId + " "))
+                        .collect(java.util.stream.Collectors.toList());
+        assertThat(events)
+                .allMatch(
+                        message ->
+                                message.contains("audit_version=1")
+                                        && message.contains("cluster_id=test-cluster"));
+        assertThat(events.stream().filter(message -> message.contains("action=scope_plan ")))
+                .singleElement()
+                .asString()
+                .contains("bucket_tasks=0", "orphan_dir_tasks=0");
+        List<String> scans =
+                events.stream()
+                        .filter(message -> message.contains("action=scan_subtask_summary "))
+                        .collect(java.util.stream.Collectors.toList());
+        assertThat(scans)
+                .hasSize(3)
+                .allMatch(
+                        message ->
+                                message.contains("tasks_completed=0")
+                                        && message.contains("attempt=0")
+                                        && message.contains("dry_run=true"));
+        for (int subtask = 0; subtask < 3; subtask++) {
+            final String expected = "subtask=" + subtask + " ";
+            assertThat(scans).anyMatch(message -> message.contains(expected));
+        }
+        assertThat(events.stream().filter(message -> message.contains("action=audit_integrity ")))
+                .singleElement()
+                .asString()
+                .doesNotContain("=false");
+        assertThat(events.stream().filter(message -> message.contains("action=summary ")))
+                .singleElement()
+                .asString()
+                .contains("scanned=0", "deleted_files=0", "dry_run=true");
+    }
+
+    @Test
     @MultiVersionTest
     void mixedOrphanAndActiveFilesInSameBucket() throws Exception {
         String dbName = newDatabaseName("mixed");
@@ -276,22 +326,6 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
     }
 
     @Test
-    void cleansOldLogSegmentWhenBucketHasNoRemoteManifest() throws Exception {
-        String dbName = newDatabaseName("nomanifest");
-        TablePath tablePath = createLogTable(dbName, "partial_first_tiering");
-        Path orphan = createOldSegmentFile(tablePath, "99999999999999999999.log");
-
-        runCleanerForDatabase(false, dbName);
-
-        assertThat(Files.exists(orphan)).isFalse();
-        assertThat(auditMessages())
-                .anyMatch(
-                        message ->
-                                message.contains("action=scan_log_bucket_without_manifest")
-                                        && message.contains("reason=no_remote_manifest"));
-    }
-
-    @Test
     void cleansOldSnapshotWhenBucketHasNoActiveSnapshots() throws Exception {
         String dbName = newDatabaseName("no_snapshot");
         TablePath tablePath = createPrimaryKeyTable(dbName, "partial_first_snapshot");
@@ -324,6 +358,34 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
                                 message.contains("action=deleted")
                                         && message.contains("rule=kv-snapshot-file")
                                         && message.contains(orphan.toString()));
+        assertThat(auditMessages())
+                .anyMatch(
+                        message ->
+                                message.contains("action=coverage_summary")
+                                        && message.contains("no_remote_manifest_targets=0")
+                                        && message.contains("empty_active_set_targets=0"));
+    }
+
+    @Test
+    void cleansOldLogSegmentWhenBucketHasNoRemoteManifest() throws Exception {
+        String dbName = newDatabaseName("nomanifest");
+        TablePath tablePath = createLogTable(dbName, "partial_first_tiering");
+        Path orphan = createOldSegmentFile(tablePath, "99999999999999999999.log");
+
+        runCleanerForDatabase(false, dbName);
+
+        assertThat(Files.exists(orphan)).isFalse();
+        assertThat(auditMessages())
+                .anyMatch(
+                        message ->
+                                message.contains("action=scan_log_bucket_without_manifest")
+                                        && message.contains("reason=no_remote_manifest"));
+        assertThat(auditMessages())
+                .anyMatch(
+                        message ->
+                                message.contains("action=coverage_summary")
+                                        && message.contains("no_remote_manifest_targets=0")
+                                        && message.contains("empty_active_set_targets=0"));
     }
 
     /**
@@ -332,7 +394,7 @@ abstract class OrphanFilesCleanITCase extends AbstractTestBase {
      * table. Returns the active segment's {@code .log} path so callers can assert it survives
      * cleanup.
      *
-     * <p>This helper gives tests a non-empty active log reference set.
+     * <p>The helper installs a manifest so the bucket is included in remote log cleanup.
      */
     private Path seedActiveBucketManifest(TablePath tablePath) throws Exception {
         TableInfo tableInfo = admin.getTableInfo(tablePath).get();

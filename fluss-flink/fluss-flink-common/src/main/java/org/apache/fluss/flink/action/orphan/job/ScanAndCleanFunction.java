@@ -20,6 +20,7 @@ package org.apache.fluss.flink.action.orphan.job;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.audit.ResultAuditLogger;
 import org.apache.fluss.flink.action.orphan.fs.FileSystemProbe;
 import org.apache.fluss.flink.action.orphan.fs.SafeDeleter;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
@@ -28,12 +29,14 @@ import org.apache.fluss.flink.action.orphan.rule.FileMeta;
 import org.apache.fluss.flink.action.orphan.rule.FileRule;
 import org.apache.fluss.flink.action.orphan.rule.MtimePolicy;
 import org.apache.fluss.flink.action.orphan.rule.RuleDispatcher;
+import org.apache.fluss.flink.adapter.RuntimeContextAdapter;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
 
 import org.apache.flink.streaming.api.functions.ProcessFunction;
+import org.apache.flink.streaming.api.operators.StreamingRuntimeContext;
 import org.apache.flink.util.Collector;
 
 import java.io.IOException;
@@ -67,11 +70,30 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     private final long remoteFsOpRateLimitPerSecond;
     private final Map<String, String> extraConfigs;
 
+    private final ResultAuditLogger resultAudit;
+    private final boolean dryRun;
+    private transient CleanupCounters subtaskCounters;
+    private transient RuleSummary subtaskRules;
+    private transient long tasksCompleted;
     private transient AuditLogger audit;
     private transient RateLimiter remoteFsOpRateLimiter;
 
     public ScanAndCleanFunction(
             long remoteFsOpRateLimitPerSecond, Map<String, String> extraConfigs) {
+        this(
+                remoteFsOpRateLimitPerSecond,
+                extraConfigs,
+                false,
+                new ResultAuditLogger(extraConfigs));
+    }
+
+    public ScanAndCleanFunction(
+            long remoteFsOpRateLimitPerSecond,
+            Map<String, String> extraConfigs,
+            boolean dryRun,
+            ResultAuditLogger resultAudit) {
+        this.dryRun = dryRun;
+        this.resultAudit = resultAudit;
         this.remoteFsOpRateLimitPerSecond = remoteFsOpRateLimitPerSecond;
         this.extraConfigs = extraConfigs;
     }
@@ -84,6 +106,9 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
             FileSystem.initialize(Configuration.fromMap(extraConfigs), null);
         }
         audit = new AuditLogger();
+        subtaskCounters = CleanupCounters.empty();
+        subtaskRules = new RuleSummary();
+        tasksCompleted = 0;
         int parallelism = getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks();
         int subtaskIndex = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
         // Distribute the configured rate as base + 1 extra for the first `remainder` subtasks.
@@ -98,11 +123,35 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     @Override
     public void processElement(CleanTask task, Context ctx, Collector<CleanStats> out)
             throws Exception {
-        if (task instanceof BucketCleanTask) {
-            out.collect(processBucketTask((BucketCleanTask) task));
+        if (task instanceof ScopeSummaryTask) {
+            out.collect(CleanStats.scopeSummary(((ScopeSummaryTask) task).coverage()));
+        } else if (task instanceof BucketCleanTask) {
+            emitTaskStats(processBucketTask((BucketCleanTask) task), out);
         } else if (task instanceof OrphanDirCleanTask) {
-            out.collect(processOrphanDirTask((OrphanDirCleanTask) task));
+            emitTaskStats(processOrphanDirTask((OrphanDirCleanTask) task), out);
         }
+    }
+
+    private void emitTaskStats(CleanStats stats, Collector<CleanStats> out) {
+        subtaskCounters = subtaskCounters.add(stats.counters());
+        subtaskRules.add(stats.rules());
+        tasksCompleted++;
+        out.collect(stats);
+    }
+
+    @Override
+    public void close() throws Exception {
+        if (subtaskCounters != null) {
+            resultAudit.subtask(
+                    RuntimeContextAdapter.getIndexOfThisSubtask(
+                            (StreamingRuntimeContext) getRuntimeContext()),
+                    RuntimeContextAdapter.getAttemptNumber(getRuntimeContext()),
+                    tasksCompleted,
+                    subtaskCounters,
+                    subtaskRules,
+                    dryRun);
+        }
+        super.close();
     }
 
     // -------------------------------------------------------------------------
@@ -129,16 +178,28 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         SafeDeleter safeDeleter = createSafeDeleter(anyDir.getFileSystem(), task.dryRun());
         BucketCleaner cleaner =
                 new BucketCleaner(
-                        dispatcher, safeDeleter, audit, task.cutoffMillis(), remoteFsOpRateLimiter);
+                        dispatcher,
+                        safeDeleter,
+                        audit,
+                        task.cutoffMillis(),
+                        remoteFsOpRateLimiter,
+                        task.dryRun());
 
         BucketCleaner.BucketCleanStats bucketStats = cleaner.clean(activeRefs, logDir, kvDir);
 
-        return new CleanStats(
-                bucketStats.scanned,
-                bucketStats.deleted,
-                bucketStats.emptyDirsRemoved,
-                bucketStats.deleteFailures,
-                bucketStats.bytesReclaimed);
+        CleanStats result =
+                new CleanStats(
+                        new CleanupCounters(
+                                bucketStats.scannedFiles,
+                                bucketStats.plannedFiles,
+                                bucketStats.plannedDirs,
+                                bucketStats.plannedBytes,
+                                bucketStats.deletedFiles,
+                                bucketStats.emptyDirsRemoved,
+                                bucketStats.deleteFailures,
+                                bucketStats.bytesReclaimed));
+        result.rules().add(bucketStats.rules);
+        return result;
     }
 
     // -------------------------------------------------------------------------
@@ -152,7 +213,11 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         SafeDeleter safeDeleter = createSafeDeleter(fs, task.dryRun());
         RuleDispatcher dispatcher = new RuleDispatcher(task.allowDeleteManifest());
 
+        RuleSummary rules = new RuleSummary();
         long scanned = 0L;
+        long plannedFiles = 0L;
+        long plannedDirs = 0L;
+        long plannedBytes = 0L;
         long deleted = 0L;
         long emptyDirsRemoved = 0L;
         long deleteFailures = 0L;
@@ -161,9 +226,12 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         Optional<FileStatus> rootStatusResult =
                 FileSystemProbe.getFileStatus(fs, dirPath, remoteFsOpRateLimiter);
         if (!rootStatusResult.isPresent()) {
-            return CleanStats.empty();
+            CleanStats missing = CleanStats.empty();
+            missing.rules().recordMissingDirectory();
+            return missing;
         }
         FileStatus rootStatus = rootStatusResult.get();
+        rules.recordDirectoryMtime(rootStatus.getModificationTime());
         Deque<DirVisit> stack = new ArrayDeque<DirVisit>();
         stack.push(
                 new DirVisit(
@@ -173,26 +241,40 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                                 && MtimePolicy.evaluateInactiveFile(
                                                 rootStatus.getModificationTime(),
                                                 task.cutoffMillis())
-                                        == Decision.DELETE));
+                                        == Decision.DELETE,
+                        null));
         while (!stack.isEmpty()) {
             DirVisit visit = stack.pop();
             if (visit.postOrder) {
-                if (visit.oldEnough && safeDeleter.deleteEmptyDir(visit.dir)) {
-                    deleted++;
-                    emptyDirsRemoved++;
+                if (visit.oldEnough && !visit.hasRemainingChild) {
+                    plannedDirs++;
+                    if (task.dryRun()) {
+                        audit.logWouldDeleteDir(visit.dir);
+                    } else if (safeDeleter.deleteEmptyDir(visit.dir)) {
+                        emptyDirsRemoved++;
+                    } else {
+                        deleteFailures++;
+                        visit.markParentRemaining();
+                    }
+                } else {
+                    visit.markParentRemaining();
                 }
                 continue;
             }
             Optional<FileStatus[]> listing =
                     FileSystemProbe.listStatus(fs, visit.dir, remoteFsOpRateLimiter);
             if (!listing.isPresent()) {
+                rules.recordMissingDirectory();
+                visit.markParentRemaining();
                 continue;
             }
             FileStatus[] children = listing.get();
-            stack.push(new DirVisit(visit.dir, true, visit.oldEnough));
+            visit.postOrder = true;
+            stack.push(visit);
             for (FileStatus child : children) {
                 FsPath childPath = child.getPath();
                 if (child.isDir()) {
+                    rules.recordDirectoryMtime(child.getModificationTime());
                     stack.push(
                             new DirVisit(
                                     childPath,
@@ -200,41 +282,57 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                                     MtimePolicy.evaluateInactiveFile(
                                                     child.getModificationTime(),
                                                     task.cutoffMillis())
-                                            == Decision.DELETE));
+                                            == Decision.DELETE,
+                                    visit));
                     continue;
                 }
                 scanned++;
-                if (MtimePolicy.evaluateInactiveFile(
-                                child.getModificationTime(), task.cutoffMillis())
-                        != Decision.DELETE) {
-                    continue;
-                }
                 FileMeta meta =
                         new FileMeta(childPath, child.getLen(), child.getModificationTime());
                 FileRule rule = dispatcher.dispatch(meta);
                 Decision decision =
                         rule.evaluate(meta, BucketActiveRefs.knownEmpty(), task.cutoffMillis());
+                rules.record(rule.id(), decision, meta.size());
                 switch (decision) {
                     case DELETE:
+                        plannedFiles++;
+                        plannedBytes += meta.size();
                         if (safeDeleter.deleteFile(meta.path(), decision, rule.id())) {
-                            deleted++;
-                            bytesReclaimed += meta.size();
+                            if (!task.dryRun()) {
+                                deleted++;
+                                bytesReclaimed += meta.size();
+                            }
                         } else {
                             deleteFailures++;
+                            visit.hasRemainingChild = true;
                         }
                         break;
                     case SKIP_UNKNOWN:
                         audit.logSkipUnknown(meta.path(), rule.id());
+                        visit.hasRemainingChild = true;
                         break;
                     case KEEP_ACTIVE:
                     case DEFER:
                     default:
+                        visit.hasRemainingChild = true;
                         break;
                 }
             }
         }
 
-        return new CleanStats(scanned, deleted, emptyDirsRemoved, deleteFailures, bytesReclaimed);
+        CleanStats result =
+                new CleanStats(
+                        new CleanupCounters(
+                                scanned,
+                                plannedFiles,
+                                plannedDirs,
+                                plannedBytes,
+                                deleted,
+                                emptyDirsRemoved,
+                                deleteFailures,
+                                bytesReclaimed));
+        result.rules().add(rules);
+        return result;
     }
 
     // -------------------------------------------------------------------------
@@ -254,13 +352,22 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
 
     private static final class DirVisit {
         private final FsPath dir;
-        private final boolean postOrder;
+        private boolean postOrder;
         private final boolean oldEnough;
+        private final DirVisit parent;
+        private boolean hasRemainingChild;
 
-        private DirVisit(FsPath dir, boolean postOrder, boolean oldEnough) {
+        private DirVisit(FsPath dir, boolean postOrder, boolean oldEnough, DirVisit parent) {
             this.dir = dir;
             this.postOrder = postOrder;
             this.oldEnough = oldEnough;
+            this.parent = parent;
+        }
+
+        private void markParentRemaining() {
+            if (parent != null) {
+                parent.hasRemainingChild = true;
+            }
         }
     }
 }
