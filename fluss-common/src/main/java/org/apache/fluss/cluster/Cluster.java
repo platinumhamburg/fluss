@@ -136,25 +136,24 @@ public final class Cluster {
                         new ArrayList<>(tablePathAndBucketLocations.getValue()));
             }
         }
-        // resolve the invalid table or partition keys so the bucket count map can be filtered
-        Set<TableOrPartition> invalidTableOrPartitions = new HashSet<>();
+        // A partition's bucket count never changes once determined (partition ids are
+        // globally unique and immutable), so invalidating locations must preserve known
+        // per-partition counts; dropping them would make the writer fall back to a stale
+        // table-level count and route a retry to the wrong bucket. Only table-level counts
+        // (non-partitioned) are dropped, so a rescale re-resolves from fresh metadata.
+        Set<TableOrPartition> invalidTables = new HashSet<>();
         for (PhysicalTablePath path : physicalTablesToInvalid) {
             if (path.getPartitionName() == null) {
                 Long tableId = tableIdByPath.get(path.getTablePath());
                 if (tableId != null) {
-                    invalidTableOrPartitions.add(TableOrPartition.ofTable(tableId));
-                }
-            } else {
-                Long partitionId = partitionsIdByPath.get(path);
-                if (partitionId != null) {
-                    invalidTableOrPartitions.add(TableOrPartition.ofPartition(partitionId));
+                    invalidTables.add(TableOrPartition.ofTable(tableId));
                 }
             }
         }
         Map<TableOrPartition, Integer> newBucketCountByTableOrPartition = new HashMap<>();
         for (Map.Entry<TableOrPartition, Integer> entry :
                 bucketCountByTableOrPartition.entrySet()) {
-            if (!invalidTableOrPartitions.contains(entry.getKey())) {
+            if (!invalidTables.contains(entry.getKey())) {
                 newBucketCountByTableOrPartition.put(entry.getKey(), entry.getValue());
             }
         }

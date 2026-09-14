@@ -298,6 +298,33 @@ public final class WriteRecord {
         return estimatedSizeInBytes;
     }
 
+    // A positive per-entry charge also bounds queues of deletes and very small rows. Generic
+    // Arrow rows remain on the calling thread until routing is available instead of being copied
+    // before their retained size can be bounded.
+    long pendingSizeInBytes() {
+        if (row != null && !(row instanceof BinaryRow)) {
+            return Long.MAX_VALUE;
+        }
+        return 256L
+                + (row == null ? 0 : ((BinaryRow) row).getSizeInBytes())
+                + (key == null ? 0 : key.length)
+                + (bucketKey == null ? 0 : bucketKey.length)
+                + (targetColumns == null ? 0 : 4L * targetColumns.length);
+    }
+
+    WriteRecord copy() {
+        return new WriteRecord(
+                tableInfo,
+                physicalTablePath,
+                key == null ? null : key.clone(),
+                bucketKey == null ? null : bucketKey.clone(),
+                row == null ? null : ((BinaryRow) row).copy(),
+                writeFormat,
+                targetColumns == null ? null : targetColumns.clone(),
+                estimatedSizeInBytes,
+                mergeMode);
+    }
+
     public int getSchemaId() {
         return tableInfo.getSchemaId();
     }

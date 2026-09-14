@@ -320,27 +320,6 @@ class RecordAccumulatorTest {
     }
 
     @Test
-    void testAppendRollsNewBatchWhenBucketCountChanges() throws Exception {
-        int batchSize = 1024;
-        IndexedRow row = indexedRow(DATA1_ROW_TYPE, new Object[] {1, "a"});
-        RecordAccumulator accum = createTestRecordAccumulator(batchSize, 10L * batchSize);
-
-        accum.append(createRecord(row), writeCallback, cluster, 0, numBuckets, false);
-        accum.append(createRecord(row), writeCallback, cluster, 0, numBuckets + 1, false);
-
-        Deque<WriteBatch> writeBatches =
-                accum.getReadyDeque(DATA1_PHYSICAL_TABLE_PATH, tb1.getBucket());
-        assertThat(writeBatches).hasSize(2);
-        Iterator<WriteBatch> batchIterator = writeBatches.iterator();
-        WriteBatch oldBatch = batchIterator.next();
-        assertThat(oldBatch.isClosed()).isTrue();
-        assertThat(oldBatch.getBucketCount()).isEqualTo(numBuckets);
-        WriteBatch newBatch = batchIterator.next();
-        assertThat(newBatch.isClosed()).isFalse();
-        assertThat(newBatch.getBucketCount()).isEqualTo(numBuckets + 1);
-    }
-
-    @Test
     void testAppendRollsNewBatchWhenSchemaIdChanges() throws Exception {
         int batchSize = 1024;
         IndexedRow row = indexedRow(DATA1_ROW_TYPE, new Object[] {1, "a"});

@@ -408,14 +408,16 @@ class AutoPartitionedTableITCase extends ClientToServerITCaseBase {
 
         assertThatThrownBy(
                         () ->
-                                upsertWriter.upsert(
-                                        row(
-                                                2,
-                                                "b",
-                                                LocalDate.now()
-                                                        .format(
-                                                                DateTimeFormatter.ofPattern(
-                                                                        "yyyyMMdd")))))
+                                upsertWriter
+                                        .upsert(
+                                                row(
+                                                        2,
+                                                        "b",
+                                                        LocalDate.now()
+                                                                .format(
+                                                                        DateTimeFormatter.ofPattern(
+                                                                                "yyyyMMdd"))))
+                                        .get())
                 .rootCause()
                 .isInstanceOf(InvalidPartitionException.class)
                 .hasMessageContaining("yyyy-MM-dd")
@@ -460,7 +462,7 @@ class AutoPartitionedTableITCase extends ClientToServerITCaseBase {
         UpsertWriter upsertWriter = table.newUpsert().createWriter();
 
         // Write a row with a partition value that doesn't match the YEAR format 'yyyy'.
-        assertThatThrownBy(() -> upsertWriter.upsert(row(1, "a", "2024-03-25")))
+        assertThatThrownBy(() -> upsertWriter.upsert(row(1, "a", "2024-03-25")).get())
                 .rootCause()
                 .isInstanceOf(InvalidPartitionException.class)
                 .hasMessageContaining(
@@ -471,7 +473,7 @@ class AutoPartitionedTableITCase extends ClientToServerITCaseBase {
                 LocalDate.now().minusYears(8).format(DateTimeFormatter.ofPattern("yyyy"));
         String earliestRetainedPartition =
                 LocalDate.now().minusYears(7).format(DateTimeFormatter.ofPattern("yyyy"));
-        assertThatThrownBy(() -> upsertWriter.upsert(row(1, "a", outOfYearPartition)))
+        assertThatThrownBy(() -> upsertWriter.upsert(row(1, "a", outOfYearPartition)).get())
                 .rootCause()
                 .isInstanceOf(InvalidPartitionException.class)
                 .hasMessageContaining(

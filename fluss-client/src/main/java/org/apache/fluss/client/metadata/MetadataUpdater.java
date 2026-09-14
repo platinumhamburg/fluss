@@ -18,7 +18,9 @@
 package org.apache.fluss.client.metadata;
 
 import org.apache.fluss.annotation.VisibleForTesting;
+import org.apache.fluss.client.utils.ClientRpcMessageUtils;
 import org.apache.fluss.client.utils.ClientUtils;
+import org.apache.fluss.client.utils.MetadataUtils;
 import org.apache.fluss.cluster.BucketLocation;
 import org.apache.fluss.cluster.Cluster;
 import org.apache.fluss.cluster.ServerNode;
@@ -32,6 +34,7 @@ import org.apache.fluss.exception.RetriableException;
 import org.apache.fluss.exception.StaleMetadataException;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableOrPartition;
 import org.apache.fluss.metadata.TablePartition;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.GatewayClientProxy;
@@ -39,6 +42,8 @@ import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.gateway.AdminReadOnlyGateway;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
+import org.apache.fluss.rpc.messages.MetadataResponse;
+import org.apache.fluss.utils.concurrent.FutureUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -53,7 +58,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
@@ -188,6 +195,94 @@ public class MetadataUpdater {
     }
 
     /**
+     * Resolves a partition ID and its positive bucket count in one metadata snapshot. Creation is
+     * handled separately; a missing partition completes this future exceptionally.
+     */
+    public CompletableFuture<Cluster> ensurePartitionMetadataAsync(PhysicalTablePath path) {
+        Cluster snapshot = cluster;
+        if (hasPartitionRouting(snapshot, path)) {
+            return CompletableFuture.completedFuture(snapshot);
+        }
+        try {
+            return requestPartitionMetadata(path, 0);
+        } catch (Throwable error) {
+            CompletableFuture<Cluster> failed = new CompletableFuture<>();
+            failed.completeExceptionally(error);
+            return failed;
+        }
+    }
+
+    private CompletableFuture<Cluster> requestPartitionMetadata(
+            PhysicalTablePath path, int attempt) {
+        ServerNode node = getOneAvailableTabletServerNode(cluster, unavailableTabletServerIds);
+        if (node == null) {
+            List<InetSocketAddress> addresses =
+                    ClientUtils.parseAndValidateAddresses(
+                            conf.get(ConfigOptions.BOOTSTRAP_SERVERS));
+            InetSocketAddress address = addresses.get(attempt % addresses.size());
+            node =
+                    new ServerNode(
+                            -1, address.getHostString(), address.getPort(), ServerType.UNKNOWN);
+        }
+        ServerNode requestNode = node;
+        AdminReadOnlyGateway gateway =
+                GatewayClientProxy.createGatewayProxy(
+                        () -> requestNode, rpcClient, AdminReadOnlyGateway.class);
+        return FutureUtils.orTimeout(
+                        gateway.metadata(
+                                ClientRpcMessageUtils.makeMetadataRequest(
+                                        Collections.singleton(path.getTablePath()),
+                                        Collections.singleton(path),
+                                        null)),
+                        conf.get(ConfigOptions.CLIENT_REQUEST_TIMEOUT).toMillis(),
+                        TimeUnit.MILLISECONDS,
+                        "Timed out resolving partition " + path)
+                .thenApply(
+                        response -> {
+                            synchronized (this) {
+                                cluster = MetadataUtils.rebuildCluster(cluster, response, true);
+                                return cluster;
+                            }
+                        })
+                .handle(
+                        (snapshot, error) -> {
+                            Throwable cause =
+                                    error == null
+                                            ? null
+                                            : org.apache.fluss.utils.ExceptionUtils
+                                                    .stripCompletionException(error);
+                            if (cause == null && hasPartitionRouting(snapshot, path)) {
+                                unavailableTabletServerIds.remove(requestNode.id());
+                                return CompletableFuture.completedFuture(snapshot);
+                            }
+                            if (attempt < MAX_RETRY_TIMES
+                                    && (cause == null
+                                            || cause instanceof RetriableException
+                                            || cause instanceof TimeoutException)) {
+                                if (cause != null) {
+                                    unavailableTabletServerIds.add(requestNode.id());
+                                }
+                                return requestPartitionMetadata(path, attempt + 1);
+                            }
+                            CompletableFuture<Cluster> failed = new CompletableFuture<>();
+                            failed.completeExceptionally(
+                                    cause == null
+                                            ? new StaleMetadataException(
+                                                    "Partition routing is incomplete for " + path)
+                                            : cause);
+                            return failed;
+                        })
+                .thenCompose(future -> future);
+    }
+
+    private static boolean hasPartitionRouting(Cluster snapshot, PhysicalTablePath path) {
+        return snapshot.getPartitionId(path)
+                .flatMap(id -> snapshot.getBucketCount(TableOrPartition.ofPartition(id)))
+                .filter(count -> count > 0)
+                .isPresent();
+    }
+
+    /**
      * Check the table/partition bucket info for the given table bucket exist in metadata cache, if
      * not, try to update the metadata cache.
      */
@@ -249,21 +344,10 @@ public class MetadataUpdater {
         ServerNode serverNode =
                 getOneAvailableTabletServerNode(cluster, unavailableTabletServerIds);
         try {
-            synchronized (this) {
-                if (serverNode == null) {
-                    LOG.info(
-                            "No available tablet server to update metadata, try to re-initialize cluster using bootstrap server.");
-                    cluster = initializeCluster(conf, rpcClient);
-                } else {
-                    cluster =
-                            sendMetadataRequestAndRebuildCluster(
-                                    cluster,
-                                    rpcClient,
-                                    tablePaths,
-                                    tablePartitionNames,
-                                    tablePartitionIds,
-                                    serverNode);
-                }
+            if (serverNode == null) {
+                refreshBootstrapNodes();
+            } else {
+                updateFromServer(serverNode, tablePaths, tablePartitionNames, tablePartitionIds);
             }
 
             Map<Integer, ServerNode> aliveTabletServers = cluster.getAliveTabletServers();
@@ -317,21 +401,13 @@ public class MetadataUpdater {
             if (serverNode == null) {
                 // All known tablet servers are unavailable, re-initialize the cluster from the
                 // bootstrap servers as the terminal recovery step and stop.
-                synchronized (this) {
-                    LOG.info(
-                            "No available tablet server to refresh metadata, re-initializing cluster using bootstrap server.");
-                    cluster = initializeCluster(conf, rpcClient);
-                }
+                refreshBootstrapNodes();
                 unavailableTabletServerIds.removeIf(cluster.getAliveTabletServers()::containsKey);
                 return;
             }
 
             try {
-                synchronized (this) {
-                    cluster =
-                            sendMetadataRequestAndRebuildCluster(
-                                    cluster, rpcClient, null, null, null, serverNode);
-                }
+                updateFromServer(serverNode, null, null, null);
                 // Refresh succeeded against a live server, the cluster node list is now up to date.
                 unavailableTabletServerIds.removeIf(cluster.getAliveTabletServers()::containsKey);
                 return;
@@ -350,6 +426,39 @@ public class MetadataUpdater {
                     throw new FlussRuntimeException("Failed to refresh metadata", t);
                 }
             }
+        }
+    }
+
+    private void updateFromServer(
+            ServerNode node,
+            Set<TablePath> tablePaths,
+            Collection<PhysicalTablePath> partitionNames,
+            Collection<Long> partitionIds)
+            throws Exception {
+        AdminReadOnlyGateway gateway =
+                GatewayClientProxy.createGatewayProxy(
+                        () -> node, rpcClient, AdminReadOnlyGateway.class);
+        MetadataResponse response =
+                gateway.metadata(
+                                ClientRpcMessageUtils.makeMetadataRequest(
+                                        tablePaths, partitionNames, partitionIds))
+                        .get(30, TimeUnit.SECONDS);
+        synchronized (this) {
+            cluster = MetadataUtils.rebuildCluster(cluster, response, true);
+        }
+    }
+
+    private void refreshBootstrapNodes() {
+        Cluster nodes = initializeCluster(conf, rpcClient);
+        synchronized (this) {
+            cluster =
+                    new Cluster(
+                            nodes.getAliveTabletServers(),
+                            nodes.getCoordinatorServer(),
+                            cluster.getBucketLocationsByPath(),
+                            cluster.getTableIdByPath(),
+                            cluster.getPartitionIdByPath(),
+                            cluster.getBucketCountByTableOrPartition());
         }
     }
 
@@ -461,14 +570,15 @@ public class MetadataUpdater {
     }
 
     /** Invalid the bucket metadata for the given physical table paths. */
-    public void invalidPhysicalTableBucketMeta(Set<PhysicalTablePath> physicalTablesToInvalid) {
+    public synchronized void invalidPhysicalTableBucketMeta(
+            Set<PhysicalTablePath> physicalTablesToInvalid) {
         if (!physicalTablesToInvalid.isEmpty()) {
             cluster = cluster.invalidPhysicalTableBucketMeta(physicalTablesToInvalid);
         }
     }
 
     /** Invalid the bucket metadata and partition ID mappings for the given physical table paths. */
-    public void invalidPhysicalTableBucketAndPartitionMeta(
+    public synchronized void invalidPhysicalTableBucketAndPartitionMeta(
             Set<PhysicalTablePath> physicalTablesToInvalid) {
         if (!physicalTablesToInvalid.isEmpty()) {
             cluster = cluster.invalidPhysicalTableBucketAndPartitionMeta(physicalTablesToInvalid);

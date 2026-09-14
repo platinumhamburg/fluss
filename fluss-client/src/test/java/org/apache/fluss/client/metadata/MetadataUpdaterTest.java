@@ -23,10 +23,12 @@ import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.StaleMetadataException;
+import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableOrPartition;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.gateway.AdminReadOnlyGateway;
+import org.apache.fluss.rpc.messages.ApiMessage;
 import org.apache.fluss.rpc.messages.MetadataRequest;
 import org.apache.fluss.rpc.messages.MetadataResponse;
 import org.apache.fluss.rpc.messages.PbPartitionMetadata;
@@ -38,10 +40,14 @@ import org.junit.jupiter.api.Test;
 
 import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.buildMetadataResponse;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /** UT Test for update metadata of {@link MetadataUpdater}. */
 public class MetadataUpdaterTest {
@@ -50,6 +56,83 @@ public class MetadataUpdaterTest {
             new ServerNode(1, "localhost", 8080, ServerType.COORDINATOR);
     private static final ServerNode TS_NODE =
             new ServerNode(1, "localhost", 8080, ServerType.TABLET_SERVER);
+
+    @Test
+    void testAsyncMetadataMergesAgainstLatestSnapshot() throws Exception {
+        RpcClient client = mock(RpcClient.class);
+        CompletableFuture<ApiMessage> first = new CompletableFuture<>();
+        CompletableFuture<ApiMessage> second = new CompletableFuture<>();
+        when(client.sendRequest(any(), any(), any())).thenReturn(first, second);
+        Cluster initial =
+                new Cluster(
+                        Collections.singletonMap(TS_NODE.id(), TS_NODE),
+                        CS_NODE,
+                        Collections.emptyMap(),
+                        Collections.emptyMap(),
+                        Collections.emptyMap(),
+                        Collections.emptyMap());
+        MetadataUpdater updater = new MetadataUpdater(client, new Configuration(), initial);
+        PhysicalTablePath path1 = PhysicalTablePath.of(TablePath.of("db", "one"), "p");
+        PhysicalTablePath path2 = PhysicalTablePath.of(TablePath.of("db", "two"), "p");
+        CompletableFuture<Cluster> resolution1 = updater.ensurePartitionMetadataAsync(path1);
+        CompletableFuture<Cluster> resolution2 = updater.ensurePartitionMetadataAsync(path2);
+        second.complete(partitionResponse(path2, 2, 20, 5));
+        resolution2.get(10, TimeUnit.SECONDS);
+        first.complete(partitionResponse(path1, 1, 10, 3));
+        Cluster result = resolution1.get(10, TimeUnit.SECONDS);
+        assertThat(result.getPartitionId(path1)).contains(10L);
+        assertThat(result.getPartitionId(path2)).contains(20L);
+        assertThat(result.getBucketCount(TableOrPartition.ofPartition(10))).contains(3);
+        assertThat(result.getBucketCount(TableOrPartition.ofPartition(20))).contains(5);
+    }
+
+    @Test
+    void testAsyncMetadataDoesNotCompleteWithOnlyPartitionId() throws Exception {
+        RpcClient client = mock(RpcClient.class);
+        PhysicalTablePath path = PhysicalTablePath.of(TablePath.of("db", "one"), "p");
+        CompletableFuture<ApiMessage> assignment = new CompletableFuture<>();
+        when(client.sendRequest(any(), any(), any()))
+                .thenReturn(
+                        CompletableFuture.completedFuture(partitionResponse(path, 1, 10, 0)),
+                        assignment);
+        Cluster initial =
+                new Cluster(
+                        Collections.singletonMap(TS_NODE.id(), TS_NODE),
+                        CS_NODE,
+                        Collections.emptyMap(),
+                        Collections.singletonMap(path.getTablePath(), 1L),
+                        Collections.singletonMap(path, 10L),
+                        Collections.emptyMap());
+        MetadataUpdater updater = new MetadataUpdater(client, new Configuration(), initial);
+        CompletableFuture<Cluster> resolution = updater.ensurePartitionMetadataAsync(path);
+        assertThat(resolution).isNotDone();
+        assignment.complete(partitionResponse(path, 1, 10, 3));
+        assertThat(
+                        resolution
+                                .get(10, TimeUnit.SECONDS)
+                                .getBucketCount(TableOrPartition.ofPartition(10)))
+                .contains(3);
+    }
+
+    private static MetadataResponse partitionResponse(
+            PhysicalTablePath path, long tableId, long partitionId, int count) {
+        MetadataResponse response = new MetadataResponse();
+        response.addTabletServer()
+                .setNodeId(TS_NODE.id())
+                .setHost(TS_NODE.host())
+                .setPort(TS_NODE.port());
+        response.addTableMetadata()
+                .setTableId(tableId)
+                .setTablePath()
+                .setDatabaseName(path.getTablePath().getDatabaseName())
+                .setTableName(path.getTablePath().getTableName());
+        response.addPartitionMetadata()
+                .setTableId(tableId)
+                .setPartitionId(partitionId)
+                .setPartitionName(path.getPartitionName())
+                .setBucketCount(count);
+        return response;
+    }
 
     @Test
     void testInitializeClusterWithRetries() throws Exception {

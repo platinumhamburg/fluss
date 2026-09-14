@@ -105,68 +105,61 @@ public class MetadataUtils {
                 ClientRpcMessageUtils.makeMetadataRequest(
                         tablePaths, tablePartitions, tablePartitionIds);
         return gateway.metadata(metadataRequest)
-                .thenApply(
-                        response -> {
-                            // Update the alive table servers.
-                            Map<Integer, ServerNode> newAliveTabletServers =
-                                    getAliveTabletServers(response);
-                            // when talking to the startup tablet
-                            // server, it maybe receive empty metadata, we'll consider it as
-                            // stale metadata and throw StaleMetadataException which will cause
-                            // to retry later.
-                            if (newAliveTabletServers.isEmpty()) {
-                                throw new StaleMetadataException("Alive tablet server is empty.");
-                            }
-                            ServerNode coordinatorServer = getCoordinatorServer(response);
+                .thenApply(response -> rebuildCluster(originCluster, response, partialUpdate))
+                .get(30, TimeUnit.SECONDS);
+    }
 
-                            Map<TablePath, Long> newTablePathToTableId;
-                            Map<PhysicalTablePath, List<BucketLocation>> newBucketLocations;
-                            Map<PhysicalTablePath, Long> newPartitionIdByPath;
-                            Map<TableOrPartition, Integer> newBucketCountByTableOrPartition;
+    /** Applies a metadata response to the supplied cache snapshot. */
+    public static Cluster rebuildCluster(
+            Cluster originCluster, MetadataResponse response, boolean partialUpdate) {
+        // Update the alive table servers.
+        Map<Integer, ServerNode> newAliveTabletServers = getAliveTabletServers(response);
+        // when talking to the startup tablet
+        // server, it maybe receive empty metadata, we'll consider it as
+        // stale metadata and throw StaleMetadataException which will cause
+        // to retry later.
+        if (newAliveTabletServers.isEmpty()) {
+            throw new StaleMetadataException("Alive tablet server is empty.");
+        }
+        ServerNode coordinatorServer = getCoordinatorServer(response);
 
-                            NewTableMetadata newTableMetadata =
-                                    getTableMetadataToUpdate(originCluster, response);
+        Map<TablePath, Long> newTablePathToTableId;
+        Map<PhysicalTablePath, List<BucketLocation>> newBucketLocations;
+        Map<PhysicalTablePath, Long> newPartitionIdByPath;
+        Map<TableOrPartition, Integer> newBucketCountByTableOrPartition;
 
-                            if (partialUpdate) {
-                                // If partial update, we will clear the to be updated table out ot
-                                // the origin cluster.
-                                newTablePathToTableId =
-                                        new HashMap<>(originCluster.getTableIdByPath());
-                                newBucketLocations =
-                                        new HashMap<>(originCluster.getBucketLocationsByPath());
-                                newPartitionIdByPath =
-                                        new HashMap<>(originCluster.getPartitionIdByPath());
-                                newBucketCountByTableOrPartition =
-                                        new HashMap<>(
-                                                originCluster.getBucketCountByTableOrPartition());
+        NewTableMetadata newTableMetadata = getTableMetadataToUpdate(originCluster, response);
 
-                                newTablePathToTableId.putAll(newTableMetadata.tablePathToTableId);
-                                newBucketLocations.putAll(newTableMetadata.bucketLocations);
-                                newPartitionIdByPath.putAll(newTableMetadata.partitionIdByPath);
-                                newBucketCountByTableOrPartition.putAll(
-                                        newTableMetadata.bucketCountByTableOrPartition);
+        if (partialUpdate) {
+            // If partial update, we will clear the to be updated table out ot
+            // the origin cluster.
+            newTablePathToTableId = new HashMap<>(originCluster.getTableIdByPath());
+            newBucketLocations = new HashMap<>(originCluster.getBucketLocationsByPath());
+            newPartitionIdByPath = new HashMap<>(originCluster.getPartitionIdByPath());
+            newBucketCountByTableOrPartition =
+                    new HashMap<>(originCluster.getBucketCountByTableOrPartition());
 
-                            } else {
-                                // If full update, we will clear all tables info out ot the origin
-                                // cluster.
-                                newTablePathToTableId = newTableMetadata.tablePathToTableId;
-                                newBucketLocations = newTableMetadata.bucketLocations;
-                                newPartitionIdByPath = newTableMetadata.partitionIdByPath;
-                                newBucketCountByTableOrPartition =
-                                        newTableMetadata.bucketCountByTableOrPartition;
-                            }
+            newTablePathToTableId.putAll(newTableMetadata.tablePathToTableId);
+            newBucketLocations.putAll(newTableMetadata.bucketLocations);
+            newPartitionIdByPath.putAll(newTableMetadata.partitionIdByPath);
+            newBucketCountByTableOrPartition.putAll(newTableMetadata.bucketCountByTableOrPartition);
 
-                            return new Cluster(
-                                    newAliveTabletServers,
-                                    coordinatorServer,
-                                    newBucketLocations,
-                                    newTablePathToTableId,
-                                    newPartitionIdByPath,
-                                    newBucketCountByTableOrPartition);
-                        })
-                .get(30, TimeUnit.SECONDS); // TODO currently, we don't have timeout logic in
-        // RpcClient, it will let the get() block forever. So we
-        // time out here
+        } else {
+            // If full update, we will clear all tables info out ot the origin
+            // cluster.
+            newTablePathToTableId = newTableMetadata.tablePathToTableId;
+            newBucketLocations = newTableMetadata.bucketLocations;
+            newPartitionIdByPath = newTableMetadata.partitionIdByPath;
+            newBucketCountByTableOrPartition = newTableMetadata.bucketCountByTableOrPartition;
+        }
+
+        return new Cluster(
+                newAliveTabletServers,
+                coordinatorServer,
+                newBucketLocations,
+                newTablePathToTableId,
+                newPartitionIdByPath,
+                newBucketCountByTableOrPartition);
     }
 
     private static NewTableMetadata getTableMetadataToUpdate(

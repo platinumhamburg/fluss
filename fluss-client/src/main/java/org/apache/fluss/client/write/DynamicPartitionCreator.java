@@ -17,160 +17,128 @@
 
 package org.apache.fluss.client.write;
 
+import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.metadata.MetadataUpdater;
-import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.TableInfo;
-import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.utils.AutoPartitionStrategy;
-import org.apache.fluss.utils.ExceptionUtils;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.fluss.utils.concurrent.FutureUtils;
 
 import javax.annotation.concurrent.ThreadSafe;
 
-import java.util.List;
-import java.util.Optional;
-import java.util.Set;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 import static org.apache.fluss.utils.ExceptionUtils.stripCompletionException;
 import static org.apache.fluss.utils.PartitionUtils.validateAutoPartitionTime;
-import static org.apache.fluss.utils.Preconditions.checkArgument;
 
-/** A creator to create partition when dynamic partition create enable for table. */
+/** Creates missing partitions, sharing each in-flight check and create request among callers. */
 @ThreadSafe
+@Internal
 public class DynamicPartitionCreator {
-    private static final Logger LOG = LoggerFactory.getLogger(DynamicPartitionCreator.class);
-
     private final MetadataUpdater metadataUpdater;
-    private final boolean dynamicPartitionEnabled;
     private final Admin admin;
+    private final long timeoutMs;
+    private final boolean dynamicPartitionEnabled;
     private final Consumer<Throwable> fatalErrorHandler;
+    private final Map<PhysicalTablePath, CompletableFuture<Void>> inflightPartitionsToCreate =
+            new ConcurrentHashMap<>();
 
-    private final Set<PhysicalTablePath> inflightPartitionsToCreate = ConcurrentHashMap.newKeySet();
-
+    /** Creates a partition creator with a timeout for each shared check-and-create operation. */
     public DynamicPartitionCreator(
             MetadataUpdater metadataUpdater,
             Admin admin,
             boolean dynamicPartitionEnabled,
-            Consumer<Throwable> fatalErrorHandler) {
+            Consumer<Throwable> fatalErrorHandler,
+            long timeoutMs) {
         this.metadataUpdater = metadataUpdater;
         this.admin = admin;
         this.dynamicPartitionEnabled = dynamicPartitionEnabled;
         this.fatalErrorHandler = fatalErrorHandler;
+        this.timeoutMs = timeoutMs;
     }
 
-    /** Ensures the partition exists, creating it asynchronously when enabled. */
-    public void checkAndCreatePartitionAsync(
-            PhysicalTablePath physicalTablePath, TableInfo tableInfo) {
-        String partitionName = physicalTablePath.getPartitionName();
-        if (partitionName == null) {
-            // no need to check and create partition
-            return;
+    /**
+     * Ensures the partition exists. Success does not guarantee that its routing metadata is
+     * available. Failed checks, validation and creation complete the returned future exceptionally.
+     */
+    public CompletableFuture<Void> checkAndCreatePartitionAsync(
+            PhysicalTablePath path, TableInfo tableInfo) {
+        if (path.getPartitionName() == null || metadataUpdater.getPartitionId(path).isPresent()) {
+            return CompletableFuture.completedFuture(null);
         }
-
-        Optional<Long> partitionIdOpt = metadataUpdater.getPartitionId(physicalTablePath);
-        // first try to update metadata info if not exists.
-        boolean idExist = partitionIdOpt.isPresent();
-        if (!idExist) {
-            if (inflightPartitionsToCreate.contains(physicalTablePath)) {
-                // if the partition is already in inflightPartitionsToCreate, we should skip
-                // creating it.
-                LOG.debug("Partition {} is already being created, skipping.", physicalTablePath);
-            } else if (forceCheckPartitionExist(physicalTablePath)) {
-                // if the partition exists, we should skip creating it.
-                LOG.debug("Partition {} already exists, skipping.", physicalTablePath);
-            } else {
-                // Validate early, before touching any state. The strategy is only resolved here,
-                // on the partition-creation path, not on the common "already exists" path.
-                List<String> partitionKeys = tableInfo.getPartitionKeys();
-                AutoPartitionStrategy autoPartitionStrategy =
-                        tableInfo.getTableConfig().getAutoPartitionStrategy();
-                ResolvedPartitionSpec resolvedPartitionSpec =
-                        ResolvedPartitionSpec.fromPartitionName(partitionKeys, partitionName);
-                validateAutoPartitionTime(
-                        resolvedPartitionSpec.toPartitionSpec(),
-                        partitionKeys,
-                        autoPartitionStrategy);
-
-                // create partition if not exists.
-                // partition may not exist, we should try to create it.
-                if (inflightPartitionsToCreate.add(physicalTablePath)) {
-                    // if the partition is not in inflightPartitionsToCreate, we should create it.
-                    // this means that the partition is not being created by other threads.
-                    LOG.info("Dynamically creating partition for {}", physicalTablePath);
-                    createPartition(physicalTablePath, partitionKeys);
-                } else {
-                    // if the partition is already in inflightPartitionsToCreate, we should skip
-                    // creating it.
-                    LOG.debug(
-                            "Partition {} is already being created, skipping.", physicalTablePath);
-                }
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        while (true) {
+            CompletableFuture<Void> existing = inflightPartitionsToCreate.putIfAbsent(path, result);
+            if (existing == null) {
+                break;
             }
+            if (!existing.isDone()) {
+                return existing;
+            }
+            inflightPartitionsToCreate.remove(path, existing);
         }
-    }
-
-    private boolean forceCheckPartitionExist(PhysicalTablePath physicalTablePath) {
-        boolean idExist = false;
-        // force an IO to check whether the partition exists
+        FutureUtils.orTimeout(
+                result,
+                timeoutMs,
+                TimeUnit.MILLISECONDS,
+                "Timed out checking or creating partition " + path);
+        result.whenComplete((ignored, error) -> inflightPartitionsToCreate.remove(path, result));
         try {
-            idExist = metadataUpdater.checkAndUpdatePartitionMetadata(physicalTablePath);
-        } catch (Exception e) {
-            Throwable t = ExceptionUtils.stripExecutionException(e);
-            if (t instanceof PartitionNotExistException) {
-                if (!dynamicPartitionEnabled) {
-                    throw new PartitionNotExistException(
-                            String.format(
-                                    "Table partition '%s' does not exist.", physicalTablePath));
-                }
-            } else {
-                throw new FlussRuntimeException(e.getMessage(), e);
-            }
+            metadataUpdater
+                    .ensurePartitionMetadataAsync(path)
+                    .handle(
+                            (snapshot, error) -> {
+                                if (result.isDone()) {
+                                    return result;
+                                }
+                                if (error == null) {
+                                    return CompletableFuture.<Void>completedFuture(null);
+                                }
+                                Throwable cause = stripCompletionException(error);
+                                if (!(cause instanceof PartitionNotExistException)
+                                        || !dynamicPartitionEnabled) {
+                                    CompletableFuture<Void> failed = new CompletableFuture<>();
+                                    failed.completeExceptionally(cause);
+                                    return failed;
+                                }
+                                ResolvedPartitionSpec spec =
+                                        ResolvedPartitionSpec.fromPartitionName(
+                                                tableInfo.getPartitionKeys(),
+                                                path.getPartitionName());
+                                validateAutoPartitionTime(
+                                        spec.toPartitionSpec(),
+                                        tableInfo.getPartitionKeys(),
+                                        tableInfo.getTableConfig().getAutoPartitionStrategy());
+                                return admin.createPartition(
+                                                path.getTablePath(), spec.toPartitionSpec(), true)
+                                        .whenComplete(
+                                                (ignored, failure) -> {
+                                                    if (failure != null && !result.isDone()) {
+                                                        fatalErrorHandler.accept(
+                                                                stripCompletionException(failure));
+                                                    }
+                                                });
+                            })
+                    .thenCompose(future -> future)
+                    .whenComplete((ignored, error) -> finish(result, error));
+        } catch (Throwable error) {
+            finish(result, error);
         }
-        return idExist;
+        return result;
     }
 
-    private void createPartition(PhysicalTablePath physicalTablePath, List<String> partitionKeys) {
-        String partitionName = physicalTablePath.getPartitionName();
-        TablePath tablePath = physicalTablePath.getTablePath();
-        checkArgument(partitionName != null, "Partition name shouldn't be null.");
-        ResolvedPartitionSpec resolvedPartitionSpec =
-                ResolvedPartitionSpec.fromPartitionName(partitionKeys, partitionName);
-
-        admin.createPartition(tablePath, resolvedPartitionSpec.toPartitionSpec(), true)
-                .whenComplete(
-                        (ignore, throwable) -> {
-                            if (throwable != null) {
-                                // If encounter TooManyPartitionsException or
-                                // TooManyBucketsException, we should set
-                                // cachedCreatePartitionException to make the next createPartition
-                                // call failed.
-                                onPartitionCreationFailed(physicalTablePath, throwable);
-                            } else {
-                                onPartitionCreationSuccess(physicalTablePath);
-                            }
-                        });
-    }
-
-    private void onPartitionCreationSuccess(PhysicalTablePath physicalTablePath) {
-        inflightPartitionsToCreate.remove(physicalTablePath);
-        // TODO: trigger to update metadata here when metadataUpdater supports async update
-        // metadataUpdater.checkAndUpdatePartitionMetadata(physicalTablePath);
-        LOG.info("Successfully created partition {}", physicalTablePath);
-    }
-
-    private void onPartitionCreationFailed(
-            PhysicalTablePath physicalTablePath, Throwable throwable) {
-        inflightPartitionsToCreate.remove(physicalTablePath);
-        fatalErrorHandler.accept(
-                new FlussRuntimeException(
-                        "Failed to dynamically create partition " + physicalTablePath,
-                        stripCompletionException(throwable)));
+    private void finish(CompletableFuture<Void> result, Throwable error) {
+        if (error == null) {
+            result.complete(null);
+        } else {
+            Throwable cause = stripCompletionException(error);
+            result.completeExceptionally(cause);
+        }
     }
 }

@@ -39,18 +39,26 @@ import org.apache.fluss.utils.AutoPartitionStrategy;
 import org.apache.fluss.utils.CopyOnWriteMap;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
+import org.apache.fluss.utils.concurrent.FutureUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.concurrent.ThreadSafe;
 
+import java.io.EOFException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZonedDateTime;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -69,9 +77,9 @@ import static org.apache.fluss.utils.PartitionUtils.generateAutoPartitionTime;
  * turning these records into requests and transmitting them to the cluster. Failure to close the
  * {@link WriterClient} after use will leak these resources.
  *
- * <p>The send method is asynchronous. When called, it adds the log record to a buffer of pending
- * record sends and immediately returns. This allows the wrote record to batch together individual
- * records for efficiency.
+ * <p>The send method does not wait for acknowledgment. It may block while waiting for buffer
+ * capacity, or for partition routing when a record cannot be buffered within the pending budget.
+ * Buffered records are routed and sent in the background without requiring another send or flush.
  */
 @ThreadSafe
 @Internal
@@ -85,13 +93,6 @@ public class WriterClient {
      */
     private static final int MAX_IN_FLIGHT_REQUESTS_PER_BUCKET_FOR_IDEMPOTENCE = 5;
 
-    /**
-     * The bounded time to wait for the sender thread to exit after it has been force closed. Once
-     * force closed, the sender abandons all pending requests and exits promptly, so this is only a
-     * safety net to avoid blocking close forever.
-     */
-    private static final long FORCE_CLOSE_TERMINATION_TIMEOUT_MS = 5000;
-
     private final Configuration conf;
     private final int maxRequestSize;
     private final RecordAccumulator accumulator;
@@ -102,6 +103,17 @@ public class WriterClient {
     private final IdempotenceManager idempotenceManager;
     private final WriterMetricGroup writerMetricGroup;
     private final DynamicPartitionCreator dynamicPartitionCreator;
+
+    private final Object pendingLock = new Object();
+    private final Map<PhysicalTablePath, PendingPartition> pendingPartitions = new HashMap<>();
+    private final TreeMap<Long, AcceptedWrite> acceptedWrites = new TreeMap<>();
+    private final ExecutorService transferExecutor;
+    private final long pendingCapacity;
+    // All admission, queue ownership and completion bookkeeping is guarded by pendingLock.
+    private long pendingBytes;
+    private long nextSequence;
+    private boolean closed;
+    private Exception failure;
 
     public WriterClient(
             Configuration conf,
@@ -121,6 +133,15 @@ public class WriterClient {
         try {
             this.conf = conf;
             this.metadataUpdater = metadataUpdater;
+            this.pendingCapacity =
+                    conf.get(ConfigOptions.CLIENT_WRITER_PENDING_BUFFER_MEMORY_SIZE).getBytes();
+            if (pendingCapacity < 256) {
+                throw new IllegalConfigurationException(
+                        "Pending buffer must hold at least 256 bytes.");
+            }
+            this.transferExecutor =
+                    Executors.newSingleThreadExecutor(
+                            new ExecutorThreadFactory("fluss-write-partition-transfer"));
             maxRequestSizeLocal =
                     (int) conf.get(ConfigOptions.CLIENT_WRITER_REQUEST_MAX_SIZE).getBytes();
             this.maxRequestSize = maxRequestSizeLocal;
@@ -142,7 +163,8 @@ public class WriterClient {
                             metadataUpdater,
                             admin,
                             conf.get(ConfigOptions.CLIENT_WRITER_DYNAMIC_CREATE_PARTITION_ENABLED),
-                            this::maybeAbortBatches);
+                            this::maybeAbortBatches,
+                            conf.get(ConfigOptions.CLIENT_REQUEST_TIMEOUT).toMillis());
         } catch (Throwable t) {
             LOG.error("Failed to construct writer.", t);
             close(Duration.ofMillis(0));
@@ -182,13 +204,17 @@ public class WriterClient {
         accumulator.beginFlush();
         sender.wakeup();
         try {
-            accumulator.awaitFlushCompletion();
+            synchronized (pendingLock) {
+                long cutoff = nextSequence;
+                while (!acceptedWrites.isEmpty() && acceptedWrites.firstKey() <= cutoff) {
+                    pendingLock.wait();
+                }
+            }
         } catch (InterruptedException e) {
-            throw new FlussRuntimeException(
-                    String.format(
-                            "Flush interrupted after %d ms. Writer may be in inconsistent state",
-                            System.currentTimeMillis() - start),
-                    e);
+            Thread.currentThread().interrupt();
+            throw new FlussRuntimeException("Interrupted while flushing writer", e);
+        } finally {
+            accumulator.endFlush();
         }
         LOG.trace(
                 "Flushed accumulated records in writer in {} ms.",
@@ -197,7 +223,9 @@ public class WriterClient {
 
     private void doSend(WriteRecord record, WriteCallback callback) {
         try {
-            throwIfWriterClosed();
+            synchronized (pendingLock) {
+                throwIfWriterClosed();
+            }
 
             TableInfo tableInfo = record.getTableInfo();
             PhysicalTablePath physicalTablePath = record.getPhysicalTablePath();
@@ -211,62 +239,9 @@ public class WriterClient {
                         && mayBeExpiredHistoricalPartition(
                                 physicalTablePath, tableInfo, Instant.now())) {
                     routingPath = resolveHistoricalWriteTarget(physicalTablePath);
-                } else {
-                    dynamicPartitionCreator.checkAndCreatePartitionAsync(
-                            physicalTablePath, tableInfo);
                 }
             }
-
-            Cluster cluster = metadataUpdater.getCluster();
-            long tableId = tableInfo.getTableId();
-            Long partitionId =
-                    tableInfo.isPartitioned()
-                            ? cluster.getPartitionId(routingPath).orElse(null)
-                            : null;
-            int bucketCount =
-                    partitionId == null
-                            ? tableInfo.getNumBuckets()
-                            : cluster.getBucketCountOrFallback(tableInfo, partitionId);
-            final PhysicalTablePath finalRoutingPath = routingPath;
-            BucketAssigner bucketAssigner =
-                    bucketAssigners.computeIfAbsent(
-                            TableOrPartition.of(tableId, partitionId),
-                            k ->
-                                    createBucketAssigner(
-                                            tableInfo, finalRoutingPath, bucketCount, conf));
-
-            // Append the record to the accumulator.
-            int bucketId = bucketAssigner.assignBucket(record.getBucketKey(), cluster);
-
-            RecordAppendResult result =
-                    accumulator.append(
-                            record,
-                            callback,
-                            cluster,
-                            bucketId,
-                            bucketCount,
-                            bucketAssigner.abortIfBatchFull());
-
-            if (result.abortRecordForNewBatch) {
-                int prevBucketId = bucketId;
-                bucketAssigner.onNewBatch(cluster, prevBucketId);
-                bucketId = bucketAssigner.assignBucket(record.getBucketKey(), cluster);
-                LOG.trace(
-                        "Retrying append due to new batch creation for table {} bucket {}, the old bucket was {}.",
-                        physicalTablePath,
-                        bucketId,
-                        prevBucketId);
-                result =
-                        accumulator.append(record, callback, cluster, bucketId, bucketCount, false);
-            }
-
-            if (result.batchIsFull || result.newBatchCreated) {
-                LOG.trace(
-                        "Waking up the sender since table {} bucket {} is either full or getting a new batch",
-                        record.getPhysicalTablePath(),
-                        bucketId);
-                sender.wakeup();
-            }
+            appendOrWait(record, callback, routingPath);
         } catch (Exception e) {
             throw new FlussRuntimeException(
                     String.format(
@@ -274,6 +249,319 @@ public class WriterClient {
                             record.getPhysicalTablePath(),
                             sender != null && sender.isRunning() ? "running" : "closed"),
                     e);
+        }
+    }
+
+    private boolean isBucketCountKnown(
+            TableInfo tableInfo, PhysicalTablePath path, Cluster snapshot) {
+        if (!tableInfo.isPartitioned()) {
+            return true;
+        }
+        return snapshot.getTableId(path.getTablePath())
+                        .filter(id -> id == tableInfo.getTableId())
+                        .isPresent()
+                && snapshot.getPartitionId(path)
+                        .flatMap(id -> snapshot.getBucketCount(TableOrPartition.ofPartition(id)))
+                        .filter(count -> count > 0)
+                        .isPresent();
+    }
+
+    private CompletableFuture<Cluster> resolvePartition(TableInfo info, PhysicalTablePath path) {
+        return FutureUtils.orTimeout(
+                dynamicPartitionCreator
+                        .checkAndCreatePartitionAsync(path, info)
+                        .thenCompose(ignored -> metadataUpdater.ensurePartitionMetadataAsync(path))
+                        .thenApply(
+                                snapshot -> {
+                                    if (!isBucketCountKnown(info, path, snapshot)) {
+                                        throw new FlussRuntimeException(
+                                                "Partition metadata does not belong to table "
+                                                        + info.getTableId()
+                                                        + ": "
+                                                        + path);
+                                    }
+                                    return snapshot;
+                                }),
+                conf.get(ConfigOptions.CLIENT_REQUEST_TIMEOUT).toMillis(),
+                TimeUnit.MILLISECONDS,
+                "Timed out resolving write partition " + path);
+    }
+
+    private void appendOrWait(WriteRecord record, WriteCallback callback, PhysicalTablePath path)
+            throws Exception {
+        long start = System.nanoTime();
+        PendingPartition partition;
+        AcceptedWrite write;
+        boolean resolve;
+        boolean direct;
+        synchronized (pendingLock) {
+            while (true) {
+                throwIfWriterClosed();
+                partition = pendingPartitions.get(record.getPhysicalTablePath());
+                Cluster snapshot = metadataUpdater.getCluster();
+                boolean ready =
+                        partition == null
+                                && isBucketCountKnown(record.getTableInfo(), path, snapshot);
+                long size = record.pendingSizeInBytes();
+                direct = ready || size > pendingCapacity;
+                long charge = ready ? 0 : direct ? 256 : size;
+                if (pendingBytes + charge > pendingCapacity) {
+                    awaitPending(start);
+                    continue;
+                }
+                resolve = partition == null && !ready;
+                if (partition == null) {
+                    partition =
+                            new PendingPartition(
+                                    record.getPhysicalTablePath(),
+                                    path,
+                                    record.getTableInfo().getTableId(),
+                                    ready ? snapshot : null);
+                    pendingPartitions.put(record.getPhysicalTablePath(), partition);
+                } else if (partition.tableId != record.getTableInfo().getTableId()) {
+                    throw new FlussRuntimeException(
+                            "Table was replaced while writes were pending: " + path);
+                }
+                write = new AcceptedWrite(++nextSequence, callback, charge, direct);
+                acceptedWrites.put(write.sequence, write);
+                partition.writes.addLast(write);
+                pendingBytes += charge;
+                break;
+            }
+        }
+        PendingPartition target = partition;
+        try {
+            if (resolve) {
+                resolvePartition(record.getTableInfo(), path)
+                        .whenComplete(
+                                (snapshot, error) -> {
+                                    if (error != null) {
+                                        failPartition(target, error);
+                                    } else {
+                                        synchronized (pendingLock) {
+                                            target.snapshot = snapshot;
+                                            scheduleTransfer(target);
+                                            pendingLock.notifyAll();
+                                        }
+                                    }
+                                });
+            }
+            if (direct) {
+                synchronized (pendingLock) {
+                    while (failure == null
+                            && partition.error == null
+                            && (partition.snapshot == null
+                                    || partition.writes.peekFirst() != write)) {
+                        awaitPending(start);
+                    }
+                    if (failure != null) {
+                        throw failure;
+                    }
+                    if (partition.error != null) {
+                        throw partition.error;
+                    }
+                }
+                try {
+                    routeRecord(record, write, partition.snapshot, partition.routingPath);
+                } finally {
+                    finishTransfer(partition, write);
+                }
+            } else {
+                WriteRecord copy = record.copy();
+                synchronized (pendingLock) {
+                    if (failure != null) {
+                        throw failure;
+                    }
+                    if (partition.error == null) {
+                        write.record = copy;
+                        scheduleTransfer(partition);
+                    }
+                }
+            }
+        } catch (Exception error) {
+            finishTransfer(partition, write);
+            write.onCompletion(null, -1L, error);
+            throw error;
+        }
+    }
+
+    private void awaitPending(long start) throws InterruptedException, EOFException {
+        long remaining =
+                conf.get(ConfigOptions.CLIENT_WRITER_BUFFER_WAIT_TIMEOUT).toNanos()
+                        - (System.nanoTime() - start);
+        if (remaining <= 0) {
+            throw new EOFException(
+                    "Timed out waiting for partition routing or pending buffer space");
+        }
+        TimeUnit.NANOSECONDS.timedWait(pendingLock, remaining);
+    }
+
+    // Called under pendingLock. Each partition has at most one transfer task, and the head stays
+    // in the queue until append has registered it in the accumulator, including memory waits.
+    private void scheduleTransfer(PendingPartition partition) {
+        AcceptedWrite head = partition.writes.peekFirst();
+        if (failure == null
+                && !partition.transferring
+                && partition.snapshot != null
+                && head != null
+                && !head.direct
+                && head.record != null) {
+            partition.transferring = true;
+            transferExecutor.execute(() -> transfer(partition));
+        }
+    }
+
+    private void transfer(PendingPartition partition) {
+        while (true) {
+            AcceptedWrite write;
+            WriteRecord record;
+            synchronized (pendingLock) {
+                write = partition.writes.peekFirst();
+                if (failure != null || write == null || write.direct || write.record == null) {
+                    partition.transferring = false;
+                    pendingLock.notifyAll();
+                    return;
+                }
+                record = write.record;
+            }
+            Exception appendError = null;
+            try {
+                routeRecord(record, write, partition.snapshot, partition.routingPath);
+            } catch (Exception error) {
+                appendError = error;
+            } finally {
+                finishTransfer(partition, write);
+            }
+            if (appendError != null) {
+                write.onCompletion(null, -1L, appendError);
+            }
+        }
+    }
+
+    private void finishTransfer(PendingPartition partition, AcceptedWrite write) {
+        synchronized (pendingLock) {
+            if (partition.writes.remove(write)) {
+                pendingBytes -= write.charge;
+                write.record = null;
+            }
+            if (partition.writes.isEmpty()) {
+                pendingPartitions.remove(partition.originalPath, partition);
+            } else {
+                scheduleTransfer(partition);
+            }
+            pendingLock.notifyAll();
+        }
+    }
+
+    /** Owns completion continuously from admission through routing, batching and acknowledgment. */
+    private final class AcceptedWrite implements WriteCallback {
+        private final long sequence;
+        private final WriteCallback callback;
+        private final long charge;
+        private final boolean direct;
+        private WriteRecord record;
+        private boolean completing;
+
+        private AcceptedWrite(long sequence, WriteCallback callback, long charge, boolean direct) {
+            this.sequence = sequence;
+            this.callback = callback;
+            this.charge = charge;
+            this.direct = direct;
+        }
+
+        @Override
+        public void onCompletion(TableBucket bucket, long offset, Exception error) {
+            synchronized (pendingLock) {
+                if (completing) {
+                    return;
+                }
+                completing = true;
+            }
+            try {
+                callback.onCompletion(bucket, offset, error);
+            } catch (Throwable callbackError) {
+                LOG.warn("Write callback failed", callbackError);
+            } finally {
+                synchronized (pendingLock) {
+                    acceptedWrites.remove(sequence);
+                    pendingLock.notifyAll();
+                }
+            }
+        }
+    }
+
+    private final class PendingPartition {
+        private final PhysicalTablePath originalPath;
+        private final PhysicalTablePath routingPath;
+        private final long tableId;
+        private final Deque<AcceptedWrite> writes = new ArrayDeque<>();
+        private Cluster snapshot;
+        private Exception error;
+        private boolean transferring;
+
+        private PendingPartition(
+                PhysicalTablePath originalPath,
+                PhysicalTablePath routingPath,
+                long tableId,
+                Cluster snapshot) {
+            this.originalPath = originalPath;
+            this.routingPath = routingPath;
+            this.tableId = tableId;
+            this.snapshot = snapshot;
+        }
+    }
+
+    private void routeRecord(
+            WriteRecord record,
+            WriteCallback callback,
+            Cluster cluster,
+            PhysicalTablePath routingPath)
+            throws Exception {
+        TableInfo tableInfo = record.getTableInfo();
+        long tableId = tableInfo.getTableId();
+        Long partitionId =
+                tableInfo.isPartitioned() ? cluster.getPartitionIdOrElseThrow(routingPath) : null;
+        int bucketCount =
+                partitionId == null
+                        ? tableInfo.getNumBuckets()
+                        : cluster.getBucketCount(TableOrPartition.ofPartition(partitionId))
+                                .orElseThrow(
+                                        () ->
+                                                new FlussRuntimeException(
+                                                        "Bucket count missing for " + routingPath));
+        BucketAssigner bucketAssigner =
+                bucketAssigners.computeIfAbsent(
+                        TableOrPartition.of(tableId, partitionId),
+                        k -> createBucketAssigner(tableInfo, routingPath, bucketCount, conf));
+
+        int bucketId = bucketAssigner.assignBucket(record.getBucketKey(), cluster);
+        RecordAppendResult result =
+                accumulator.append(
+                        record,
+                        callback,
+                        cluster,
+                        bucketId,
+                        bucketCount,
+                        bucketAssigner.abortIfBatchFull());
+
+        if (result.abortRecordForNewBatch) {
+            int prevBucketId = bucketId;
+            bucketAssigner.onNewBatch(cluster, prevBucketId);
+            bucketId = bucketAssigner.assignBucket(record.getBucketKey(), cluster);
+            LOG.trace(
+                    "Retrying append due to new batch creation for table {} bucket {}, the old bucket was {}.",
+                    routingPath,
+                    bucketId,
+                    prevBucketId);
+            result = accumulator.append(record, callback, cluster, bucketId, bucketCount, false);
+        }
+
+        if (result.batchIsFull || result.newBatchCreated) {
+            LOG.trace(
+                    "Waking up the sender since table {} bucket {} is either full or getting a new batch",
+                    routingPath,
+                    bucketId);
+            sender.wakeup();
         }
     }
 
@@ -349,17 +637,63 @@ public class WriterClient {
         return targetPath;
     }
 
-    private void maybeAbortBatches(Throwable t) {
-        if (accumulator.hasIncomplete()) {
-            LOG.error("Aborting all pending write batches due to fatal error", t);
-            accumulator.abortAllBatches(toException(t));
+    private void failPartition(PendingPartition partition, Throwable error) {
+        List<AcceptedWrite> writes;
+        Exception cause =
+                toException(org.apache.fluss.utils.ExceptionUtils.stripCompletionException(error));
+        synchronized (pendingLock) {
+            partition.error = cause;
+            writes = new ArrayList<>(partition.writes);
+            for (AcceptedWrite write : writes) {
+                write.record = null;
+                pendingBytes -= write.charge;
+            }
+            partition.writes.clear();
+            pendingPartitions.remove(partition.originalPath, partition);
+            pendingLock.notifyAll();
+        }
+        for (AcceptedWrite write : writes) {
+            write.onCompletion(null, -1L, cause);
+        }
+    }
+
+    private void maybeAbortBatches(Throwable error) {
+        List<AcceptedWrite> writes;
+        synchronized (pendingLock) {
+            if (failure != null) {
+                return;
+            }
+            failure =
+                    toException(
+                            org.apache.fluss.utils.ExceptionUtils.stripCompletionException(error));
+            writes = new ArrayList<>(acceptedWrites.values());
+            for (PendingPartition partition : pendingPartitions.values()) {
+                for (AcceptedWrite write : partition.writes) {
+                    write.record = null;
+                }
+                partition.writes.clear();
+            }
+            pendingPartitions.clear();
+            pendingBytes = 0;
+            pendingLock.notifyAll();
+        }
+        if (sender != null) {
+            sender.recordFatalError(failure);
+        } else if (accumulator != null) {
+            accumulator.close();
+        }
+        for (AcceptedWrite write : writes) {
+            write.onCompletion(null, -1L, failure);
         }
     }
 
     // Verify that writer instance has not been closed. This method throws IllegalStateException if
     // writer has already been closed.
     private void throwIfWriterClosed() {
-        if (sender == null || !sender.isRunning()) {
+        if (failure != null) {
+            throw new FlussRuntimeException("Writer failed", failure);
+        }
+        if (closed || sender == null || !sender.isRunning()) {
             throw new IllegalStateException(
                     String.format(
                             "Cannot perform write operation after writer has been closed. Sender running: %b, Thread pool shutdown: %b",
@@ -432,69 +766,74 @@ public class WriterClient {
                 metadataUpdater,
                 idempotenceManager,
                 writerMetricGroup,
-                this::invalidateBucketAssigner);
+                this::maybeAbortBatches);
     }
 
     public void close(Duration timeout) {
-        long timeoutMs = timeout.toMillis();
-        LOG.info("Closing writer with timeout {} ms.", timeoutMs);
-
-        writerMetricGroup.close();
-
-        if (sender != null) {
-            sender.initiateClose();
+        long budget = TimeUnit.MILLISECONDS.toNanos(Math.max(0, timeout.toMillis()));
+        long start = System.nanoTime();
+        synchronized (pendingLock) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            pendingLock.notifyAll();
         }
-
-        if (ioThreadPool != null) {
-            ioThreadPool.shutdown();
-
-            if (timeoutMs > 0) {
-                try {
-                    if (!ioThreadPool.awaitTermination(timeoutMs, TimeUnit.MILLISECONDS)) {
-                        LOG.warn("Writer graceful close timed out after {} ms.", timeoutMs);
+        if (accumulator != null) {
+            accumulator.beginFlush();
+        }
+        if (sender != null) {
+            sender.wakeup();
+        }
+        try {
+            synchronized (pendingLock) {
+                while (!acceptedWrites.isEmpty()) {
+                    long remaining = budget - (System.nanoTime() - start);
+                    if (remaining <= 0) {
+                        break;
                     }
-                } catch (InterruptedException e) {
-                    LOG.error("Interrupted while waiting for writer sender thread.", e);
-                    Thread.currentThread().interrupt();
+                    TimeUnit.NANOSECONDS.timedWait(pendingLock, remaining);
                 }
             }
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+        } finally {
+            if (accumulator != null) {
+                accumulator.endFlush();
+            }
         }
-
-        if (sender != null && ioThreadPool != null && !ioThreadPool.isTerminated()) {
-            LOG.info(
-                    "Proceeding to force close the writer since pending requests could not be completed "
-                            + "within timeout {} ms.",
-                    timeoutMs);
+        boolean unfinished;
+        synchronized (pendingLock) {
+            unfinished = !acceptedWrites.isEmpty();
+        }
+        if (unfinished) {
+            maybeAbortBatches(
+                    new FlussRuntimeException("Writer closed before all writes completed"));
+        }
+        if (transferExecutor != null) {
+            transferExecutor.shutdownNow();
+        }
+        if (sender != null) {
             sender.forceClose();
+        }
+        if (ioThreadPool != null) {
             ioThreadPool.shutdownNow();
             try {
-                if (!ioThreadPool.awaitTermination(
-                        FORCE_CLOSE_TERMINATION_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-                    LOG.error("Failed to shutdown writer.");
+                long remaining = budget - (System.nanoTime() - start);
+                if (remaining > 0) {
+                    ioThreadPool.awaitTermination(remaining, TimeUnit.NANOSECONDS);
                 }
-            } catch (InterruptedException e) {
-                LOG.error("Interrupted while force closing writer sender thread.", e);
+            } catch (InterruptedException error) {
                 Thread.currentThread().interrupt();
             }
         }
-
-        LOG.info("Writer closed.");
+        if (writerMetricGroup != null) {
+            writerMetricGroup.close();
+        }
     }
 
     private ExecutorService createThreadPool() {
         return Executors.newFixedThreadPool(1, new ExecutorThreadFactory(SENDER_THREAD_PREFIX));
-    }
-
-    /**
-     * Removes the {@link BucketAssigner} associated with the given table bucket. Called by {@link
-     * Sender} when a write batch is rejected for invalid bucket routing, so the next {@code send}
-     * creates a new assigner with the refreshed bucket count.
-     */
-    private void invalidateBucketAssigner(TableBucket tableBucket) {
-        bucketAssigners.remove(TableOrPartition.ofTable(tableBucket.getTableId()));
-        if (tableBucket.getPartitionId() != null) {
-            bucketAssigners.remove(TableOrPartition.ofPartition(tableBucket.getPartitionId()));
-        }
     }
 
     private BucketAssigner createBucketAssigner(

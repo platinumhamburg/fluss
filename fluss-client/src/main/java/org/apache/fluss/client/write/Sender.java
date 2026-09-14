@@ -22,7 +22,6 @@ import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.client.metrics.WriterMetricGroup;
 import org.apache.fluss.client.write.RecordAccumulator.ReadyCheckResult;
 import org.apache.fluss.cluster.Cluster;
-import org.apache.fluss.exception.InvalidBucketRoutingException;
 import org.apache.fluss.exception.InvalidMetadataException;
 import org.apache.fluss.exception.LeaderNotAvailableException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
@@ -122,12 +121,7 @@ public class Sender implements Runnable {
 
     private final WriterMetricGroup writerMetricGroup;
 
-    /**
-     * Called when a write batch is rejected for invalid bucket routing so the owning {@link
-     * WriterClient} can remove the stale {@link BucketAssigner}. The next {@code send} will refresh
-     * metadata and create a new assigner with the updated bucket count.
-     */
-    private final Consumer<TableBucket> bucketAssignerInvalidator;
+    private final Consumer<Throwable> fatalErrorHandler;
 
     public Sender(
             RecordAccumulator accumulator,
@@ -137,8 +131,30 @@ public class Sender implements Runnable {
             int retries,
             MetadataUpdater metadataUpdater,
             IdempotenceManager idempotenceManager,
+            WriterMetricGroup writerMetricGroup) {
+        this(
+                accumulator,
+                maxRequestTimeoutMs,
+                maxRequestSize,
+                acks,
+                retries,
+                metadataUpdater,
+                idempotenceManager,
+                writerMetricGroup,
+                ignored -> {});
+    }
+
+    Sender(
+            RecordAccumulator accumulator,
+            int maxRequestTimeoutMs,
+            int maxRequestSize,
+            short acks,
+            int retries,
+            MetadataUpdater metadataUpdater,
+            IdempotenceManager idempotenceManager,
             WriterMetricGroup writerMetricGroup,
-            Consumer<TableBucket> bucketAssignerInvalidator) {
+            Consumer<Throwable> fatalErrorHandler) {
+        this.fatalErrorHandler = fatalErrorHandler;
         this.accumulator = accumulator;
         this.maxRequestSize = maxRequestSize;
         this.maxRequestTimeoutMs = maxRequestTimeoutMs;
@@ -152,7 +168,6 @@ public class Sender implements Runnable {
 
         this.idempotenceManager = idempotenceManager;
         this.writerMetricGroup = writerMetricGroup;
-        this.bucketAssignerInvalidator = bucketAssignerInvalidator;
 
         // TODO add retry logic while send failed. See FLUSS-56364375
     }
@@ -255,26 +270,6 @@ public class Sender implements Runnable {
         // get the list of buckets with data ready to send.
         ReadyCheckResult readyCheckResult = accumulator.ready(clusterSnapshot);
 
-        if (!readyCheckResult.invalidBucketRoutingTables.isEmpty()) {
-            for (PhysicalTablePath physicalTablePath :
-                    readyCheckResult.invalidBucketRoutingTables) {
-                accumulator.abortBatches(
-                        physicalTablePath,
-                        new InvalidBucketRoutingException(
-                                "The bucket count changed before queued records for "
-                                        + physicalTablePath
-                                        + " could be sent. Retry the failed records."));
-                Long tableId =
-                        clusterSnapshot.getTableId(physicalTablePath.getTablePath()).orElse(null);
-                Long partitionId = clusterSnapshot.getPartitionId(physicalTablePath).orElse(null);
-                if (tableId != null) {
-                    bucketAssignerInvalidator.accept(new TableBucket(tableId, partitionId, 0));
-                }
-            }
-            metadataUpdater.invalidPhysicalTableBucketAndPartitionMeta(
-                    readyCheckResult.invalidBucketRoutingTables);
-        }
-
         // if there are any buckets whose leaders are not known yet, force metadata update
         if (!readyCheckResult.unknownLeaderTables.isEmpty()) {
             try {
@@ -358,6 +353,7 @@ public class Sender implements Runnable {
 
     private void maybeAbortBatches(Throwable t) {
         try {
+            fatalErrorHandler.accept(t);
             if (accumulator.hasIncomplete()) {
                 LOG.error("Aborting write batches due to fatal error", t);
                 accumulator.abortAllBatches(ExceptionUtils.toException(t));
@@ -700,7 +696,7 @@ public class Sender implements Runnable {
         metadataUpdater.invalidPhysicalTableBucketMeta(invalidMetadataTablesSet);
     }
 
-    private void recordFatalError(Throwable t) {
+    void recordFatalError(Throwable t) {
         // Request callbacks may run on a network thread. Only publish the fatal state here; the
         // sender thread aborts incomplete batches in run() before destroying accumulator resources.
         accumulator.close();
@@ -728,23 +724,21 @@ public class Sender implements Runnable {
             accumulator.updateThrottle(readyWriteBatch.tableBucket(), 1.0f);
         }
         if (error.error() == Errors.INVALID_BUCKET_ROUTING) {
-            // The bucketId in this batch was computed with invalid routing information, and the
-            // server rejected it during pre-append validation, so it was provably never written.
-            // Reclaim its batch sequence (adjustBatchSequences=true): otherwise a permanent hole is
-            // left at this sequence, and the next batch that reaches the server on this bucket
-            // (created after the metadata refresh, carrying a valid routing count) would send the
-            // following sequence against a lower expected one, raising OUT_OF_ORDER_SEQUENCE and
-            // resetting the writer id — which discards idempotence for every bucket of this writer.
-            // Do not re-enqueue (the bucketId is fixed); invalidate metadata and drop the
-            // BucketAssigner so the next send re-routes with the updated count.
-            LOG.warn(
-                    "Received {} in write request on table bucket {}. Failing batch and "
-                            + "invalidating BucketAssigner.",
+            // Under resolve-before-route the client never sends a batch whose routing bucket count
+            // was guessed: records are held unrouted until the partition's count is resolved. So
+            // this rejection should not happen and points to a client/server routing bug; fail it
+            // loudly instead of silently re-routing. The server rejected the batch during
+            // pre-append validation, so it was provably never written: reclaim its batch sequence
+            // (adjustBatchSequences=true) to avoid leaving a permanent hole that would poison
+            // idempotence for every bucket of this writer, and refresh metadata defensively.
+            LOG.error(
+                    "Received {} in write request on table bucket {} even though the client routes "
+                            + "only with a resolved bucket count. Failing batch; this indicates a "
+                            + "routing bug.",
                     error.error(),
                     readyWriteBatch.tableBucket());
             failBatch(readyWriteBatch, error.exception(), true);
             invalidMetadataTables.add(writeBatch.physicalTablePath());
-            bucketAssignerInvalidator.accept(readyWriteBatch.tableBucket());
             return invalidMetadataTables;
         }
         if (error.error() == Errors.DUPLICATE_SEQUENCE_EXCEPTION) {

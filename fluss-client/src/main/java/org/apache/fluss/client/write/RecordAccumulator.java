@@ -32,7 +32,6 @@ import org.apache.fluss.memory.PreAllocatedPagedOutputView;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
-import org.apache.fluss.metadata.TableOrPartition;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.record.LogRecordBatchStatisticsCollector;
@@ -114,6 +113,9 @@ public final class RecordAccumulator {
 
     @GuardedBy("resourcesLock")
     private boolean resourcesDestroyed;
+
+    @GuardedBy("resourcesLock")
+    private boolean destroyRequested;
 
     /** The pool of lazily created arrow {@link ArrowWriter}s for arrow log write batch. */
     private final ArrowWriterPool arrowWriterPool;
@@ -209,21 +211,15 @@ public final class RecordAccumulator {
             throws Exception {
         PhysicalTablePath physicalTablePath = writeRecord.getPhysicalTablePath();
         TableInfo tableInfo = writeRecord.getTableInfo();
-        // The metadata may return null for the partition id, but it is fine to pass null here,
-        // because we will fill the partitionId in bucketReady() before send the batch.
-        Optional<Long> partitionIdOpt = cluster.getPartitionId(physicalTablePath);
-        BucketAndWriteBatches bucketAndWriteBatches =
-                writeBatches.computeIfAbsent(
-                        physicalTablePath,
-                        k ->
-                                new BucketAndWriteBatches(
-                                        partitionIdOpt.orElse(null),
-                                        tableInfo.isPartitioned(),
-                                        physicalTablePath));
+        BucketAndWriteBatches bucketAndWriteBatches = getOrCreateWriteBatches(writeRecord, cluster);
 
-        // We keep track of the number of appending thread to make sure we do not miss batches in
-        // abortIncompleteBatches().
-        appendsInProgress.incrementAndGet();
+        // Keep pooled and Arrow resources alive until allocation and registration have finished.
+        synchronized (resourcesLock) {
+            if (closed) {
+                throw new FlussRuntimeException("Writer closed while send in progress");
+            }
+            appendsInProgress.incrementAndGet();
+        }
         List<MemorySegment> memorySegments = Collections.emptyList();
         try {
             // check if we have an in-progress batch
@@ -231,7 +227,7 @@ public final class RecordAccumulator {
                     bucketAndWriteBatches.batches.computeIfAbsent(
                             bucketId, k -> new ArrayDeque<>());
             synchronized (dq) {
-                RecordAppendResult appendResult = tryAppend(writeRecord, callback, bucketCount, dq);
+                RecordAppendResult appendResult = tryAppend(writeRecord, callback, dq);
                 if (appendResult != null) {
                     return appendResult;
                 }
@@ -263,9 +259,32 @@ public final class RecordAccumulator {
             // Other append operations by the Sender thread may have created a new batch, causing
             // the temporarily allocated memorySegments here to go unused, and therefore, it needs
             // to be released.
-            writerBufferPool.returnAll(memorySegments);
-            appendsInProgress.decrementAndGet();
+            synchronized (resourcesLock) {
+                writerBufferPool.returnAll(memorySegments);
+                if (appendsInProgress.decrementAndGet() == 0 && destroyRequested) {
+                    destroyResources();
+                }
+            }
         }
+    }
+
+    /**
+     * Returns the write-batch holder for the record's original physical path, creating it if
+     * absent. The partition id may be null here; {@link #bucketReady} fills it in before send and,
+     * while it stays null, registers the path for the metadata fetch that resolves it.
+     */
+    private BucketAndWriteBatches getOrCreateWriteBatches(
+            WriteRecord writeRecord, Cluster cluster) {
+        PhysicalTablePath physicalTablePath = writeRecord.getPhysicalTablePath();
+        TableInfo tableInfo = writeRecord.getTableInfo();
+        Optional<Long> partitionIdOpt = cluster.getPartitionId(physicalTablePath);
+        return writeBatches.computeIfAbsent(
+                physicalTablePath,
+                k ->
+                        new BucketAndWriteBatches(
+                                partitionIdOpt.orElse(null),
+                                tableInfo.isPartitioned(),
+                                physicalTablePath));
     }
 
     /**
@@ -289,7 +308,6 @@ public final class RecordAccumulator {
         Set<Integer> readyNodes = new HashSet<>();
         long nextReadyCheckDelayMs = batchTimeoutMs;
         Set<PhysicalTablePath> unknownLeaderTables = new HashSet<>();
-        Set<PhysicalTablePath> invalidBucketRoutingTables = new HashSet<>();
         // Go table by table so that we can get queue sizes for buckets in a table and calculate
         // cumulative frequency table (used in bucket assigner).
 
@@ -299,15 +317,13 @@ public final class RecordAccumulator {
                             bucketAndWriteBatches,
                             readyNodes,
                             unknownLeaderTables,
-                            invalidBucketRoutingTables,
                             cluster,
                             nextReadyCheckDelayMs);
         }
 
         // TODO and the earliest time at which any non-send-able bucket will be ready;
 
-        return new ReadyCheckResult(
-                readyNodes, nextReadyCheckDelayMs, unknownLeaderTables, invalidBucketRoutingTables);
+        return new ReadyCheckResult(readyNodes, nextReadyCheckDelayMs, unknownLeaderTables);
     }
 
     /**
@@ -605,8 +621,12 @@ public final class RecordAccumulator {
                 future.await();
             }
         } finally {
-            flushesInProgress.decrementAndGet();
+            endFlush();
         }
+    }
+
+    void endFlush() {
+        flushesInProgress.decrementAndGet();
     }
 
     /**
@@ -695,7 +715,6 @@ public final class RecordAccumulator {
             BucketAndWriteBatches bucketAndWriteBatches,
             Set<Integer> readyNodes,
             Set<PhysicalTablePath> unknownLeaderTables,
-            Set<PhysicalTablePath> invalidBucketRoutingTables,
             Cluster cluster,
             long nextReadyCheckDelayMs) {
         // first check this table has partitionId.
@@ -714,13 +733,8 @@ public final class RecordAccumulator {
             }
         }
 
-        Integer actualBucketCount =
-                bucketAndWriteBatches.isPartitionedTable
-                        ? cluster.getBucketCount(
-                                        TableOrPartition.ofPartition(
-                                                bucketAndWriteBatches.partitionId))
-                                .orElse(null)
-                        : null;
+        // WriterClient resolves each partition's immutable bucket count before assigning buckets
+        // and registering batches here.
         Map<Integer, Deque<WriteBatch>> batches = bucketAndWriteBatches.batches;
         // Collect the queue sizes for available buckets to be used in adaptive bucket allocate.
 
@@ -748,11 +762,6 @@ public final class RecordAccumulator {
                 waitedTimeMs = batch.waitedTimeMs(clock.milliseconds());
                 dequeSize = deque.size();
                 full = dequeSize > 1 || batch.isClosed();
-            }
-
-            if (actualBucketCount != null && batch.getBucketCount() != actualBucketCount) {
-                invalidBucketRoutingTables.add(targetPath);
-                return nextReadyCheckDelayMs;
             }
 
             int bucketId = entry.getKey();
@@ -857,7 +866,7 @@ public final class RecordAccumulator {
                         ? bucketAndWriteBatches
                         : deque;
         synchronized (routeLock) {
-            RecordAppendResult appendResult = tryAppend(writeRecord, callback, bucketCount, deque);
+            RecordAppendResult appendResult = tryAppend(writeRecord, callback, deque);
             if (appendResult != null) {
                 // Somebody else found us a batch, return the one we waited for! Hopefully this
                 // doesn't happen often...
@@ -881,8 +890,14 @@ public final class RecordAccumulator {
                             isHistoricalPartition);
 
             batch.tryAppend(writeRecord, callback);
-            deque.addLast(batch);
-            incomplete.add(batch);
+            synchronized (resourcesLock) {
+                if (closed) {
+                    batch.abortRecordAppends();
+                    throw new FlussRuntimeException("Writer closed while send in progress");
+                }
+                deque.addLast(batch);
+                incomplete.add(batch);
+            }
             return new RecordAppendResult(deque.size() > 1 || batch.isClosed(), true, false);
         }
     }
@@ -971,18 +986,14 @@ public final class RecordAccumulator {
     }
 
     private RecordAppendResult tryAppend(
-            WriteRecord writeRecord,
-            WriteCallback callback,
-            int bucketCount,
-            Deque<WriteBatch> deque)
+            WriteRecord writeRecord, WriteCallback callback, Deque<WriteBatch> deque)
             throws Exception {
         if (closed) {
             throw new FlussRuntimeException("Writer closed while send in progress");
         }
         WriteBatch last = deque.peekLast();
         if (last != null) {
-            boolean success =
-                    last.getBucketCount() == bucketCount && last.tryAppend(writeRecord, callback);
+            boolean success = last.tryAppend(writeRecord, callback);
             if (!success) {
                 // The last batch is either full/closed or belongs to a different table, write
                 // format, schema, or bucket layout. Close it so the incoming record rolls over to
@@ -1411,23 +1422,22 @@ public final class RecordAccumulator {
         public final Set<Integer> readyNodes;
         public final long nextReadyCheckDelayMs;
         public final Set<PhysicalTablePath> unknownLeaderTables;
-        public final Set<PhysicalTablePath> invalidBucketRoutingTables;
 
         public ReadyCheckResult(
                 Set<Integer> readyNodes,
                 long nextReadyCheckDelayMs,
-                Set<PhysicalTablePath> unknownLeaderTables,
-                Set<PhysicalTablePath> invalidBucketRoutingTables) {
+                Set<PhysicalTablePath> unknownLeaderTables) {
             this.readyNodes = readyNodes;
             this.nextReadyCheckDelayMs = nextReadyCheckDelayMs;
             this.unknownLeaderTables = unknownLeaderTables;
-            this.invalidBucketRoutingTables = invalidBucketRoutingTables;
         }
     }
 
     /** Close this accumulator to reject new appends. */
     public void close() {
-        closed = true;
+        synchronized (resourcesLock) {
+            closed = true;
+        }
     }
 
     /**
@@ -1446,8 +1456,13 @@ public final class RecordAccumulator {
             if (resourcesDestroyed) {
                 return;
             }
-            resourcesDestroyed = true;
+            closed = true;
+            destroyRequested = true;
             writerBufferPool.close();
+            if (appendsInProgress.get() != 0) {
+                return;
+            }
+            resourcesDestroyed = true;
             arrowWriterPool.close();
             bufferAllocator.close();
             chunkedFactory.close();

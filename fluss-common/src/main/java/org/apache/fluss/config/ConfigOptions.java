@@ -1280,6 +1280,17 @@ public class ConfigOptions {
                     .withDescription(
                             "The total bytes of memory the writer can use to buffer internal rows.");
 
+    /** Capacity for records waiting for partition routing, separate from batch buffer memory. */
+    public static final ConfigOption<MemorySize> CLIENT_WRITER_PENDING_BUFFER_MEMORY_SIZE =
+            key("client.writer.pending-buffer.memory-size")
+                    .memoryType()
+                    .defaultValue(MemorySize.ofMebiBytes(16))
+                    .withDescription(
+                            "Memory budget for owned records waiting for partition routing. "
+                                    + "This is additional to the writer batch buffer. When exhausted, writes "
+                                    + "wait for space. Records larger than this budget, or with an unknown "
+                                    + "retained size, wait for routing on the calling thread.");
+
     public static final ConfigOption<MemorySize> CLIENT_WRITER_BUFFER_PAGE_SIZE =
             key("client.writer.buffer.page-size")
                     .memoryType()

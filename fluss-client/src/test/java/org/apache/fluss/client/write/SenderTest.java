@@ -218,34 +218,6 @@ final class SenderTest {
     }
 
     @Test
-    void testFailsQueuedBatchWhenPartitionBucketCountChanged() throws Exception {
-        sender.destroyResources();
-        TableInfo tableInfo = createHistoricalTableInfo();
-        PhysicalTablePath partitionPath =
-                PhysicalTablePath.of(tableInfo.getTablePath(), "20990101");
-        TableBucket tableBucket = new TableBucket(tableInfo.getTableId(), 21L, 0);
-        Map<TableOrPartition, Integer> bucketCounts = new HashMap<>();
-        bucketCounts.put(TableOrPartition.ofPartition(tableBucket.getPartitionId()), 4);
-        metadataUpdater.updateCluster(
-                partitionedCluster(
-                        tableInfo,
-                        Collections.singletonMap(partitionPath, tableBucket),
-                        bucketCounts));
-        sender = setupWithIdempotenceState();
-
-        CompletableFuture<Exception> future =
-                appendKvRecord(tableInfo, partitionPath, 1, metadataUpdater.getCluster(), 2);
-        sender.runOnce();
-
-        assertThat(future.get())
-                .isInstanceOf(InvalidBucketRoutingException.class)
-                .hasMessageContaining("bucket count changed");
-        assertThatThrownBy(() -> node1Gateway().getRequest(0))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("No requests pending");
-    }
-
-    @Test
     void testAbortsRerouteWhenQueuedBatchBucketCountDiffers() throws Exception {
         sender.destroyResources();
         TableInfo tableInfo = createHistoricalTableInfo();
@@ -1735,8 +1707,10 @@ final class SenderTest {
     }
 
     @Test
-    void testInvalidBucketRoutingFailsBatchAndInvalidatesBucketAssigner() throws Exception {
-        // Recreate sender with a tracking bucketAssignerInvalidator.
+    void testInvalidBucketRoutingFailsBatchAndInvalidatesMetadata() throws Exception {
+        // Under resolve-before-route the client never routes with a guessed count, so
+        // INVALID_BUCKET_ROUTING is now a defensive path: the batch must fail loudly (never retry
+        // with the stale bucketId) and the table's bucket metadata must be refreshed.
         IdempotenceManager idempotenceManager = createIdempotenceManager(false);
         Configuration conf = new Configuration();
         conf.set(ConfigOptions.CLIENT_WRITER_BUFFER_MEMORY_SIZE, new MemorySize(TOTAL_MEMORY_SIZE));
@@ -1746,7 +1720,6 @@ final class SenderTest {
         accumulator =
                 new RecordAccumulator(
                         conf, idempotenceManager, writerMetricGroup, SystemClock.getInstance());
-        AtomicReference<TableBucket> invalidatedBucket = new AtomicReference<>();
         Sender staleSender =
                 new Sender(
                         accumulator,
@@ -1756,8 +1729,7 @@ final class SenderTest {
                         Integer.MAX_VALUE,
                         metadataUpdater,
                         idempotenceManager,
-                        writerMetricGroup,
-                        invalidatedBucket::set);
+                        writerMetricGroup);
 
         // Append one record and send it.
         CompletableFuture<Exception> future = new CompletableFuture<>();
@@ -1765,17 +1737,13 @@ final class SenderTest {
         staleSender.runOnce();
         assertThat(staleSender.numOfInFlightBatches(tb1)).isEqualTo(1);
 
-        // Server rejects the bucketId computed with a stale count.
+        // Server rejects the bucketId computed with a stale count during pre-append validation.
         Cluster clusterBeforeError = metadataUpdater.getCluster();
         finishRequest(tb1, 0, createProduceLogResponse(tb1, Errors.INVALID_BUCKET_ROUTING));
 
         // The batch is failed (not re-enqueued for retry — the bucketId is stale and must not be
         // reused).
         assertThat(staleSender.numOfInFlightBatches(tb1)).isEqualTo(0);
-
-        // The BucketAssigner for this bucket was invalidated so the next send rebuilds it with
-        // the refreshed bucket count.
-        assertThat(invalidatedBucket.get()).isEqualTo(tb1);
 
         // The table's bucket metadata was invalidated so the next send requests it again.
         assertThat(metadataUpdater.getCluster()).isNotSameAs(clusterBeforeError);
@@ -2151,8 +2119,7 @@ final class SenderTest {
                 reties,
                 metadataUpdater,
                 idempotenceManager,
-                writerMetricGroup,
-                tb -> {});
+                writerMetricGroup);
     }
 
     private IdempotenceManager createIdempotenceManager(boolean idempotenceEnabled) {
