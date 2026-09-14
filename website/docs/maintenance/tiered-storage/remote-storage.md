@@ -10,6 +10,8 @@ See more detail about how to configure remote storage in documentation of [files
 
 For log table, Fluss will use remote storage to store the tiered log segments of data. For primary key table, Fluss will use remote storage to store the snapshot as well as the tiered log segments for change log.
 
+The [`remove_orphan_files`](/engine-flink/actions.md#remove_orphan_files) Flink action can remove eligible orphan files from remote storage. See the action documentation for cleanup scope and usage.
+
 ## Remote Log
 
 As a streaming storage, Fluss data is mostly consumed in a streaming fashion using tail reads. To achieve low
