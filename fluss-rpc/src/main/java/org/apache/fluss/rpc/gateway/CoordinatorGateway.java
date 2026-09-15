@@ -32,6 +32,8 @@ import org.apache.fluss.rpc.messages.LakeTieringHeartbeatRequest;
 import org.apache.fluss.rpc.messages.LakeTieringHeartbeatResponse;
 import org.apache.fluss.rpc.messages.PrepareLakeTableSnapshotRequest;
 import org.apache.fluss.rpc.messages.PrepareLakeTableSnapshotResponse;
+import org.apache.fluss.rpc.messages.TestFilesystemRequest;
+import org.apache.fluss.rpc.messages.TestFilesystemResponse;
 import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.rpc.protocol.RPC;
 
@@ -39,6 +41,10 @@ import java.util.concurrent.CompletableFuture;
 
 /** The entry point of RPC gateway interface for coordinator server. */
 public interface CoordinatorGateway extends RpcGateway, AdminGateway {
+
+    /** Executes a filesystem operation in a dedicated test build. */
+    @RPC(api = ApiKeys.TEST_FILESYSTEM)
+    CompletableFuture<TestFilesystemResponse> testFilesystem(TestFilesystemRequest request);
 
     /** Checks if the current server is the leader. */
     boolean isLeader();

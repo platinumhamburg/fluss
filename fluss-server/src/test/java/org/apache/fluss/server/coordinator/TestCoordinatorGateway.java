@@ -118,6 +118,8 @@ import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
 import org.apache.fluss.rpc.messages.RemoveServerTagResponse;
 import org.apache.fluss.rpc.messages.TableExistsRequest;
 import org.apache.fluss.rpc.messages.TableExistsResponse;
+import org.apache.fluss.rpc.messages.TestFilesystemRequest;
+import org.apache.fluss.rpc.messages.TestFilesystemResponse;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.server.entity.AdjustIsrResultForBucket;
 import org.apache.fluss.server.entity.CommitRemoteLogManifestData;
@@ -513,5 +515,10 @@ public class TestCoordinatorGateway implements CoordinatorGateway {
 
     public void setNetworkIssueEnable(boolean networkIssueEnable) {
         this.networkIssueEnable = networkIssueEnable;
+    }
+
+    @Override
+    public CompletableFuture<TestFilesystemResponse> testFilesystem(TestFilesystemRequest request) {
+        throw new UnsupportedOperationException();
     }
 }

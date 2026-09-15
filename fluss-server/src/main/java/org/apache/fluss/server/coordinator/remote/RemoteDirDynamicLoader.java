@@ -24,8 +24,10 @@ import org.apache.fluss.config.cluster.ServerReconfigurable;
 import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.exception.IllegalConfigurationException;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -47,7 +49,7 @@ import static org.apache.fluss.config.FlussConfigUtils.validateRemoteDataDirs;
 public class RemoteDirDynamicLoader implements ServerReconfigurable, AutoCloseable {
 
     private volatile RemoteDirSelector remoteDirSelector;
-    private Configuration currentConfiguration;
+    private volatile Configuration currentConfiguration;
 
     public RemoteDirDynamicLoader(Configuration configuration) {
         this.currentConfiguration = configuration;
@@ -56,6 +58,17 @@ public class RemoteDirDynamicLoader implements ServerReconfigurable, AutoCloseab
 
     public RemoteDirSelector getRemoteDirSelector() {
         return remoteDirSelector;
+    }
+
+    /** Returns configured roots, including the legacy root, for filesystem test access. */
+    public List<String> getTestFilesystemRoots() {
+        Configuration snapshot = currentConfiguration;
+        Set<String> roots = new LinkedHashSet<>(snapshot.get(ConfigOptions.REMOTE_DATA_DIRS));
+        String legacyRoot = snapshot.get(ConfigOptions.REMOTE_DATA_DIR);
+        if (legacyRoot != null) {
+            roots.add(legacyRoot);
+        }
+        return new ArrayList<>(roots);
     }
 
     @Override

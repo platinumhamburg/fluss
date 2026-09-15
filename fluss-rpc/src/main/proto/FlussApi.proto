@@ -1469,3 +1469,32 @@ message PbLiteralValue {
   optional int32 timestamp_nano_of_millis_value = 12; // Nano of millis
   optional bytes decimal_bytes = 13;   // Serialized decimal (non-compact mode)
 }
+
+// Internal filesystem access for dedicated test server builds.
+message TestFilesystemRequest {
+  // LIST=0, STAT=1, READ=2, WRITE=3, DELETE=4, COPY=5.
+  required int32 operation = 1;
+  required string path = 2;
+  optional int64 offset = 3;
+  optional int32 length = 4;
+  optional bytes content = 5;
+  optional bool overwrite = 6;
+  optional bool recursive = 7;
+  optional string target_path = 8;
+}
+
+message TestFilesystemResponse {
+  repeated PbTestFileStatus files = 1;
+  optional bytes content = 2;
+  optional bool deleted = 3;
+  // Filesystem exceptions are distinct from transport/protocol failures.
+  optional string error_type = 4;
+  optional string error_message = 5;
+}
+
+message PbTestFileStatus {
+  required string path = 1;
+  required bool directory = 2;
+  required int64 length = 3;
+  required int64 modification_time = 4;
+}

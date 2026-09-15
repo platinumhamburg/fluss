@@ -42,6 +42,7 @@ import org.apache.fluss.metrics.registry.MetricRegistry;
 import org.apache.fluss.rpc.GatewayClientProxy;
 import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.gateway.AdminReadOnlyGateway;
+import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.metrics.ClientMetricGroup;
 
 import java.time.Duration;
@@ -113,6 +114,11 @@ public final class FlussConnection implements Connection {
     @Override
     public MultiTable getMultiTable() {
         return new MultiTableImpl(this);
+    }
+
+    CoordinatorGateway testFilesystemGateway() {
+        return GatewayClientProxy.createGatewayProxy(
+                metadataUpdater::getCoordinatorServer, rpcClient, CoordinatorGateway.class);
     }
 
     public MetadataUpdater getMetadataUpdater() {

@@ -137,6 +137,8 @@ import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseRequest;
 import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseResponse;
 import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
 import org.apache.fluss.rpc.messages.RemoveServerTagResponse;
+import org.apache.fluss.rpc.messages.TestFilesystemRequest;
+import org.apache.fluss.rpc.messages.TestFilesystemResponse;
 import org.apache.fluss.rpc.netty.server.Session;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.rpc.protocol.Errors;
@@ -167,6 +169,7 @@ import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
 import org.apache.fluss.server.coordinator.producer.ProducerOffsetsManager;
 import org.apache.fluss.server.coordinator.rebalance.goal.Goal;
 import org.apache.fluss.server.coordinator.remote.RemoteDirDynamicLoader;
+import org.apache.fluss.server.coordinator.remote.TestFilesystemHandler;
 import org.apache.fluss.server.entity.CommitKvSnapshotData;
 import org.apache.fluss.server.entity.DatabasePropertyChanges;
 import org.apache.fluss.server.entity.LakeTieringTableInfo;
@@ -334,6 +337,18 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     public void shutdown() {
         IOUtils.closeQuietly(producerOffsetsManager, "producer snapshot manager");
         IOUtils.closeQuietly(lakeCatalogDynamicLoader, "lake catalog");
+    }
+
+    @Override
+    public CompletableFuture<TestFilesystemResponse> testFilesystem(TestFilesystemRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.ALTER, Resource.cluster());
+        }
+        return CompletableFuture.supplyAsync(
+                () ->
+                        new TestFilesystemHandler(remoteDirDynamicLoader.getTestFilesystemRoots())
+                                .execute(request),
+                ioExecutor);
     }
 
     @Override
