@@ -106,6 +106,48 @@ final class NettyServerHandlerTest {
     }
 
     @Test
+    void testInactiveLazyRequestIsRejectedBeforeQueuing() throws Exception {
+        RecordingRequestChannel channel = new RecordingRequestChannel();
+        NettyServerHandler handler = newServerHandler(channel);
+        TestEmbeddedChannel embeddedChannel = new TestEmbeddedChannel(handler);
+        ByteBuf requestBuffer = encodeProduceLogRequest();
+
+        try {
+            ChannelHandlerContext context = embeddedChannel.pipeline().context(handler);
+            handler.exceptionCaught(context, new RuntimeException("close connection"));
+            handler.channelRead(context, requestBuffer);
+
+            assertThat(channel.getPutRequestInvocations()).isZero();
+            assertThat(channel.requestsCount()).isZero();
+            assertThat(requestBuffer.refCnt()).isZero();
+        } finally {
+            embeddedChannel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void testActiveLazyRequestRetainsBufferUntilProcessed() throws Exception {
+        TestingRequestChannel channel = new TestingRequestChannel(100);
+        NettyServerHandler handler = newServerHandler(channel);
+        TestEmbeddedChannel embeddedChannel = new TestEmbeddedChannel(handler);
+        ByteBuf requestBuffer = encodeProduceLogRequest();
+
+        try {
+            handler.channelRead(embeddedChannel.pipeline().context(handler), requestBuffer);
+
+            assertThat(channel.requestsCount()).isOne();
+            assertThat(requestBuffer.refCnt()).isOne();
+
+            RpcRequest request = channel.pollRequest(0);
+            assertThat(request).isNotNull();
+            request.releaseBuffer();
+            assertThat(requestBuffer.refCnt()).isZero();
+        } finally {
+            embeddedChannel.finishAndReleaseAll();
+        }
+    }
+
+    @Test
     void testInactiveProduceRequestCannotAppendReleasedBuffer(@TempDir Path tempDir)
             throws Exception {
         CompletableFuture<MemoryLogRecords> capturedRecords = new CompletableFuture<>();
@@ -113,7 +155,9 @@ final class NettyServerHandlerTest {
         AtomicInteger produceInvocations = new AtomicInteger();
         AtomicReference<Boolean> validBeforeRelease = new AtomicReference<>();
         AtomicReference<Throwable> appendFailure = new AtomicReference<>();
-        RequestChannel channel = new CoordinatedRequestChannel(capturedRecords);
+        AtomicReference<Throwable> coordinationFailure = new AtomicReference<>();
+        RequestChannel channel =
+                new CoordinatedRequestChannel(capturedRecords, coordinationFailure);
         NettyServerHandler handler = newServerHandler(channel);
         TestEmbeddedChannel embeddedChannel = new TestEmbeddedChannel(handler);
         ChannelHandlerContext context = embeddedChannel.pipeline().context(handler);
@@ -132,8 +176,8 @@ final class NettyServerHandlerTest {
                                     MemoryLogRecords.pointToByteBuffer(recordsSlice.nioBuffer());
                             validBeforeRelease.set(records.batches().iterator().next().isValid());
                             capturedRecords.complete(records);
-                            continueAppend.join();
                             try {
+                                getWithTimeout(continueAppend, "permission to append records");
                                 fileRecords.append(records);
                             } catch (Throwable t) {
                                 appendFailure.set(t);
@@ -169,6 +213,7 @@ final class NettyServerHandlerTest {
                 boolean validOnDisk =
                         fileRecords.sizeInBytes() == 0
                                 || fileRecords.batches().iterator().next().isValid();
+                assertThat(coordinationFailure.get()).isNull();
                 assertThat(appendFailure.get()).isNull();
                 if (fileRecords.sizeInBytes() > 0) {
                     assertThat(validBeforeRelease).hasValue(true);
@@ -435,19 +480,57 @@ final class NettyServerHandlerTest {
         return response;
     }
 
+    private static <T> T getWithTimeout(CompletableFuture<T> future, String operation) {
+        try {
+            return future.get(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("Interrupted while waiting for " + operation, e);
+        } catch (Exception e) {
+            throw new AssertionError("Failed while waiting for " + operation, e);
+        }
+    }
+
+    private static final class RecordingRequestChannel extends RequestChannel {
+        private int putRequestInvocations;
+
+        private RecordingRequestChannel() {
+            super(100);
+        }
+
+        @Override
+        public void putRequest(RpcRequest request) {
+            putRequestInvocations++;
+            super.putRequest(request);
+        }
+
+        private int getPutRequestInvocations() {
+            return putRequestInvocations;
+        }
+    }
+
     private static final class CoordinatedRequestChannel extends RequestChannel {
         private final CompletableFuture<MemoryLogRecords> capturedRecords;
+        private final AtomicReference<Throwable> coordinationFailure;
 
-        private CoordinatedRequestChannel(CompletableFuture<MemoryLogRecords> capturedRecords) {
+        private CoordinatedRequestChannel(
+                CompletableFuture<MemoryLogRecords> capturedRecords,
+                AtomicReference<Throwable> coordinationFailure) {
             super(100);
             this.capturedRecords = capturedRecords;
+            this.coordinationFailure = coordinationFailure;
         }
 
         @Override
         public void putRequest(RpcRequest request) {
             super.putRequest(request);
             if (request != ShutdownRequest.INSTANCE) {
-                capturedRecords.join();
+                try {
+                    getWithTimeout(capturedRecords, "request processor to capture records");
+                } catch (Throwable t) {
+                    coordinationFailure.set(t);
+                    throw t;
+                }
             }
         }
     }
