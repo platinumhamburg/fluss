@@ -93,6 +93,18 @@ class KvSnapshotFileMetadataJsonSerdeTest extends JsonSerdeTestBase<KvSnapshotFi
                 .hasMessageContaining("version");
     }
 
+    @Test
+    void testRejectVersionOutsideIntegerRange() {
+        byte[] json =
+                GOLDEN_JSON
+                        .replace("\"version\":1", "\"version\":4294967297")
+                        .getBytes(StandardCharsets.UTF_8);
+
+        assertThatThrownBy(() -> KvSnapshotFileMetadataJsonSerde.fromJson(json))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("version");
+    }
+
     @Override
     protected KvSnapshotFileMetadata[] createObjects() {
         return new KvSnapshotFileMetadata[] {
