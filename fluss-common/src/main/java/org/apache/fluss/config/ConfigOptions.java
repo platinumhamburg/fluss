@@ -2153,7 +2153,8 @@ public class ConfigOptions {
                     .defaultValue(false)
                     .withDescription(
                             "Whether to use direct I/O for RocksDB SST reads. "
-                                    + "This applies to primary key tables and takes effect when a RocksDB instance is opened. "
+                                    + "This applies to primary key tables, does not affect WAL or MANIFEST I/O, "
+                                    + "and requires a TabletServer restart to take effect. "
                                     + "The default value is `false`.");
 
     public static final ConfigOption<Boolean> KV_USE_DIRECT_IO_FOR_FLUSH_AND_COMPACTION =
@@ -2162,7 +2163,8 @@ public class ConfigOptions {
                     .defaultValue(false)
                     .withDescription(
                             "Whether to use direct I/O for RocksDB SST reads and writes during flush and compaction. "
-                                    + "This applies to primary key tables and takes effect when a RocksDB instance is opened. "
+                                    + "This applies to primary key tables, does not affect WAL or MANIFEST I/O, "
+                                    + "and requires a TabletServer restart to take effect. "
                                     + "The default value is `false`.");
 
     public static final ConfigOption<MemorySize> KV_LOG_MAX_FILE_SIZE =
