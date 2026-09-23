@@ -26,6 +26,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /** Immutable standard metadata stored in a KV snapshot {@code _METADATA} file. */
@@ -167,12 +168,23 @@ public final class KvSnapshotFileMetadata {
         private final String path;
         private final long size;
         private final String localPath;
+        private final @Nullable String sha256;
 
-        /** Creates an immutable file reference. */
+        /** Creates an immutable file reference without a content digest. */
         public FileHandle(String path, long size, String localPath) {
+            this(path, size, localPath, null);
+        }
+
+        /** Creates an immutable file reference with an optional SHA-256 content digest. */
+        public FileHandle(String path, long size, String localPath, @Nullable String sha256) {
             this.path = checkNotNull(path, "File path must not be null.");
+            checkArgument(size >= 0L, "File size must not be negative.");
             this.size = size;
             this.localPath = checkNotNull(localPath, "File local path must not be null.");
+            checkArgument(
+                    sha256 == null || sha256.matches("[0-9a-f]{64}"),
+                    "File SHA-256 must contain exactly 64 lowercase hexadecimal characters.");
+            this.sha256 = sha256;
         }
 
         /** Returns the remote file path. */
@@ -190,6 +202,12 @@ public final class KvSnapshotFileMetadata {
             return localPath;
         }
 
+        /** Returns the lowercase hexadecimal SHA-256 when present. */
+        @Nullable
+        public String getSha256() {
+            return sha256;
+        }
+
         @Override
         public boolean equals(Object o) {
             if (this == o) {
@@ -201,12 +219,13 @@ public final class KvSnapshotFileMetadata {
             FileHandle that = (FileHandle) o;
             return size == that.size
                     && Objects.equals(path, that.path)
-                    && Objects.equals(localPath, that.localPath);
+                    && Objects.equals(localPath, that.localPath)
+                    && Objects.equals(sha256, that.sha256);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(path, size, localPath);
+            return Objects.hash(path, size, localPath, sha256);
         }
     }
 

@@ -19,6 +19,7 @@ package org.apache.fluss.server.coordinator;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.fs.FSDataInputStream;
 import org.apache.fluss.fs.FSDataOutputStream;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
@@ -57,6 +58,7 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -65,7 +67,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.stream.Collectors;
 
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.server.testutils.KvTestUtils.assertLookupResponse;
@@ -275,15 +276,37 @@ class ExternalKvSnapshotITCase {
     }
 
     private static List<KvSnapshotFileMetadata.FileHandle> fileMetadata(
-            List<KvFileHandleAndLocalPath> files) {
-        return files.stream()
-                .map(
-                        file ->
-                                new KvSnapshotFileMetadata.FileHandle(
-                                        file.getKvFileHandle().getFilePath(),
-                                        file.getKvFileHandle().getSize(),
-                                        file.getLocalPath()))
-                .collect(Collectors.toList());
+            List<KvFileHandleAndLocalPath> files) throws Exception {
+        List<KvSnapshotFileMetadata.FileHandle> metadata = new ArrayList<>(files.size());
+        for (KvFileHandleAndLocalPath file : files) {
+            metadata.add(
+                    new KvSnapshotFileMetadata.FileHandle(
+                            file.getKvFileHandle().getFilePath(),
+                            file.getKvFileHandle().getSize(),
+                            file.getLocalPath(),
+                            sha256(new FsPath(file.getKvFileHandle().getFilePath()))));
+        }
+        return metadata;
+    }
+
+    private static String sha256(FsPath path) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (FSDataInputStream input = path.getFileSystem().open(path)) {
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                digest.update(buffer, 0, read);
+            }
+        }
+        byte[] hash = digest.digest();
+        char[] result = new char[hash.length * 2];
+        char[] alphabet = "0123456789abcdef".toCharArray();
+        for (int i = 0; i < hash.length; i++) {
+            int value = hash[i] & 0xff;
+            result[i * 2] = alphabet[value >>> 4];
+            result[i * 2 + 1] = alphabet[value & 0xf];
+        }
+        return new String(result);
     }
 
     private static void putRecords(

@@ -19,7 +19,13 @@ package org.apache.fluss.metadata;
 
 import org.apache.fluss.utils.json.JsonSerdeTestBase;
 
+import org.junit.jupiter.api.Test;
+
+import java.nio.charset.StandardCharsets;
 import java.util.Collections;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Compatibility test for {@link KvSnapshotFileMetadataJsonSerde}. */
 class KvSnapshotFileMetadataJsonSerdeTest extends JsonSerdeTestBase<KvSnapshotFileMetadata> {
@@ -37,6 +43,54 @@ class KvSnapshotFileMetadataJsonSerdeTest extends JsonSerdeTestBase<KvSnapshotFi
 
     KvSnapshotFileMetadataJsonSerdeTest() {
         super(KvSnapshotFileMetadataJsonSerde.INSTANCE);
+    }
+
+    @Test
+    void testOptionalFileDigestRoundTrip() {
+        String sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        KvSnapshotFileMetadata metadata =
+                new KvSnapshotFileMetadata(
+                        new TableBucket(1, 1),
+                        2,
+                        "oss://bucket/snapshot",
+                        Collections.emptyList(),
+                        Collections.singletonList(
+                                new KvSnapshotFileMetadata.FileHandle(
+                                        "oss://bucket/snapshot/private.sst",
+                                        10,
+                                        "private.sst",
+                                        sha256)),
+                        10,
+                        20,
+                        null,
+                        null);
+
+        byte[] json = KvSnapshotFileMetadataJsonSerde.toJson(metadata);
+
+        assertThat(new String(json, StandardCharsets.UTF_8))
+                .contains("\"sha256\":\"" + sha256 + "\"");
+        assertThat(KvSnapshotFileMetadataJsonSerde.fromJson(json)).isEqualTo(metadata);
+    }
+
+    @Test
+    void testRejectMissingVersion() {
+        byte[] json = GOLDEN_JSON.replace("{\"version\":1,", "{").getBytes(StandardCharsets.UTF_8);
+
+        assertThatThrownBy(() -> KvSnapshotFileMetadataJsonSerde.fromJson(json))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("version");
+    }
+
+    @Test
+    void testRejectUnsupportedVersion() {
+        byte[] json =
+                GOLDEN_JSON
+                        .replace("\"version\":1", "\"version\":2")
+                        .getBytes(StandardCharsets.UTF_8);
+
+        assertThatThrownBy(() -> KvSnapshotFileMetadataJsonSerde.fromJson(json))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("version");
     }
 
     @Override

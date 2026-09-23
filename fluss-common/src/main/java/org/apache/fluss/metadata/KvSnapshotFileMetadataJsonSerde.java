@@ -28,6 +28,8 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.apache.fluss.utils.Preconditions.checkArgument;
+
 /** Version-1 JSON serde for standard KV snapshot file metadata. */
 @Internal
 public final class KvSnapshotFileMetadataJsonSerde
@@ -50,6 +52,7 @@ public final class KvSnapshotFileMetadataJsonSerde
     private static final String KV_FILE_HANDLE = "kv_file_handle";
     private static final String KV_FILE_PATH = "path";
     private static final String KV_FILE_SIZE = "size";
+    private static final String KV_FILE_SHA256 = "sha256";
     private static final String KV_FILE_LOCAL_PATH = "local_path";
     private static final String SNAPSHOT_INCREMENTAL_SIZE = "snapshot_incremental_size";
     private static final String LOG_OFFSET = "log_offset";
@@ -108,6 +111,12 @@ public final class KvSnapshotFileMetadataJsonSerde
 
     @Override
     public KvSnapshotFileMetadata deserialize(JsonNode node) {
+        JsonNode versionNode = node.get(VERSION_KEY);
+        checkArgument(
+                versionNode != null
+                        && versionNode.isIntegralNumber()
+                        && versionNode.asInt() == VERSION,
+                "Unsupported KV snapshot metadata version.");
         JsonNode partitionIdNode = node.get(PARTITION_ID);
         TableBucket tableBucket =
                 new TableBucket(
@@ -159,6 +168,9 @@ public final class KvSnapshotFileMetadataJsonSerde
             generator.writeObjectFieldStart(KV_FILE_HANDLE);
             generator.writeStringField(KV_FILE_PATH, fileHandle.getPath());
             generator.writeNumberField(KV_FILE_SIZE, fileHandle.getSize());
+            if (fileHandle.getSha256() != null) {
+                generator.writeStringField(KV_FILE_SHA256, fileHandle.getSha256());
+            }
             generator.writeEndObject();
             generator.writeStringField(KV_FILE_LOCAL_PATH, fileHandle.getLocalPath());
             generator.writeEndObject();
@@ -174,7 +186,10 @@ public final class KvSnapshotFileMetadataJsonSerde
                     new KvSnapshotFileMetadata.FileHandle(
                             handleNode.get(KV_FILE_PATH).asText(),
                             handleNode.get(KV_FILE_SIZE).asLong(),
-                            fileNode.get(KV_FILE_LOCAL_PATH).asText()));
+                            fileNode.get(KV_FILE_LOCAL_PATH).asText(),
+                            handleNode.has(KV_FILE_SHA256)
+                                    ? handleNode.get(KV_FILE_SHA256).asText()
+                                    : null));
         }
         return fileHandles;
     }
