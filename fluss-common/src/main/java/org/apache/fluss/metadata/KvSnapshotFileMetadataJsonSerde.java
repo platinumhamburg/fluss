@@ -115,7 +115,8 @@ public final class KvSnapshotFileMetadataJsonSerde
         checkArgument(
                 versionNode != null
                         && versionNode.isIntegralNumber()
-                        && versionNode.asInt() == VERSION,
+                        && versionNode.canConvertToInt()
+                        && versionNode.intValue() == VERSION,
                 "Unsupported KV snapshot metadata version.");
         JsonNode partitionIdNode = node.get(PARTITION_ID);
         TableBucket tableBucket =
