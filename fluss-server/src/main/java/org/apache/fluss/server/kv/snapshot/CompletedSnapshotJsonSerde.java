@@ -117,7 +117,8 @@ public class CompletedSnapshotJsonSerde
                     new KvSnapshotFileMetadata.FileHandle(
                             serverHandle.getKvFileHandle().getFilePath(),
                             serverHandle.getKvFileHandle().getSize(),
-                            serverHandle.getLocalPath()));
+                            serverHandle.getLocalPath(),
+                            serverHandle.getKvFileHandle().getSha256()));
         }
         return handles;
     }
@@ -128,7 +129,10 @@ public class CompletedSnapshotJsonSerde
         for (KvSnapshotFileMetadata.FileHandle metadataHandle : metadataHandles) {
             handles.add(
                     KvFileHandleAndLocalPath.of(
-                            new KvFileHandle(metadataHandle.getPath(), metadataHandle.getSize()),
+                            new KvFileHandle(
+                                    metadataHandle.getPath(),
+                                    metadataHandle.getSize(),
+                                    metadataHandle.getSha256()),
                             metadataHandle.getLocalPath()));
         }
         return handles;

@@ -26,6 +26,9 @@ import org.apache.fluss.server.kv.snapshot.CompletedSnapshotHandle;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotHandleStore;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotStore;
+import org.apache.fluss.server.kv.snapshot.KvFileHandle;
+import org.apache.fluss.server.kv.snapshot.KvFileHandleAndLocalPath;
+import org.apache.fluss.server.kv.snapshot.KvSnapshotHandle;
 import org.apache.fluss.server.kv.snapshot.TestingCompletedSnapshotHandle;
 import org.apache.fluss.server.kv.snapshot.ZooKeeperCompletedSnapshotHandleStore;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
@@ -53,6 +56,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -288,6 +292,64 @@ class CompletedSnapshotStoreManagerTest {
     }
 
     @Test
+    void testExternalSnapshotRequiresDigestAndSafeLocalPath() throws Exception {
+        TableBucket bucket = new TableBucket(99, 0);
+        int epoch =
+                zookeeperClient
+                        .fenceBecomeCoordinatorLeader("coordinator")
+                        .getCoordinatorEpochZkVersion();
+        FsPath location = new FsPath(tempDir.resolve("snapshot").toString());
+        CompletedSnapshotStoreManager manager = createCompletedSnapshotStoreManager(1);
+
+        CompletedSnapshot missingDigest =
+                externalSnapshotWithFile(bucket, location, "file.sst", null);
+        assertThatThrownBy(
+                        () ->
+                                manager.registerExternalSnapshot(
+                                        DATA1_TABLE_PATH,
+                                        bucket,
+                                        writeExternalSnapshot(missingDigest),
+                                        epoch))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("SHA-256");
+
+        String sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        CompletedSnapshot unsafePath =
+                externalSnapshotWithFile(
+                        bucket,
+                        new FsPath(tempDir.resolve("unsafe-snapshot").toString()),
+                        "../file.sst",
+                        sha256);
+        assertThatThrownBy(
+                        () ->
+                                manager.registerExternalSnapshot(
+                                        DATA1_TABLE_PATH,
+                                        bucket,
+                                        writeExternalSnapshot(unsafePath),
+                                        epoch))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("local path");
+
+        FsPath escapedLocation = new FsPath(tempDir.resolve("escaped-snapshot").toString());
+        CompletedSnapshot escapedRemotePath =
+                externalSnapshotWithFile(
+                        bucket,
+                        escapedLocation,
+                        new FsPath(tempDir.resolve("outside.sst").toString()).toString(),
+                        "file.sst",
+                        sha256);
+        assertThatThrownBy(
+                        () ->
+                                manager.registerExternalSnapshot(
+                                        DATA1_TABLE_PATH,
+                                        bucket,
+                                        writeExternalSnapshot(escapedRemotePath),
+                                        epoch))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("escapes");
+    }
+
+    @Test
     void testExternalSnapshotRegistrationRetryAndRecovery() throws Exception {
         TableBucket bucket = new TableBucket(99, 0);
         int epoch =
@@ -425,6 +487,32 @@ class CompletedSnapshotStoreManagerTest {
                 .registerExternalTableBucketSnapshot(any(), any(), anyInt());
         manager.registerExternalSnapshot(DATA1_TABLE_PATH, bucket, handle, epoch);
         assertThat(store.getAllSnapshots()).containsExactly(snapshot);
+    }
+
+    private static CompletedSnapshot externalSnapshotWithFile(
+            TableBucket bucket, FsPath location, String localPath, String sha256) {
+        return externalSnapshotWithFile(
+                bucket, location, new FsPath(location, "file.sst").toString(), localPath, sha256);
+    }
+
+    private static CompletedSnapshot externalSnapshotWithFile(
+            TableBucket bucket,
+            FsPath location,
+            String remotePath,
+            String localPath,
+            String sha256) {
+        KvFileHandle file = new KvFileHandle(remotePath, 1L, sha256);
+        return new CompletedSnapshot(
+                bucket,
+                0L,
+                location,
+                KvSnapshotHandle.create(
+                        Collections.emptyList(),
+                        Collections.singletonList(KvFileHandleAndLocalPath.of(file, localPath)),
+                        1L),
+                0L,
+                null,
+                null);
     }
 
     private static CompletedSnapshotHandle writeExternalSnapshot(CompletedSnapshot snapshot)
