@@ -31,6 +31,7 @@ import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.metadata.TableOrPartition;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.Gauge;
 import org.apache.fluss.metrics.MetricNames;
@@ -663,16 +664,23 @@ class RecordAccumulatorTest {
                         null,
                         Collections.emptyMap(),
                         tableIds,
-                        Collections.singletonMap(partitionPath, 41L));
+                        Collections.singletonMap(partitionPath, 41L),
+                        Collections.singletonMap(
+                                TableOrPartition.ofPartition(41L),
+                                PARTITION_TABLE_INFO.getNumBuckets()));
         accum.append(
                 WriteRecord.forIndexedAppend(PARTITION_TABLE_INFO, partitionPath, row, null),
                 writeCallback,
-                partitionKnown,
-                0,
-                false);
+                partitionKnown);
 
         Cluster partitionMissing =
-                new Cluster(nodes, null, Collections.emptyMap(), tableIds, Collections.emptyMap());
+                new Cluster(
+                        nodes,
+                        null,
+                        Collections.emptyMap(),
+                        tableIds,
+                        Collections.emptyMap(),
+                        Collections.emptyMap());
         RecordAccumulator.ReadyCheckResult result = accum.ready(partitionMissing);
 
         assertThat(result.readyNodes).isEmpty();
