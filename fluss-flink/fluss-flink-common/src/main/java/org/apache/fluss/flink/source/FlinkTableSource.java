@@ -18,6 +18,7 @@
 package org.apache.fluss.flink.source;
 
 import org.apache.fluss.client.initializer.OffsetsInitializer;
+import org.apache.fluss.client.lookup.LookupType;
 import org.apache.fluss.client.table.getter.PartitionGetter;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
@@ -650,7 +651,8 @@ public class FlinkTableSource
     @Nullable
     private InputDataPartitionerAdapter createLookupInputPartitioner(
             LookupNormalizer lookupNormalizer) {
-        if (bucketKeyIndexes.length == 0) {
+        if (lookupNormalizer.getLookupType() == LookupType.SECONDARY_INDEX_LOOKUP
+                || bucketKeyIndexes.length == 0) {
             return null;
         }
 
