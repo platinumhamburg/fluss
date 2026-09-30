@@ -20,10 +20,12 @@ package org.apache.fluss.flink.action.orphan.fs;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
+import org.apache.fluss.fs.FileSystemFailure;
+import org.apache.fluss.fs.FileSystemOperationException;
+import org.apache.fluss.fs.FileSystemPathNotFoundException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
 
-import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.Optional;
 
@@ -37,10 +39,10 @@ public final class FileSystemProbe {
             FileSystem fs, FsPath path, RateLimiter rateLimiter) throws IOException {
         try {
             return Optional.of(listOnce(fs, path, rateLimiter));
-        } catch (FileNotFoundException firstNotFound) {
+        } catch (FileSystemPathNotFoundException firstNotFound) {
             try {
                 return Optional.of(listOnce(fs, path, rateLimiter));
-            } catch (FileNotFoundException confirmedNotFound) {
+            } catch (FileSystemPathNotFoundException confirmedNotFound) {
                 return Optional.empty();
             }
         }
@@ -50,10 +52,10 @@ public final class FileSystemProbe {
             FileSystem fs, FsPath path, RateLimiter rateLimiter) throws IOException {
         try {
             return Optional.of(getFileStatusOnce(fs, path, rateLimiter));
-        } catch (FileNotFoundException firstNotFound) {
+        } catch (FileSystemPathNotFoundException firstNotFound) {
             try {
                 return Optional.of(getFileStatusOnce(fs, path, rateLimiter));
-            } catch (FileNotFoundException confirmedNotFound) {
+            } catch (FileSystemPathNotFoundException confirmedNotFound) {
                 return Optional.empty();
             }
         }
@@ -67,7 +69,14 @@ public final class FileSystemProbe {
             // Some filesystems return null for a missing path as well as a failed listing.
             // Only an explicit NOT_FOUND from stat may enter the bounded absence retry.
             getFileStatusOnce(fs, path, rateLimiter);
-            throw new IOException("Filesystem returned null while listing " + path);
+            throw new FileSystemOperationException(
+                    FileSystemFailure.Kind.UNEXPECTED,
+                    FileSystemFailure.Resource.UNKNOWN,
+                    "list_status",
+                    false,
+                    null,
+                    null,
+                    new IOException("Filesystem returned null while listing " + path));
         }
         return listing;
     }

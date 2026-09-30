@@ -19,6 +19,7 @@ package org.apache.fluss.flink.action.orphan.job;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.audit.FileSystemFailureSamples;
 import org.apache.fluss.flink.action.orphan.fs.FileSystemProbe;
 import org.apache.fluss.flink.action.orphan.fs.SafeDeleter;
 import org.apache.fluss.flink.action.orphan.rule.BucketActiveRefs;
@@ -29,6 +30,7 @@ import org.apache.fluss.flink.action.orphan.rule.MtimePolicy;
 import org.apache.fluss.flink.action.orphan.rule.RuleDispatcher;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
+import org.apache.fluss.fs.FileSystemFailure;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
 
@@ -53,6 +55,7 @@ public final class BucketCleaner {
     private final long cutoffMillis;
     private final RateLimiter remoteFsOpRateLimiter;
     private final boolean dryRun;
+    private final FileSystemFailureSamples failureSamples;
 
     public BucketCleaner(
             RuleDispatcher dispatcher,
@@ -60,7 +63,14 @@ public final class BucketCleaner {
             AuditLogger audit,
             long cutoffMillis,
             RateLimiter remoteFsOpRateLimiter) {
-        this(dispatcher, safeDeleter, audit, cutoffMillis, remoteFsOpRateLimiter, false);
+        this(
+                dispatcher,
+                safeDeleter,
+                audit,
+                cutoffMillis,
+                remoteFsOpRateLimiter,
+                false,
+                new FileSystemFailureSamples());
     }
 
     public BucketCleaner(
@@ -70,12 +80,31 @@ public final class BucketCleaner {
             long cutoffMillis,
             RateLimiter remoteFsOpRateLimiter,
             boolean dryRun) {
+        this(
+                dispatcher,
+                safeDeleter,
+                audit,
+                cutoffMillis,
+                remoteFsOpRateLimiter,
+                dryRun,
+                new FileSystemFailureSamples());
+    }
+
+    public BucketCleaner(
+            RuleDispatcher dispatcher,
+            SafeDeleter safeDeleter,
+            AuditLogger audit,
+            long cutoffMillis,
+            RateLimiter remoteFsOpRateLimiter,
+            boolean dryRun,
+            FileSystemFailureSamples failureSamples) {
         this.dispatcher = dispatcher;
         this.safeDeleter = safeDeleter;
         this.audit = audit;
         this.cutoffMillis = cutoffMillis;
         this.remoteFsOpRateLimiter = remoteFsOpRateLimiter;
         this.dryRun = dryRun;
+        this.failureSamples = failureSamples;
     }
 
     /** Cleans one bucket's log/kv subtrees using the caller-supplied active reference set. */
@@ -113,8 +142,23 @@ public final class BucketCleaner {
                 }
                 continue;
             }
-            Optional<FileStatus[]> listing =
-                    FileSystemProbe.listStatus(fs, visit.dir, remoteFsOpRateLimiter);
+            Optional<FileStatus[]> listing;
+            try {
+                listing = FileSystemProbe.listStatus(fs, visit.dir, remoteFsOpRateLimiter);
+            } catch (IOException failure) {
+                FileSystemFailure.Kind kind =
+                        failure instanceof FileSystemFailure
+                                ? ((FileSystemFailure) failure).kind()
+                                : FileSystemFailure.Kind.UNEXPECTED;
+                FileSystemFailure.Resource resource =
+                        failure instanceof FileSystemFailure
+                                ? ((FileSystemFailure) failure).resource()
+                                : FileSystemFailure.Resource.UNKNOWN;
+                stats.rules.recordListFailure(kind, resource);
+                failureSamples.record("list_status", visit.dir, failure);
+                visit.markParentRemaining();
+                continue;
+            }
             if (!listing.isPresent()) {
                 stats.rules.recordMissingDirectory();
                 visit.markParentRemaining();

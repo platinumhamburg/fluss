@@ -35,6 +35,7 @@ import org.apache.fluss.flink.action.orphan.build.KvSharedSstFetchResult;
 import org.apache.fluss.flink.action.orphan.build.LogActiveRefsFetchResult;
 import org.apache.fluss.flink.action.orphan.build.MaxKnownIdsTracker;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
+import org.apache.fluss.flink.action.orphan.fs.FileSystemProbe;
 import org.apache.fluss.flink.action.orphan.rule.OrphanDirDetector;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
@@ -62,6 +63,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
@@ -762,15 +764,11 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
         for (String root : clusterRoots) {
             for (String topLevel : TOP_LEVEL_DIRS) {
                 FsPath topLevelDir = remoteSubDir(root, topLevel);
-                FileSystem fs = getFileSystemIfExists(topLevelDir, remoteFsOpRateLimiter);
-                if (fs == null) {
+                Optional<FileStatus[]> entries = listStatuses(topLevelDir, remoteFsOpRateLimiter);
+                if (!entries.isPresent()) {
                     continue;
                 }
-                FileStatus[] entries = listStatuses(fs, topLevelDir, remoteFsOpRateLimiter);
-                if (entries == null) {
-                    continue;
-                }
-                for (FileStatus entry : entries) {
+                for (FileStatus entry : entries.get()) {
                     if (!entry.isDir()) {
                         continue;
                     }
@@ -802,16 +800,12 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             RateLimiter remoteFsOpRateLimiter,
             Collector<CleanTask> out)
             throws IOException {
-        FileSystem fs = getFileSystemIfExists(dbDir, remoteFsOpRateLimiter);
-        if (fs == null) {
-            return;
-        }
-        FileStatus[] entries = listStatuses(fs, dbDir, remoteFsOpRateLimiter);
-        if (entries == null) {
+        Optional<FileStatus[]> entries = listStatuses(dbDir, remoteFsOpRateLimiter);
+        if (!entries.isPresent()) {
             return;
         }
         long maxKnownTableId = tracker.maxKnownTableId();
-        for (FileStatus entry : entries) {
+        for (FileStatus entry : entries.get()) {
             if (!entry.isDir()) {
                 continue;
             }
@@ -870,15 +864,11 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
             RateLimiter remoteFsOpRateLimiter,
             Consumer<FsPath> action)
             throws IOException {
-        FileSystem fs = getFileSystemIfExists(parentDir, remoteFsOpRateLimiter);
-        if (fs == null) {
+        Optional<FileStatus[]> entries = listStatuses(parentDir, remoteFsOpRateLimiter);
+        if (!entries.isPresent()) {
             return;
         }
-        FileStatus[] entries = listStatuses(fs, parentDir, remoteFsOpRateLimiter);
-        if (entries == null) {
-            return;
-        }
-        for (FileStatus entry : entries) {
+        for (FileStatus entry : entries.get()) {
             if (!entry.isDir()) {
                 continue;
             }
@@ -948,22 +938,9 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
         }
     }
 
-    @Nullable
-    private static FileSystem getFileSystemIfExists(FsPath dir, RateLimiter remoteFsOpRateLimiter)
-            throws IOException {
-        FileSystem fs = dir.getFileSystem();
-        remoteFsOpRateLimiter.acquire();
-        return fs.exists(dir) ? fs : null;
-    }
-
-    private static FileStatus[] listStatuses(
-            FileSystem fs, FsPath dir, RateLimiter remoteFsOpRateLimiter) throws IOException {
-        remoteFsOpRateLimiter.acquire();
-        FileStatus[] statuses = fs.listStatus(dir);
-        if (statuses == null) {
-            throw new IOException("Directory listing returned no result");
-        }
-        return statuses;
+    private static Optional<FileStatus[]> listStatuses(
+            FsPath dir, RateLimiter remoteFsOpRateLimiter) throws IOException {
+        return FileSystemProbe.listStatus(dir.getFileSystem(), dir, remoteFsOpRateLimiter);
     }
 
     // -------------------------------------------------------------------------

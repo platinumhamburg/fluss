@@ -22,10 +22,13 @@ import org.apache.fluss.flink.action.orphan.job.CleanupCounters;
 import org.apache.fluss.flink.action.orphan.job.RuleSummary;
 import org.apache.fluss.flink.action.orphan.job.ScopeCoverageStats;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
+import org.apache.fluss.fs.FileSystemFailure;
+import org.apache.fluss.fs.FsPath;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.io.Serializable;
 import java.util.Map;
 import java.util.UUID;
@@ -64,6 +67,42 @@ public final class ResultAuditLogger implements Serializable {
                 clusterId == null ? "" : " cluster_id=" + clusterId,
                 action,
                 fields);
+    }
+
+    /** Emits a bounded native exception sample for filesystem diagnosis. */
+    public void filesystemFailureSample(
+            int subtask,
+            int attempt,
+            String position,
+            String operation,
+            FsPath path,
+            IOException failure) {
+        FileSystemFailure normalized =
+                failure instanceof FileSystemFailure ? (FileSystemFailure) failure : null;
+        LOG.error(
+                "audit_version=1 run_id={}{} action=filesystem_failure_sample subtask={}"
+                        + " attempt={} position={} operation={} path={} kind={} resource={}"
+                        + " service_code={} request_id={} temporary={}",
+                runId,
+                clusterId == null ? "" : " cluster_id=" + clusterId,
+                subtask,
+                attempt,
+                position,
+                operation,
+                path,
+                normalized == null ? FileSystemFailure.Kind.UNEXPECTED : normalized.kind(),
+                normalized == null ? FileSystemFailure.Resource.UNKNOWN : normalized.resource(),
+                normalized == null ? null : normalized.serviceCode(),
+                normalized == null ? null : normalized.requestId(),
+                normalized != null && normalized.isTemporary(),
+                failure);
+    }
+
+    /** Reports when distinct failure groups exceed the per-subtask sample limit. */
+    public void filesystemFailureSamplesTruncated(int subtask, int attempt, long count) {
+        emit(
+                "filesystem_failure_samples_truncated",
+                "subtask=" + subtask + " attempt=" + attempt + " unsampled_failures=" + count);
     }
 
     public void scopePlan(ScopeCoverageStats scope) {
@@ -138,7 +177,7 @@ public final class ResultAuditLogger implements Serializable {
                                 && counters.deleteFailures() == 0);
         boolean complete =
                 scope.coverageComplete()
-                        && rules.missingDirectories() == 0
+                        && rules.filesystemFailures() == 0
                         && rules.total(RuleSummary.UNAVAILABLE_MTIME) == 0
                         && rules.unavailableDirectories() == 0;
         // These fields count targets blocked by missing active references. Confirmed empty
@@ -149,6 +188,10 @@ public final class ResultAuditLogger implements Serializable {
                         + " metadata_read_failed_targets="
                         + (scope.logReadFailedBuckets() + scope.snapshotReadFailures())
                         + " directory_list_failed_targets="
+                        + rules.listFailures()
+                        + " file_status_failed_targets="
+                        + rules.statFailures()
+                        + " directory_not_found_targets="
                         + rules.missingDirectories()
                         + " rpc_failed_targets="
                         + scope.rpcFailures()
@@ -160,6 +203,32 @@ public final class ResultAuditLogger implements Serializable {
                         + complete
                         + " dry_run="
                         + dryRun);
+        for (FileSystemFailure.Kind kind : FileSystemFailure.Kind.values()) {
+            for (FileSystemFailure.Resource resource : FileSystemFailure.Resource.values()) {
+                long listFailures = rules.listFailures(kind, resource);
+                long statFailures = rules.statFailures(kind, resource);
+                if (listFailures > 0) {
+                    emit(
+                            "filesystem_failure_count",
+                            "operation=list_status kind="
+                                    + kind.name().toLowerCase()
+                                    + " resource="
+                                    + resource.name().toLowerCase()
+                                    + " count="
+                                    + listFailures);
+                }
+                if (statFailures > 0) {
+                    emit(
+                            "filesystem_failure_count",
+                            "operation=get_file_status kind="
+                                    + kind.name().toLowerCase()
+                                    + " resource="
+                                    + resource.name().toLowerCase()
+                                    + " count="
+                                    + statFailures);
+                }
+            }
+        }
         emit(
                 "audit_integrity",
                 "scope_counters_consistent="

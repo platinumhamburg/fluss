@@ -20,6 +20,7 @@ package org.apache.fluss.flink.action.orphan.job;
 import org.apache.fluss.flink.action.orphan.audit.ResultAuditLogger;
 import org.apache.fluss.flink.action.orphan.rule.Decision;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
+import org.apache.fluss.fs.FileSystemFailure;
 
 import org.junit.jupiter.api.Test;
 
@@ -29,6 +30,34 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class RuleSummaryTest {
+    @Test
+    void aggregatesFilesystemFailureKindsSeparatelyFromConfirmedMissingDirectories() {
+        RuleSummary first = new RuleSummary();
+        first.recordMissingDirectory();
+        first.recordListFailure(
+                FileSystemFailure.Kind.PERMISSION_DENIED, FileSystemFailure.Resource.UNKNOWN);
+        RuleSummary second = new RuleSummary();
+        second.recordListFailure(
+                FileSystemFailure.Kind.PERMISSION_DENIED, FileSystemFailure.Resource.UNKNOWN);
+        second.recordStatFailure(FileSystemFailure.Kind.NOT_FOUND, FileSystemFailure.Resource.ROOT);
+
+        first.add(second);
+
+        assertThat(first.missingDirectories()).isEqualTo(1);
+        assertThat(
+                        first.listFailures(
+                                FileSystemFailure.Kind.PERMISSION_DENIED,
+                                FileSystemFailure.Resource.UNKNOWN))
+                .isEqualTo(2);
+        assertThat(
+                        first.statFailures(
+                                FileSystemFailure.Kind.NOT_FOUND, FileSystemFailure.Resource.ROOT))
+                .isEqualTo(1);
+        assertThat(first.listFailures()).isEqualTo(2);
+        assertThat(first.statFailures()).isEqualTo(1);
+        assertThat(first.filesystemFailures()).isEqualTo(3);
+    }
+
     @Test
     void retainsEveryDecisionWhenTasksAreCombined() {
         RuleSummary sum = new RuleSummary();

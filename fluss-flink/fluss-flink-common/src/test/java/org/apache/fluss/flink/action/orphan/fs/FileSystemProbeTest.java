@@ -19,6 +19,7 @@ package org.apache.fluss.flink.action.orphan.fs;
 
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
+import org.apache.fluss.fs.FileSystemPathNotFoundException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
 
@@ -38,11 +39,16 @@ class FileSystemProbeTest {
 
     private static final FsPath DIR = new FsPath("file:/bucket/snap-1");
 
+    private static FileSystemPathNotFoundException pathNotFound() {
+        return new FileSystemPathNotFoundException(
+                "list_status", null, null, new FileNotFoundException("gone"));
+    }
+
     @Test
     void confirmsAbsentPathsWhenListingReturnsNull() throws IOException {
         FileSystem fs = mock(FileSystem.class);
         when(fs.listStatus(DIR)).thenReturn((FileStatus[]) null);
-        when(fs.getFileStatus(DIR)).thenThrow(new FileNotFoundException("gone"));
+        when(fs.getFileStatus(DIR)).thenThrow(pathNotFound());
         assertThat(FileSystemProbe.listStatus(fs, DIR, RateLimiter.create(1000.0))).isEmpty();
         verify(fs, times(2)).listStatus(DIR);
         verify(fs, times(2)).getFileStatus(DIR);
@@ -55,7 +61,7 @@ class FileSystemProbeTest {
         when(fs.getFileStatus(DIR)).thenReturn(mock(FileStatus.class));
         assertThatThrownBy(() -> FileSystemProbe.listStatus(fs, DIR, RateLimiter.create(1000.0)))
                 .isInstanceOf(IOException.class)
-                .hasMessageContaining("returned null");
+                .hasCauseInstanceOf(IOException.class);
         verify(fs).listStatus(DIR);
     }
 
@@ -63,7 +69,7 @@ class FileSystemProbeTest {
     void retriesAListingThatRacesWithDirectoryRemoval() throws IOException {
         FileSystem fs = mock(FileSystem.class);
         FileStatus[] listing = new FileStatus[0];
-        when(fs.listStatus(DIR)).thenThrow(new FileNotFoundException("raced")).thenReturn(listing);
+        when(fs.listStatus(DIR)).thenThrow(pathNotFound()).thenReturn(listing);
 
         assertThat(FileSystemProbe.listStatus(fs, DIR, RateLimiter.create(1000.0)))
                 .contains(listing);
@@ -73,7 +79,7 @@ class FileSystemProbeTest {
     @Test
     void treatsRepeatedNotFoundAsAnAbsentDirectory() throws IOException {
         FileSystem fs = mock(FileSystem.class);
-        when(fs.listStatus(DIR)).thenThrow(new FileNotFoundException("already gone"));
+        when(fs.listStatus(DIR)).thenThrow(pathNotFound());
 
         assertThat(FileSystemProbe.listStatus(fs, DIR, RateLimiter.create(1000.0))).isEmpty();
         verify(fs, times(2)).listStatus(DIR);
@@ -87,6 +93,16 @@ class FileSystemProbeTest {
         assertThatThrownBy(() -> FileSystemProbe.listStatus(fs, DIR, RateLimiter.create(1000.0)))
                 .isInstanceOf(IOException.class)
                 .hasMessage("storage unavailable");
+        verify(fs).listStatus(DIR);
+    }
+
+    @Test
+    void doesNotAssumeAnUnclassifiedNotFoundMeansTheTargetPathDisappeared() throws IOException {
+        FileSystem fs = mock(FileSystem.class);
+        when(fs.listStatus(DIR)).thenThrow(new FileNotFoundException("missing bucket"));
+
+        assertThatThrownBy(() -> FileSystemProbe.listStatus(fs, DIR, RateLimiter.create(1000.0)))
+                .isInstanceOf(FileNotFoundException.class);
         verify(fs).listStatus(DIR);
     }
 }

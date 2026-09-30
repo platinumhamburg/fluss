@@ -20,6 +20,7 @@ package org.apache.fluss.flink.action.orphan.job;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.flink.action.orphan.rule.Decision;
 import org.apache.fluss.flink.action.orphan.rule.RuleId;
+import org.apache.fluss.fs.FileSystemFailure;
 
 import java.io.Serializable;
 
@@ -38,6 +39,12 @@ public final class RuleSummary implements Serializable {
     private final long[][] rules = new long[RuleId.values().length][7];
     private long unavailableDirectories;
     private long missingDirectories;
+    private final long[][] listFailures =
+            new long[FileSystemFailure.Kind.values().length]
+                    [FileSystemFailure.Resource.values().length];
+    private final long[][] statFailures =
+            new long[FileSystemFailure.Kind.values().length]
+                    [FileSystemFailure.Resource.values().length];
 
     public void record(RuleId rule, Decision decision, long bytes) {
         long[] row = rules[rule.ordinal()];
@@ -74,6 +81,16 @@ public final class RuleSummary implements Serializable {
         missingDirectories++;
     }
 
+    public void recordListFailure(
+            FileSystemFailure.Kind kind, FileSystemFailure.Resource resource) {
+        listFailures[kind.ordinal()][resource.ordinal()]++;
+    }
+
+    public void recordStatFailure(
+            FileSystemFailure.Kind kind, FileSystemFailure.Resource resource) {
+        statFailures[kind.ordinal()][resource.ordinal()]++;
+    }
+
     public void add(RuleSummary other) {
         for (int i = 0; i < rules.length; i++) {
             for (int j = 0; j < rules[i].length; j++) {
@@ -82,6 +99,14 @@ public final class RuleSummary implements Serializable {
         }
         unavailableDirectories += other.unavailableDirectories;
         missingDirectories += other.missingDirectories;
+        for (FileSystemFailure.Kind kind : FileSystemFailure.Kind.values()) {
+            for (FileSystemFailure.Resource resource : FileSystemFailure.Resource.values()) {
+                listFailures[kind.ordinal()][resource.ordinal()] +=
+                        other.listFailures[kind.ordinal()][resource.ordinal()];
+                statFailures[kind.ordinal()][resource.ordinal()] +=
+                        other.statFailures[kind.ordinal()][resource.ordinal()];
+            }
+        }
     }
 
     public long value(RuleId rule, int column) {
@@ -102,6 +127,38 @@ public final class RuleSummary implements Serializable {
 
     public long missingDirectories() {
         return missingDirectories;
+    }
+
+    public long listFailures(FileSystemFailure.Kind kind, FileSystemFailure.Resource resource) {
+        return listFailures[kind.ordinal()][resource.ordinal()];
+    }
+
+    public long statFailures(FileSystemFailure.Kind kind, FileSystemFailure.Resource resource) {
+        return statFailures[kind.ordinal()][resource.ordinal()];
+    }
+
+    public long filesystemFailures() {
+        return listFailures() + statFailures();
+    }
+
+    public long listFailures() {
+        long total = 0;
+        for (FileSystemFailure.Kind kind : FileSystemFailure.Kind.values()) {
+            for (FileSystemFailure.Resource resource : FileSystemFailure.Resource.values()) {
+                total += listFailures(kind, resource);
+            }
+        }
+        return total;
+    }
+
+    public long statFailures() {
+        long total = 0;
+        for (FileSystemFailure.Kind kind : FileSystemFailure.Kind.values()) {
+            for (FileSystemFailure.Resource resource : FileSystemFailure.Resource.values()) {
+                total += statFailures(kind, resource);
+            }
+        }
+        return total;
     }
 
     public boolean consistent(CleanupCounters counters) {

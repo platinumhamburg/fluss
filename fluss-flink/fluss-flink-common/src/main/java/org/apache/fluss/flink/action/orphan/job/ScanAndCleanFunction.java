@@ -20,6 +20,7 @@ package org.apache.fluss.flink.action.orphan.job;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.action.orphan.audit.AuditLogger;
+import org.apache.fluss.flink.action.orphan.audit.FileSystemFailureSamples;
 import org.apache.fluss.flink.action.orphan.audit.ResultAuditLogger;
 import org.apache.fluss.flink.action.orphan.fs.FileSystemProbe;
 import org.apache.fluss.flink.action.orphan.fs.SafeDeleter;
@@ -32,6 +33,7 @@ import org.apache.fluss.flink.action.orphan.rule.RuleDispatcher;
 import org.apache.fluss.flink.adapter.RuntimeContextAdapter;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
+import org.apache.fluss.fs.FileSystemFailure;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.shaded.guava32.com.google.common.util.concurrent.RateLimiter;
 
@@ -77,6 +79,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     private transient long tasksCompleted;
     private transient AuditLogger audit;
     private transient RateLimiter remoteFsOpRateLimiter;
+    private transient FileSystemFailureSamples failureSamples;
 
     public ScanAndCleanFunction(
             long remoteFsOpRateLimitPerSecond, Map<String, String> extraConfigs) {
@@ -108,6 +111,7 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         audit = new AuditLogger();
         subtaskCounters = CleanupCounters.empty();
         subtaskRules = new RuleSummary();
+        failureSamples = new FileSystemFailureSamples();
         tasksCompleted = 0;
         int parallelism = getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks();
         int subtaskIndex = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
@@ -142,6 +146,11 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
     @Override
     public void close() throws Exception {
         if (subtaskCounters != null) {
+            failureSamples.emit(
+                    resultAudit,
+                    RuntimeContextAdapter.getIndexOfThisSubtask(
+                            (StreamingRuntimeContext) getRuntimeContext()),
+                    RuntimeContextAdapter.getAttemptNumber(getRuntimeContext()));
             resultAudit.subtask(
                     RuntimeContextAdapter.getIndexOfThisSubtask(
                             (StreamingRuntimeContext) getRuntimeContext()),
@@ -183,7 +192,8 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                         audit,
                         task.cutoffMillis(),
                         remoteFsOpRateLimiter,
-                        task.dryRun());
+                        task.dryRun(),
+                        failureSamples);
 
         BucketCleaner.BucketCleanStats bucketStats = cleaner.clean(activeRefs, logDir, kvDir);
 
@@ -223,8 +233,15 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
         long deleteFailures = 0L;
         long bytesReclaimed = 0L;
 
-        Optional<FileStatus> rootStatusResult =
-                FileSystemProbe.getFileStatus(fs, dirPath, remoteFsOpRateLimiter);
+        Optional<FileStatus> rootStatusResult;
+        try {
+            rootStatusResult = FileSystemProbe.getFileStatus(fs, dirPath, remoteFsOpRateLimiter);
+        } catch (IOException failure) {
+            CleanStats failed = CleanStats.empty();
+            failed.rules().recordStatFailure(failureKind(failure), failureResource(failure));
+            failureSamples.record("get_file_status", dirPath, failure);
+            return failed;
+        }
         if (!rootStatusResult.isPresent()) {
             CleanStats missing = CleanStats.empty();
             missing.rules().recordMissingDirectory();
@@ -261,8 +278,15 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
                 }
                 continue;
             }
-            Optional<FileStatus[]> listing =
-                    FileSystemProbe.listStatus(fs, visit.dir, remoteFsOpRateLimiter);
+            Optional<FileStatus[]> listing;
+            try {
+                listing = FileSystemProbe.listStatus(fs, visit.dir, remoteFsOpRateLimiter);
+            } catch (IOException failure) {
+                rules.recordListFailure(failureKind(failure), failureResource(failure));
+                failureSamples.record("list_status", visit.dir, failure);
+                visit.markParentRemaining();
+                continue;
+            }
             if (!listing.isPresent()) {
                 rules.recordMissingDirectory();
                 visit.markParentRemaining();
@@ -341,6 +365,18 @@ public final class ScanAndCleanFunction extends ProcessFunction<CleanTask, Clean
 
     private SafeDeleter createSafeDeleter(FileSystem fs, boolean dryRun) {
         return new SafeDeleter(fs, dryRun, audit, remoteFsOpRateLimiter);
+    }
+
+    private static FileSystemFailure.Kind failureKind(IOException failure) {
+        return failure instanceof FileSystemFailure
+                ? ((FileSystemFailure) failure).kind()
+                : FileSystemFailure.Kind.UNEXPECTED;
+    }
+
+    private static FileSystemFailure.Resource failureResource(IOException failure) {
+        return failure instanceof FileSystemFailure
+                ? ((FileSystemFailure) failure).resource()
+                : FileSystemFailure.Resource.UNKNOWN;
     }
 
     private static double perSubtaskRate(long totalRate, int parallelism, int subtaskIndex) {
