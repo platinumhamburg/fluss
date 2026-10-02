@@ -37,6 +37,7 @@ import org.apache.fluss.flink.action.orphan.build.MaxKnownIdsTracker;
 import org.apache.fluss.flink.action.orphan.config.OrphanCleanConfig;
 import org.apache.fluss.flink.action.orphan.fs.FileSystemProbe;
 import org.apache.fluss.flink.action.orphan.rule.OrphanDirDetector;
+import org.apache.fluss.flink.adapter.RuntimeContextAdapter;
 import org.apache.fluss.fs.FileStatus;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.fs.FsPath;
@@ -49,6 +50,7 @@ import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FlussPaths;
 
 import org.apache.flink.streaming.api.functions.ProcessFunction;
+import org.apache.flink.streaming.api.operators.StreamingRuntimeContext;
 import org.apache.flink.util.Collector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -938,9 +940,22 @@ public final class ScopeEnumeratorFunction extends ProcessFunction<Integer, Clea
         }
     }
 
-    private static Optional<FileStatus[]> listStatuses(
-            FsPath dir, RateLimiter remoteFsOpRateLimiter) throws IOException {
-        return FileSystemProbe.listStatus(dir.getFileSystem(), dir, remoteFsOpRateLimiter);
+    private Optional<FileStatus[]> listStatuses(FsPath dir, RateLimiter remoteFsOpRateLimiter)
+            throws IOException {
+        try {
+            return FileSystemProbe.listStatus(dir.getFileSystem(), dir, remoteFsOpRateLimiter);
+        } catch (IOException failure) {
+            config.resultAudit()
+                    .filesystemFailureSample(
+                            RuntimeContextAdapter.getIndexOfThisSubtask(
+                                    (StreamingRuntimeContext) getRuntimeContext()),
+                            RuntimeContextAdapter.getAttemptNumber(getRuntimeContext()),
+                            "first",
+                            "list_status",
+                            dir,
+                            failure);
+            throw failure;
+        }
     }
 
     // -------------------------------------------------------------------------
