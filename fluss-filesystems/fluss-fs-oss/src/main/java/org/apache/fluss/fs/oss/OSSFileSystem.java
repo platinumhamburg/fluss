@@ -29,6 +29,7 @@ import com.aliyun.oss.OSSException;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.SocketTimeoutException;
 
@@ -68,6 +69,18 @@ class OSSFileSystem extends HadoopFileSystem {
                         findCause(failure, SocketTimeoutException.class) != null,
                         clientFailure.getErrorCode(),
                         clientFailure.getRequestId(),
+                        failure);
+            }
+            // AliyunOSSFileSystem can discard a metadata request failure and synthesize a
+            // FileNotFoundException after an empty listing, even when metadata access was denied.
+            if (failure instanceof FileNotFoundException) {
+                return new FileSystemOperationException(
+                        FileSystemFailure.Kind.UNEXPECTED,
+                        FileSystemFailure.Resource.UNKNOWN,
+                        operation.code(),
+                        false,
+                        null,
+                        null,
                         failure);
             }
             return super.normalize(failure, operation);
