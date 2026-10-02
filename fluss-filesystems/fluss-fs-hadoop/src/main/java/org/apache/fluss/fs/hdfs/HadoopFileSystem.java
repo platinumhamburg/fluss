@@ -175,20 +175,18 @@ public abstract class HadoopFileSystem extends FileSystem {
                                 .unwrapRemoteException(
                                         AccessControlException.class, FileNotFoundException.class)
                         : ioFailure;
-        boolean hdfs = fs.getUri() != null && "hdfs".equalsIgnoreCase(fs.getUri().getScheme());
         if (classified instanceof FileNotFoundException
                 && (operation == Operation.GET_FILE_STATUS
                         || operation == Operation.LIST_STATUS
                         || operation == Operation.OPEN
-                        || operation == Operation.EXISTS)
-                && hdfs) {
+                        || operation == Operation.EXISTS)) {
             return new FileSystemPathNotFoundException(operation.code(), null, null, ioFailure);
         }
         FileSystemFailure.Kind kind =
                 classified instanceof AccessDeniedException
                                 || classified instanceof AccessControlException
                         ? FileSystemFailure.Kind.PERMISSION_DENIED
-                        : classified instanceof FileNotFoundException && hdfs
+                        : classified instanceof FileNotFoundException
                                 ? FileSystemFailure.Kind.NOT_FOUND
                                 : FileSystemFailure.Kind.UNEXPECTED;
         return new FileSystemOperationException(

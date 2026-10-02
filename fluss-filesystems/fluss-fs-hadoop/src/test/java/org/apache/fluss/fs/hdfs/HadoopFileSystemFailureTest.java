@@ -20,11 +20,15 @@ package org.apache.fluss.fs.hdfs;
 import org.apache.fluss.fs.FileSystemFailure;
 import org.apache.fluss.fs.FileSystemOperationException;
 import org.apache.fluss.fs.FileSystemPathNotFoundException;
+import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.fs.token.ObtainedSecurityToken;
 
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.RawLocalFileSystem;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.hadoop.security.AccessControlException;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -33,6 +37,7 @@ import java.net.URI;
 import java.nio.file.AccessDeniedException;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -55,14 +60,38 @@ class HadoopFileSystemFailureTest {
     }
 
     @Test
-    void otherHadoopSchemesDoNotInferMissingPathFromExceptionClass() {
-        org.apache.hadoop.fs.FileSystem hadoop = mock(org.apache.hadoop.fs.FileSystem.class);
-        when(hadoop.getUri()).thenReturn(URI.create("oss://store/"));
-        FileNotFoundException failure = new FileNotFoundException("missing path or marker");
+    void localHadoopMissingPathPreservesTheOperationContract(@TempDir java.nio.file.Path root)
+            throws IOException {
+        try (RawLocalFileSystem hadoop = new RawLocalFileSystem()) {
+            hadoop.initialize(URI.create("file:///"), new Configuration());
+            HadoopFileSystem fs = filesystem(hadoop);
+            FsPath missing = new FsPath(root.resolve("missing").toUri());
+            assertThatThrownBy(() -> fs.listStatus(missing))
+                    .isInstanceOf(FileSystemPathNotFoundException.class);
+            assertThatThrownBy(() -> fs.getFileStatus(missing))
+                    .isInstanceOf(FileSystemPathNotFoundException.class);
+            assertThatThrownBy(() -> fs.open(missing))
+                    .isInstanceOf(FileSystemPathNotFoundException.class);
+            assertThat(fs.exists(missing)).isFalse();
+        }
+    }
 
+    @Test
+    void remoteMissingPathRetainsItsContractAndOriginalCause() {
+        org.apache.hadoop.fs.FileSystem hadoop = mock(org.apache.hadoop.fs.FileSystem.class);
+        IOException failure =
+                new RemoteException(FileNotFoundException.class.getName(), "missing path");
+        assertThat(filesystem(hadoop).normalize(failure, HadoopFileSystem.Operation.LIST_STATUS))
+                .isInstanceOf(FileSystemPathNotFoundException.class)
+                .hasCause(failure);
+    }
+
+    @Test
+    void arbitraryIoCauseDoesNotEstablishTargetAbsence() {
+        org.apache.hadoop.fs.FileSystem hadoop = mock(org.apache.hadoop.fs.FileSystem.class);
+        IOException failure = new IOException("metadata read failed", new FileNotFoundException());
         IOException normalized =
                 filesystem(hadoop).normalize(failure, HadoopFileSystem.Operation.LIST_STATUS);
-
         assertThat(normalized).isInstanceOf(FileSystemOperationException.class).hasCause(failure);
         assertThat(((FileSystemFailure) normalized).resource())
                 .isEqualTo(FileSystemFailure.Resource.UNKNOWN);
