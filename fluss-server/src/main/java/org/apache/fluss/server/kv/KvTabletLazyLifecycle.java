@@ -69,6 +69,8 @@ public final class KvTabletLazyLifecycle {
         RELEASING,
         /** Lazy mode: last open attempt failed, in backoff cooldown. */
         FAILED,
+        /** Closing: new requests are fenced while outstanding work drains. */
+        CLOSING,
         /**
          * Terminal state: tablet is closed and will not be reopened. Local data may or may not have
          * been deleted depending on whether close or drop was called.
@@ -174,8 +176,17 @@ public final class KvTabletLazyLifecycle {
     private @Nullable DropCallback dropCallback;
     private @Nullable ReleaseCallback releaseCallback;
 
-    /** Tracks post-open finalization that runs after OPEN becomes externally visible. */
-    private boolean commitCallbackInFlight;
+    /**
+     * Includes open callbacks, candidate cleanup and idle release cleanup. Guarded by the state
+     * lock.
+     */
+    private boolean operationInFlight;
+
+    /** Retains ownership if cleaning up an uncommitted open fails. */
+    private @Nullable KvTablet failedOpenTablet;
+
+    /** Guarded by the termination monitor; prevents repeated drops from deleting a reused path. */
+    private boolean localDirectoryDeleted;
 
     KvTabletLazyLifecycle(KvTablet tablet) {
         this.tablet = tablet;
@@ -371,6 +382,7 @@ public final class KvTabletLazyLifecycle {
         // Fast path: try to pin without blocking
         KvTablet.Guard fast = tryAcquirePinAsGuard();
         if (fast != null) {
+            touchAccessTimestamp();
             return fast;
         }
 
@@ -386,7 +398,7 @@ public final class KvTabletLazyLifecycle {
                     touchAccessTimestamp();
                     return new KvTablet.Guard(tablet);
                 }
-                if (lazyState == LazyState.CLOSED) {
+                if (lazyState == LazyState.CLOSED || lazyState == LazyState.CLOSING) {
                     throw new KvStorageException(
                             "KvTablet is closed for " + tablet.getTableBucket());
                 }
@@ -427,7 +439,6 @@ public final class KvTabletLazyLifecycle {
         if (lazyState == LazyState.OPEN && !rejectNewPins) {
             activePins.incrementAndGet();
             if (lazyState == LazyState.OPEN && !rejectNewPins) {
-                touchAccessTimestamp();
                 return new KvTablet.Guard(tablet);
             }
             decrementAndMaybeSignal();
@@ -543,8 +554,8 @@ public final class KvTabletLazyLifecycle {
                         // Fall through to LAZY — cooldown expired, retry open.
 
                     case LAZY:
-                        updateStateGauges(lazyState, LazyState.OPENING);
-                        lazyState = LazyState.OPENING;
+                        transitionTo(LazyState.OPENING);
+                        operationInFlight = true;
                         openGeneration++;
                         long myGeneration = openGeneration;
                         int myLeaderEpoch =
@@ -556,8 +567,7 @@ public final class KvTabletLazyLifecycle {
                         try {
                             doSlowOpen(myGeneration, myLeaderEpoch, myBucketEpoch, localDataExists);
                         } catch (Throwable t) {
-                            // doSlowOpen already called commitOpenResult() which transitions
-                            // to FAILED, so no need to handle state transition here.
+                            // doSlowOpen completes candidate cleanup before publishing failure.
                             if (t instanceof RuntimeException) {
                                 throw (RuntimeException) t;
                             }
@@ -566,6 +576,7 @@ public final class KvTabletLazyLifecycle {
                         }
                         return;
 
+                    case CLOSING:
                     case CLOSED:
                         throw new KvStorageException(
                                 "KvTablet is closed for " + tablet.getTableBucket());
@@ -588,10 +599,11 @@ public final class KvTabletLazyLifecycle {
     private void doSlowOpen(
             long myGeneration, int myLeaderEpoch, int myBucketEpoch, boolean localDataExists)
             throws Exception {
-        KvTablet newTablet = null;
+        KvTablet candidate = null;
         boolean committed = false;
         boolean semaphoreAcquired = false;
-
+        Throwable failure = null;
+        boolean cleanupFailed = false;
         try {
             if (openSemaphore != null) {
                 semaphoreAcquired = openSemaphore.tryAcquire(openTimeoutMs, TimeUnit.MILLISECONDS);
@@ -600,114 +612,86 @@ public final class KvTabletLazyLifecycle {
                             "KvTablet open semaphore timeout for " + tablet.getTableBucket());
                 }
             }
-
-            newTablet = openCallback.doOpen(localDataExists);
-            committed =
-                    commitOpenResult(myGeneration, myLeaderEpoch, myBucketEpoch, newTablet, null);
-            if (!committed) {
-                throw new CancellationException(
-                        "open result fenced by concurrent epoch/generation change");
-            }
-        } catch (Exception e) {
-            commitOpenResult(myGeneration, myLeaderEpoch, myBucketEpoch, null, e);
-            throw e;
-        } finally {
-            if (!committed && newTablet != null) {
-                try {
-                    newTablet.close();
-                } catch (Exception ignored) {
-                }
-                // Clean up the directory created by the failed open attempt BEFORE
-                // releasing the semaphore, so that a subsequent open cannot start
-                // writing to the same canonical path while deletion is in progress.
-                File failedDir = newTablet.getKvTabletDir();
-                if (failedDir != null) {
-                    FileUtils.deleteDirectoryQuietly(failedDir);
-                }
-            }
-            if (semaphoreAcquired) {
-                openSemaphore.release();
-            }
-        }
-    }
-
-    private boolean commitOpenResult(
-            long myGeneration,
-            int myLeaderEpoch,
-            int myBucketEpoch,
-            @Nullable KvTablet newTablet,
-            @Nullable Exception error) {
-        lazyStateLock.lock();
-        try {
-            if (openGeneration != myGeneration) {
-                if (lazyState == LazyState.OPENING) {
-                    transitionToFailed(
-                            new CancellationException(
-                                    "open superseded by generation " + openGeneration),
-                            true);
-                }
-                return false;
-            }
-
-            if (error != null) {
-                transitionToFailed(error, false);
-                return false;
-            }
-
-            // Epoch fencing
-            int currentLeaderEpoch =
-                    leaderEpochSupplier != null ? leaderEpochSupplier.getAsInt() : -1;
-            int currentBucketEpoch =
-                    bucketEpochSupplier != null ? bucketEpochSupplier.getAsInt() : -1;
-            if (currentLeaderEpoch != myLeaderEpoch || currentBucketEpoch != myBucketEpoch) {
-                transitionToFailed(new CancellationException("epoch changed during open"), true);
-                return false;
-            }
-
-            // Success — absorb RocksDB state from the newly opened tablet.
-            // Note: we set OPEN and signal waiters before running commitCallback (which starts
-            // the snapshot manager). Writes during this brief window are safe — data is in
-            // RocksDB and the WAL. The commitCallbackInFlight flag prevents release until the
-            // callback completes.
-            tablet.installRocksDB(newTablet);
-            lazyState = LazyState.OPEN;
-            failureCount = 0;
-            lastAccessTimestamp = clock.milliseconds();
-            rejectNewPins = false;
-            commitCallbackInFlight = true;
-            lazyStateChanged.signalAll();
-        } finally {
-            lazyStateLock.unlock();
-        }
-
-        try {
-            updateStateGauges(LazyState.OPENING, LazyState.OPEN);
-
-            // Invoke commit callback outside the lock to avoid blocking acquireGuard() callers.
-            if (commitCallback != null) {
-                commitCallback.onOpenCommitted(tablet);
-            }
-        } catch (Exception e) {
-            LOG.warn(
-                    "Post-open commit callback failed for {}, keeping tablet OPEN",
-                    tablet.getTableBucket(),
-                    e);
-        } finally {
+            candidate = openCallback.doOpen(localDataExists);
             lazyStateLock.lock();
             try {
-                commitCallbackInFlight = false;
+                int leaderEpoch = leaderEpochSupplier != null ? leaderEpochSupplier.getAsInt() : -1;
+                int bucketEpoch = bucketEpochSupplier != null ? bucketEpochSupplier.getAsInt() : -1;
+                if (lazyState != LazyState.OPENING
+                        || openGeneration != myGeneration
+                        || leaderEpoch != myLeaderEpoch
+                        || bucketEpoch != myBucketEpoch) {
+                    throw new CancellationException(
+                            "open result fenced by concurrent epoch/generation change");
+                }
+                tablet.installRocksDB(candidate);
+                committed = true;
+                transitionTo(LazyState.OPEN);
+                failureCount = 0;
+                lastAccessTimestamp = clock.milliseconds();
+                rejectNewPins = false;
                 lazyStateChanged.signalAll();
             } finally {
                 lazyStateLock.unlock();
             }
+            try {
+                if (commitCallback != null) {
+                    commitCallback.onOpenCommitted(tablet);
+                }
+            } catch (Exception e) {
+                LOG.warn("Post-open commit callback failed for {}", tablet.getTableBucket(), e);
+            }
+        } catch (Exception | Error e) {
+            failure = e;
+            throw e;
+        } finally {
+            try {
+                if (!committed && candidate != null) {
+                    candidate.close();
+                    File dir = candidate.getKvTabletDir();
+                    if (dir != null) {
+                        FileUtils.deleteDirectory(dir);
+                    }
+                }
+            } catch (Exception | Error e) {
+                cleanupFailed = true;
+                if (failure != null) {
+                    failure.addSuppressed(e);
+                } else {
+                    failure = e;
+                    throw e;
+                }
+            } finally {
+                if (semaphoreAcquired) {
+                    openSemaphore.release();
+                }
+                lazyStateLock.lock();
+                try {
+                    if (cleanupFailed) {
+                        failedOpenTablet = candidate;
+                        rejectNewPins = true;
+                        transitionTo(LazyState.CLOSING);
+                    } else if (!committed && lazyState != LazyState.CLOSING) {
+                        transitionToFailed(failure, failure instanceof CancellationException);
+                    }
+                    operationInFlight = false;
+                    lazyStateChanged.signalAll();
+                } finally {
+                    lazyStateLock.unlock();
+                }
+            }
         }
-        return true;
+    }
+
+    /** Must be called while holding {@code lazyStateLock}. */
+    private void transitionTo(LazyState state) {
+        updateStateGauges(lazyState, state);
+        lazyState = state;
     }
 
     /** Must be called while holding {@code lazyStateLock}. */
     private void transitionToFailed(Throwable cause, boolean resetCount) {
-        updateStateGauges(LazyState.OPENING, LazyState.FAILED);
-        lazyState = LazyState.FAILED;
+        transitionTo(LazyState.FAILED);
         failedTimestamp = clock.milliseconds();
         if (resetCount) {
             failureCount = 0;
@@ -738,76 +722,58 @@ public final class KvTabletLazyLifecycle {
      * @return true if release succeeded, false if aborted
      */
     boolean releaseKv() {
-        // Pre-check state outside lock as a fast-path rejection
-        if (lazyState != LazyState.OPEN) {
-            return false;
-        }
-
         lazyStateLock.lock();
         try {
-            if (lazyState != LazyState.OPEN) {
+            if (lazyState != LazyState.OPEN || operationInFlight) {
                 return false;
             }
-
-            // Transition to RELEASING — write rejectNewPins before lazyState so that
-            // tryAcquirePinAsGuard() sees the reject flag if it reads OPEN.
             rejectNewPins = true;
-            lazyState = LazyState.RELEASING;
-
-            if (!drainPins()) {
-                LOG.warn("{} release drain timeout, aborting release", tablet.getTableBucket());
-                transitionBackToOpen();
+            transitionTo(LazyState.RELEASING);
+            operationInFlight = true;
+            if (!drainPins()
+                    || lazyState == LazyState.CLOSING
+                    || tablet.getFlushedLogOffset() < tablet.logTablet.localLogEndOffset()
+                    || tablet.hasActiveResourceLeases()) {
+                if (lazyState == LazyState.RELEASING) {
+                    transitionBackToOpen();
+                }
+                operationInFlight = false;
+                lazyStateChanged.signalAll();
                 return false;
             }
-
-            // Re-check flush progress only after blocking new pins and draining
-            // all in-flight operations. This closes the race where a writer acquired
-            // a guard before RELEASING but appended after an earlier LEO check.
-            long logEndOffset = tablet.logTablet.localLogEndOffset();
-            if (tablet.getFlushedLogOffset() < logEndOffset || tablet.hasActiveResourceLeases()) {
-                transitionBackToOpen();
-                return false;
-            }
-
-            if (!awaitCommitCallbackCompletion()) {
-                LOG.warn(
-                        "{} release waited too long for open commit finalization, aborting release",
-                        tablet.getTableBucket());
-                transitionBackToOpen();
-                return false;
-            }
-
-            // Cache metadata AFTER drain — all pinned operations have completed,
-            // so rowCount reflects the latest flushed state.
             cachedRowCount = tablet.currentRowCount();
             cachedFlushedLogOffset = tablet.getFlushedLogOffset();
         } finally {
             lazyStateLock.unlock();
         }
 
-        // All pins drained, safe to close
         boolean releaseSucceeded = false;
+        boolean nativeCloseStarted = false;
         try {
             if (releaseCallback != null) {
                 releaseCallback.doRelease(tablet);
             }
+            nativeCloseStarted = true;
             tablet.detachRocksDB();
             releaseSucceeded = true;
         } catch (Exception e) {
-            LOG.warn(
-                    "{} release callback failed, rolling back to OPEN", tablet.getTableBucket(), e);
+            LOG.warn("Failed to release KV tablet {}", tablet.getTableBucket(), e);
         } finally {
             lazyStateLock.lock();
             try {
-                if (releaseSucceeded) {
-                    lazyState = LazyState.LAZY;
-                    hasLocalData = true;
-                    updateStateGauges(LazyState.OPEN, LazyState.LAZY);
-                    rejectNewPins = false;
-                    lazyStateChanged.signalAll();
-                } else {
-                    transitionBackToOpen();
+                if (lazyState == LazyState.RELEASING) {
+                    if (releaseSucceeded) {
+                        transitionTo(LazyState.LAZY);
+                        hasLocalData = true;
+                        rejectNewPins = false;
+                    } else if (!nativeCloseStarted) {
+                        transitionBackToOpen();
+                    } else {
+                        transitionTo(LazyState.CLOSING);
+                    }
                 }
+                operationInFlight = false;
+                lazyStateChanged.signalAll();
             } finally {
                 lazyStateLock.unlock();
             }
@@ -815,88 +781,76 @@ public final class KvTabletLazyLifecycle {
         return releaseSucceeded;
     }
 
-    // ---- Drop logic ----
-
-    /**
-     * Full-state cleanup for lazy mode: handles all states, waits for in-progress operations, then
-     * transitions to CLOSED. Called by Replica.dropKv().
-     */
+    /** Close resources and remove local data only after outstanding operations finish. */
     void dropKvLazy() {
+        terminate(KvCloseMode.DISCARD_UNPERSISTED_STATE, true);
+    }
+
+    void closeKvLazy(KvCloseMode closeMode) {
+        terminate(closeMode, false);
+    }
+
+    /** Serializes close callers without holding the state lock during callbacks or native I/O. */
+    private synchronized void terminate(KvCloseMode closeMode, boolean deleteDirectory) {
+        if (lazyState == LazyState.CLOSED) {
+            if (deleteDirectory && !localDirectoryDeleted) {
+                if (dropCallback != null) {
+                    dropCallback.doDrop(tablet);
+                }
+                tablet.deleteLocalDirectory();
+                localDirectoryDeleted = true;
+            }
+            return;
+        }
         lazyStateLock.lock();
         try {
-            switch (lazyState) {
-                case CLOSED:
-                    break;
-
-                case LAZY:
-                case FAILED:
-                    tablet.deleteLocalDirectory();
-                    break;
-
-                case OPENING:
-                    // Fence the in-progress open so commitOpenResult() will reject it.
-                    // If awaitStateExit times out (open thread stuck on semaphore or slow I/O),
-                    // the open thread will eventually call commitOpenResult(), find the generation
-                    // mismatch, and transition to FAILED. The final CLOSED transition at the
-                    // bottom of this method will override FAILED. The open thread's finally block
-                    // in doSlowOpen will close the newTablet, preventing resource leaks.
-                    openGeneration++;
-                    awaitStateExit(LazyState.OPENING, openTimeoutMs * 2);
-                    if (lazyState == LazyState.OPEN) {
-                        rejectNewPins = true;
-                        awaitCommitCallbackCompletion();
-                        drainPinsForDrop();
-                        dropOpenTablet();
-                    } else if (lazyState != LazyState.OPENING) {
-                        tablet.deleteLocalDirectory();
-                    }
-                    break;
-
-                case OPEN:
-                    rejectNewPins = true;
-                    awaitCommitCallbackCompletion();
-                    drainPinsForDrop();
-                    dropOpenTablet();
-                    break;
-
-                case RELEASING:
-                    awaitStateExit(LazyState.RELEASING, releaseDrainTimeoutMs * 2);
-                    if (lazyState == LazyState.OPEN) {
-                        rejectNewPins = true;
-                        awaitCommitCallbackCompletion();
-                        drainPinsForDrop();
-                        dropOpenTablet();
-                    } else if (lazyState != LazyState.RELEASING) {
-                        tablet.deleteLocalDirectory();
-                    }
-                    break;
-
-                default:
-                    throw new IllegalStateException("Unexpected state in dropKvLazy: " + lazyState);
+            rejectNewPins = true;
+            openGeneration++;
+            transitionTo(LazyState.CLOSING);
+            lazyStateChanged.signalAll();
+            // A request timeout cannot transfer ownership of native resources or the local path.
+            while (operationInFlight || activePins.get() > 0) {
+                lazyStateChanged.awaitUninterruptibly();
             }
+        } finally {
+            lazyStateLock.unlock();
+        }
 
-            LazyState stateBeforeClose = lazyState;
-            if (stateBeforeClose != LazyState.CLOSED) {
-                updateStateGauges(stateBeforeClose, LazyState.CLOSED);
+        if (deleteDirectory) {
+            if (dropCallback != null) {
+                dropCallback.doDrop(tablet);
             }
-            lazyState = LazyState.CLOSED;
+        } else if (releaseCallback != null) {
+            releaseCallback.doRelease(tablet);
+        }
+        if (failedOpenTablet != null) {
+            try {
+                failedOpenTablet.close();
+                File dir = failedOpenTablet.getKvTabletDir();
+                if (dir != null) {
+                    FileUtils.deleteDirectory(dir);
+                }
+                failedOpenTablet = null;
+            } catch (Exception e) {
+                throw new KvStorageException(
+                        "Failed to clean up fenced open for " + tablet.getTableBucket(), e);
+            }
+        }
+        tablet.detachRocksDB(closeMode);
+        if (deleteDirectory) {
+            tablet.deleteLocalDirectory();
+            localDirectoryDeleted = true;
+        }
+        lazyStateLock.lock();
+        try {
+            transitionTo(LazyState.CLOSED);
             hasLocalData = false;
-            rejectNewPins = false;
             failureCount = 0;
             failedTimestamp = 0;
             lastFailureCause = null;
             lazyStateChanged.signalAll();
         } finally {
             lazyStateLock.unlock();
-        }
-    }
-
-    private void drainPinsForDrop() {
-        if (!drainPins()) {
-            LOG.warn(
-                    "{} drop drain timeout with {} active pins, proceeding with close",
-                    tablet.getTableBucket(),
-                    activePins.get());
         }
     }
 
@@ -917,116 +871,9 @@ public final class KvTabletLazyLifecycle {
         return true;
     }
 
-    /** Waits under {@code lazyStateLock} for post-open finalization to complete. */
-    private boolean awaitCommitCallbackCompletion() {
-        long deadline = clock.milliseconds() + releaseDrainTimeoutMs;
-        while (commitCallbackInFlight) {
-            long remaining = deadline - clock.milliseconds();
-            if (remaining <= 0) {
-                return false;
-            }
-            try {
-                if (!lazyStateChanged.await(remaining, TimeUnit.MILLISECONDS)) {
-                    return false;
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /**
-     * Wait (under lazyStateLock) until {@code lazyState} is no longer {@code state}, or timeout.
-     */
-    private void awaitStateExit(LazyState state, long timeoutMs) {
-        long deadlineNanos = clock.nanoseconds() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-        while (lazyState == state) {
-            try {
-                long remainNanos = deadlineNanos - clock.nanoseconds();
-                if (remainNanos <= 0
-                        || !lazyStateChanged.await(remainNanos, TimeUnit.NANOSECONDS)) {
-                    break;
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-    }
-
-    private void doDropViaCallback() {
-        if (dropCallback != null) {
-            dropCallback.doDrop(tablet);
-        }
-    }
-
-    void closeKvLazy(KvCloseMode closeMode) {
-        lazyStateLock.lock();
-        try {
-            switch (lazyState) {
-                case CLOSED:
-                    return;
-                case LAZY:
-                case FAILED:
-                    break;
-                case OPENING:
-                    openGeneration++;
-                    awaitStateExit(LazyState.OPENING, openTimeoutMs * 2);
-                    if (lazyState == LazyState.OPEN) {
-                        rejectNewPins = true;
-                        awaitCommitCallbackCompletion();
-                        drainPins();
-                        tablet.detachRocksDB(closeMode);
-                    }
-                    break;
-                case OPEN:
-                    rejectNewPins = true;
-                    awaitCommitCallbackCompletion();
-                    drainPins();
-                    tablet.detachRocksDB(closeMode);
-                    break;
-                case RELEASING:
-                    awaitStateExit(LazyState.RELEASING, releaseDrainTimeoutMs * 2);
-                    if (lazyState == LazyState.OPEN) {
-                        rejectNewPins = true;
-                        awaitCommitCallbackCompletion();
-                        drainPins();
-                        tablet.detachRocksDB(closeMode);
-                    }
-                    break;
-                default:
-                    throw new IllegalStateException(
-                            "Unexpected state in closeKvLazy: " + lazyState);
-            }
-
-            LazyState stateBeforeClose = lazyState;
-            if (stateBeforeClose != LazyState.CLOSED) {
-                updateStateGauges(stateBeforeClose, LazyState.CLOSED);
-            }
-            lazyState = LazyState.CLOSED;
-            hasLocalData = false;
-            rejectNewPins = false;
-            failureCount = 0;
-            failedTimestamp = 0;
-            lastFailureCause = null;
-            lazyStateChanged.signalAll();
-        } finally {
-            lazyStateLock.unlock();
-        }
-    }
-
-    /** Must be called while holding {@code lazyStateLock} and after pins have drained. */
-    private void dropOpenTablet() {
-        doDropViaCallback();
-        tablet.detachRocksDB(KvCloseMode.DISCARD_UNPERSISTED_STATE);
-        tablet.deleteLocalDirectory();
-    }
-
     /** Must be called while holding {@code lazyStateLock}. */
     private void transitionBackToOpen() {
-        lazyState = LazyState.OPEN;
+        transitionTo(LazyState.OPEN);
         rejectNewPins = false;
         lazyStateChanged.signalAll();
     }

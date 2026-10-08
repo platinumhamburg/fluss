@@ -388,7 +388,11 @@ public final class KvTablet {
     void deleteLocalDirectory() {
         File dir = getKvTabletDir();
         if (dir != null) {
-            FileUtils.deleteDirectoryQuietly(dir);
+            try {
+                FileUtils.deleteDirectory(dir);
+            } catch (IOException e) {
+                throw new KvStorageException("Failed to delete KV directory " + dir, e);
+            }
         }
     }
 

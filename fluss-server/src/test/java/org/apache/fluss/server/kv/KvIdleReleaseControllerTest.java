@@ -327,5 +327,6 @@ final class KvIdleReleaseControllerTest {
         assertThat(tablet1.getLazyState()).isEqualTo(KvTabletLazyLifecycle.LazyState.OPEN);
         // tablet2 should still be released despite tablet1's failure
         assertThat(tablet2.getLazyState()).isEqualTo(KvTabletLazyLifecycle.LazyState.LAZY);
+        tablet1.getLifecycle().setReleaseCallback(kv -> {});
     }
 }

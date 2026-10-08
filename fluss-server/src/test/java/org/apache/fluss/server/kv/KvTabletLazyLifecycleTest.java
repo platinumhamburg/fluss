@@ -38,6 +38,7 @@ import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.server.storage.LocalDiskManager;
+import org.apache.fluss.server.utils.ResourceGuard;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
@@ -45,6 +46,7 @@ import org.apache.fluss.testutils.common.AllCallbackWrapper;
 import org.apache.fluss.testutils.common.CommonTestUtils;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.ByteArraySlice;
+import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.clock.ManualClock;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.FlussScheduler;
@@ -55,6 +57,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.File;
 import java.time.Duration;
@@ -64,6 +68,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -169,7 +174,12 @@ final class KvTabletLazyLifecycleTest {
         return tablet;
     }
 
-    private KvTabletLazyLifecycle configureLifecycle(KvTablet sentinel, ManualClock clock) {
+    private KvTabletLazyLifecycle configureLifecycle(KvTablet sentinel, Clock clock) {
+        return configureLifecycle(sentinel, clock, KvManager.RELEASE_DRAIN_TIMEOUT_MS);
+    }
+
+    private KvTabletLazyLifecycle configureLifecycle(
+            KvTablet sentinel, Clock clock, long drainTimeout) {
         KvTabletLazyLifecycle lifecycle = sentinel.getLifecycle();
         lifecycle.configureLazyOpen(
                 clock,
@@ -177,7 +187,7 @@ final class KvTabletLazyLifecycleTest {
                 kvManager.getOpenTimeoutMs(),
                 kvManager.getFailedBackoffBaseMs(),
                 kvManager.getFailedBackoffMaxMs(),
-                KvManager.RELEASE_DRAIN_TIMEOUT_MS);
+                drainTimeout);
         lifecycle.setLeaderEpochSupplier(() -> 1);
         lifecycle.setBucketEpochSupplier(() -> 1);
         lifecycle.setTabletDirSupplier(
@@ -208,6 +218,183 @@ final class KvTabletLazyLifecycleTest {
                 () -> tablet.getFlushedLogOffset() >= offset,
                 Duration.ofSeconds(10),
                 "KV operation did not complete");
+    }
+
+    @Test
+    void testMaintenanceDoesNotRefreshIdleTime() throws Exception {
+        ManualClock clock = new ManualClock(System.currentTimeMillis());
+        KvTablet sentinel = createSentinel();
+        KvTabletLazyLifecycle lifecycle = configureLifecycle(sentinel, clock);
+        try (KvTablet.Guard ignored = sentinel.acquireGuard()) {
+            // Open through a business request.
+        }
+        long lastAccess = sentinel.getLastAccessTimestamp();
+        clock.advanceTime(10, TimeUnit.MINUTES);
+        sentinel.getGuardedExecutor().execute(() -> {});
+        assertThat(sentinel.getLastAccessTimestamp()).isEqualTo(lastAccess);
+        assertThat(lifecycle.canRelease(TimeUnit.MINUTES.toMillis(10), clock.milliseconds()))
+                .isTrue();
+        try (KvTablet.Guard ignored = sentinel.acquireGuard()) {
+            assertThat(sentinel.getLastAccessTimestamp()).isEqualTo(clock.milliseconds());
+        }
+        assertThat(lifecycle.canRelease(TimeUnit.MINUTES.toMillis(10), clock.milliseconds()))
+                .isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testCloseWaitsForSlowRelease(boolean delete) throws Exception {
+        KvTablet sentinel = createSentinel();
+        KvTabletLazyLifecycle lifecycle =
+                configureLifecycle(sentinel, SystemClock.getInstance(), 20);
+        try (KvTablet.Guard ignored = sentinel.acquireGuard()) {
+            // Open an empty tablet eligible for idle release.
+        }
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch finish = new CountDownLatch(1);
+        lifecycle.setReleaseCallback(
+                kv -> {
+                    entered.countDown();
+                    try {
+                        finish.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException(e);
+                    }
+                });
+        FutureTask<Boolean> release = new FutureTask<>(sentinel::releaseKv);
+        FutureTask<Void> drop =
+                new FutureTask<>(
+                        () -> {
+                            if (delete) {
+                                sentinel.dropKvLazy();
+                            } else {
+                                sentinel.close();
+                            }
+                            return null;
+                        });
+        new Thread(release, "slow-idle-release").start();
+        try {
+            assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+            new Thread(drop, "drop-slow-release").start();
+            assertThatThrownBy(() -> drop.get(200, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(TimeoutException.class);
+        } finally {
+            finish.countDown();
+            release.get(5, TimeUnit.SECONDS);
+            drop.get(5, TimeUnit.SECONDS);
+        }
+        assertThat(lifecycle.getLazyState()).isEqualTo(KvTabletLazyLifecycle.LazyState.CLOSED);
+        assertThat(sentinel.getRocksDBKv()).isNull();
+        assertThat(sentinel.getKvTabletDir().exists()).isEqualTo(!delete);
+        assertThatThrownBy(sentinel::acquireGuard).isInstanceOf(KvStorageException.class);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testCloseWaitsForFencedOpenCleanup(boolean shutdown) throws Exception {
+        KvTablet sentinel = createSentinel();
+        KvTabletLazyLifecycle lifecycle =
+                configureLifecycle(sentinel, SystemClock.getInstance(), 20);
+        CountDownLatch prepared = new CountDownLatch(1);
+        CountDownLatch returnCandidate = new CountDownLatch(1);
+        AtomicReference<KvTablet> candidate = new AtomicReference<>();
+        AtomicReference<ResourceGuard.Lease> lease = new AtomicReference<>();
+        lifecycle.setOpenCallback(
+                hasLocal -> {
+                    KvTablet opened =
+                            kvManager.createKvTabletUnregistered(
+                                    physicalPath,
+                                    tableBucket,
+                                    logTablet,
+                                    KvFormat.COMPACTED,
+                                    new TestingSchemaGetter(
+                                            new SchemaInfo(DATA1_SCHEMA_PK, SCHEMA_ID)),
+                                    new TableConfig(new Configuration()),
+                                    DEFAULT_COMPRESSION,
+                                    null);
+                    candidate.set(opened);
+                    lease.set(opened.getRocksDBKv().getResourceGuard().acquireResource());
+                    prepared.countDown();
+                    returnCandidate.await();
+                    return opened;
+                });
+        FutureTask<Void> open =
+                new FutureTask<>(
+                        () -> {
+                            assertThatThrownBy(sentinel::acquireGuard)
+                                    .isInstanceOf(RuntimeException.class);
+                            return null;
+                        });
+        FutureTask<Void> close =
+                new FutureTask<>(
+                        () -> {
+                            if (shutdown) {
+                                kvManager.shutdown();
+                            } else {
+                                kvManager.dropKv(tableBucket);
+                            }
+                            return null;
+                        });
+        new Thread(open, "fenced-open").start();
+        try {
+            assertThat(prepared.await(5, TimeUnit.SECONDS)).isTrue();
+            new Thread(close, "close-fenced-open").start();
+            CommonTestUtils.waitUntil(
+                    () -> lifecycle.getLazyState() == KvTabletLazyLifecycle.LazyState.CLOSING,
+                    Duration.ofSeconds(5),
+                    "Close did not fence opening tablet");
+            returnCandidate.countDown();
+            CommonTestUtils.waitUntil(
+                    () -> candidate.get().getRocksDBKv().getResourceGuard().isClosed(),
+                    Duration.ofSeconds(5),
+                    "Candidate cleanup did not start");
+            assertThatThrownBy(() -> close.get(200, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(TimeoutException.class);
+            assertThat(kvManager.getKv(tableBucket)).contains(sentinel);
+            assertThatThrownBy(() -> kvManager.registerKv(tableBucket, sentinel))
+                    .isInstanceOf(IllegalStateException.class);
+        } finally {
+            returnCandidate.countDown();
+            if (lease.get() != null) {
+                lease.get().close();
+            }
+            open.get(5, TimeUnit.SECONDS);
+            close.get(5, TimeUnit.SECONDS);
+        }
+        assertThat(lifecycle.getLazyState()).isEqualTo(KvTabletLazyLifecycle.LazyState.CLOSED);
+        assertThat(sentinel.getRocksDBKv()).isNull();
+        assertThat(sentinel.getKvTabletDir()).doesNotExist();
+        if (shutdown) {
+            kvManager = null;
+        } else {
+            assertThat(kvManager.getKv(tableBucket)).isEmpty();
+            KvTablet replacement = createSentinel();
+            configureLifecycle(replacement, SystemClock.getInstance());
+            try (KvTablet.Guard ignored = replacement.acquireGuard()) {
+                assertThat(replacement.getKvTabletDir()).isDirectory();
+            }
+        }
+    }
+
+    @Test
+    void testDropAfterCloseDeletesLocalDataOnlyOnce() throws Exception {
+        KvTablet sentinel = createSentinel();
+        configureLifecycle(sentinel, SystemClock.getInstance());
+        try (KvTablet.Guard ignored = sentinel.acquireGuard()) {
+            assertThat(sentinel.getKvTabletDir()).isDirectory();
+        }
+        sentinel.close();
+        assertThat(sentinel.getKvTabletDir()).isDirectory();
+        sentinel.dropKvLazy();
+        assertThat(sentinel.getKvTabletDir()).doesNotExist();
+        kvManager.unregisterKv(tableBucket, sentinel);
+        KvTablet replacement = createSentinel();
+        configureLifecycle(replacement, SystemClock.getInstance());
+        try (KvTablet.Guard ignored = replacement.acquireGuard()) {
+            sentinel.dropKvLazy();
+            assertThat(replacement.getKvTabletDir()).isDirectory();
+        }
     }
 
     // ---- Tests ----
@@ -618,7 +805,7 @@ final class KvTabletLazyLifecycleTest {
                 Duration.ofSeconds(5),
                 "Timed out waiting for drop thread to block");
         assertThat(dropTask.isDone()).isFalse();
-        assertThat(lifecycle.getLazyState()).isEqualTo(KvTabletLazyLifecycle.LazyState.OPEN);
+        assertThat(lifecycle.getLazyState()).isEqualTo(KvTabletLazyLifecycle.LazyState.CLOSING);
 
         allowCommitCallbackFinish.countDown();
         openThread.join(TimeUnit.SECONDS.toMillis(5));

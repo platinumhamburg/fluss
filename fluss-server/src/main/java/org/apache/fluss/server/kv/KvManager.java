@@ -575,11 +575,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         try {
             kvTablet.close(closeMode);
         } catch (Exception e) {
-            LOG.warn(
-                    "Exception while closing kv tablet {} with mode {}.",
-                    kvTablet.getTableBucket(),
-                    closeMode,
-                    e);
+            throw new KvStorageException(
+                    "Failed to close KV tablet " + kvTablet.getTableBucket(), e);
         }
     }
 
@@ -729,20 +726,28 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
     }
 
     public void dropKv(TableBucket tableBucket) {
-        inKvLock(
-                tableBucket,
-                () -> {
-                    doDropKv(tableBucket);
-                    return null;
-                });
+        KvTablet lazyTablet =
+                inKvLock(
+                        tableBucket,
+                        () -> {
+                            KvTablet current = currentKvs.get(tableBucket);
+                            if (current != null && !current.isLazyMode()) {
+                                doDropKv(tableBucket, current);
+                                return null;
+                            }
+                            return current;
+                        });
+        // Lazy open callbacks also need the bucket lock. Retain registry ownership while
+        // waiting, but do not hold that lock across lazy lifecycle cleanup.
+        doDropKv(tableBucket, lazyTablet);
     }
 
-    private void doDropKv(TableBucket tableBucket) {
-        KvTablet dropKvTablet = currentKvs.remove(tableBucket);
+    private void doDropKv(TableBucket tableBucket, @Nullable KvTablet dropKvTablet) {
         if (dropKvTablet != null) {
             TablePath tablePath = dropKvTablet.getTablePath();
             try {
                 dropKvTablet.drop();
+                inKvLock(tableBucket, () -> currentKvs.remove(tableBucket, dropKvTablet));
                 if (dropKvTablet.getPartitionName() == null) {
                     LOG.info(
                             "Deleted kv bucket {} for table {} in file path {}.",
@@ -898,9 +903,9 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                 });
     }
 
-    /** Remove a KvTablet from the {@code currentKvs} registry (e.g. on drop). */
-    public void unregisterKv(TableBucket tableBucket) {
-        inKvLock(tableBucket, () -> currentKvs.remove(tableBucket));
+    /** Remove the expected tablet without unregistering a replacement for the same bucket. */
+    public void unregisterKv(TableBucket tableBucket, KvTablet expectedTablet) {
+        inKvLock(tableBucket, () -> currentKvs.remove(tableBucket, expectedTablet));
     }
 
     /**

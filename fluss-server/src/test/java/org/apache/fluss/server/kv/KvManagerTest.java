@@ -833,7 +833,7 @@ final class KvManagerTest {
         KvTablet tablet = getOrCreateKv(tablePath1, partitionName, tableBucket1);
         assertThat(kvManager.getKv(tableBucket1)).isPresent();
 
-        kvManager.unregisterKv(tableBucket1);
+        kvManager.unregisterKv(tableBucket1, tablet);
         assertThat(kvManager.getKv(tableBucket1)).isNotPresent();
         tablet.close();
     }

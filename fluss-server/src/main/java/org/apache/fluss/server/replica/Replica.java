@@ -844,7 +844,7 @@ public final class Replica {
                 kv.dropKvLazy();
                 // Remove sentinel from KvManager registry
                 checkNotNull(kvManager);
-                kvManager.unregisterKv(tableBucket);
+                kvManager.unregisterKv(tableBucket, kv);
             } else {
                 bucketMetricGroup.unregisterRocksDBStatistics();
                 checkNotNull(kvManager);
