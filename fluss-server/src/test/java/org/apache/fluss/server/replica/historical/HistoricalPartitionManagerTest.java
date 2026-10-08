@@ -1433,7 +1433,10 @@ class HistoricalPartitionManagerTest extends ReplicaTestBase {
             TableInfo tableInfo,
             InternalRow expectedRow)
             throws Exception {
-        KvStateLookupResult result = kvTablet.lookupHistoricalLocal(originalPartition, primaryKey);
+        KvStateLookupResult result;
+        try (KvTablet.Guard guard = kvTablet.acquireGuard()) {
+            result = guard.getTablet().lookupHistoricalLocal(originalPartition, primaryKey);
+        }
         assertThat(result.isPresent()).isTrue();
         BinaryValue value =
                 new ValueDecoder(

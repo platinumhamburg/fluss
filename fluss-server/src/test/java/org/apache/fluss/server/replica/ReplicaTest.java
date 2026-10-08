@@ -1280,39 +1280,32 @@ final class ReplicaTest extends ReplicaTestBase {
 
     @Test
     void testGetRowCountPkTableWithNullKvTablet() throws Exception {
-        // Create a PK table replica but do NOT make it leader, so kvTablet stays null.
+
         TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 1);
         Replica kvReplica = makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, tableBucket);
 
-        // Verify preconditions: this is a PK table and kvTablet is null.
         assertThat(kvReplica.isKvTable()).isTrue();
         assertThat(kvReplica.getKvTablet()).isNull();
 
-        // Append some log records so logTablet has a non-zero row count.
         LogTablet logTablet = kvReplica.getLogTablet();
         MemoryLogRecords records = genMemoryLogRecordsByObject(DATA1);
         logTablet.appendAsLeader(records);
         logTablet.updateHighWatermark(logTablet.localLogEndOffset());
         assertThat(logTablet.getRowCount()).isGreaterThan(0);
 
-        // getRowCount() should return 0 for a PK table when kvTablet is null,
-        // NOT the logTablet row count.
         assertThat(kvReplica.getRowCount()).isEqualTo(0L);
     }
 
     @Test
     void testCreateKvRollbackOnAllRetriesFailed() throws Exception {
-        // Create a SnapshotContext whose getSnapshotDataDownloader always throws.
-        // This forces initKvTablet() to fail on every retry attempt because the
-        // snapshot download will always fail.
+
         TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 1);
         TestSnapshotContext failingSnapshotContext =
                 new TestSnapshotContext(conf.getString(ConfigOptions.REMOTE_DATA_DIR)) {
                     @Override
                     public FunctionWithException<TableBucket, CompletedSnapshot, Exception>
                             getLatestCompletedSnapshotProvider() {
-                        // Return a provider that always returns a fake snapshot,
-                        // so initKvTablet takes the snapshot-restore path
+
                         return tb ->
                                 new CompletedSnapshot(
                                         tb,
@@ -1329,17 +1322,8 @@ final class ReplicaTest extends ReplicaTestBase {
 
                     @Override
                     public KvSnapshotDataDownloader getSnapshotDataDownloader() {
-                        // Return a downloader that always throws to simulate download failure
-                        return new KvSnapshotDataDownloader(
-                                java.util.concurrent.Executors.newSingleThreadExecutor()) {
-                            @Override
-                            public void transferAllDataToDirectory(
-                                    KvSnapshotDownloadSpec kvSnapshotDownloadSpec,
-                                    org.apache.fluss.utils.CloseableRegistry closeableRegistry)
-                                    throws Exception {
-                                throw new IOException("Simulated snapshot download failure");
-                            }
-                        };
+
+                        throw new IllegalStateException("Snapshot download unavailable");
                     }
                 };
 
@@ -1349,10 +1333,8 @@ final class ReplicaTest extends ReplicaTestBase {
         assertThatThrownBy(() -> makeKvReplicaAsLeader(kvReplica))
                 .isInstanceOf(org.apache.fluss.exception.KvStorageException.class);
 
-        // kvTablet should be null since all retries failed
         assertThat(kvReplica.getKvTablet()).isNull();
 
-        // KvManager should not have a half-initialized entry for this bucket
         assertThat(kvManager.getKv(tableBucket)).isEmpty();
     }
 

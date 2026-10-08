@@ -137,30 +137,32 @@ public final class KvTablet {
      */
     private static final int TARGET_ENTRIES_PER_NATIVE_WRITE = 500;
 
-    /**
-     * A guard that prevents the underlying RocksDB from being released while held. Use with
-     * try-with-resources. In eager mode, this is a no-op. In lazy mode, it pins the RocksDB
-     * instance and ensures it is open before returning.
-     */
+    /** Pins an opened lazy tablet until closed; eager tablets use a no-op guard. */
     public static final class Guard implements AutoCloseable {
-        private final @Nullable KvTablet tablet;
+        private final KvTablet tablet;
+        private final @Nullable KvTabletLazyLifecycle lifecycle;
         private boolean released;
 
-        /** No-op guard for eager mode. */
-        static final Guard NOOP = new Guard(null);
-
-        Guard(@Nullable KvTablet tablet) {
+        Guard(KvTablet tablet, @Nullable KvTabletLazyLifecycle lifecycle) {
             this.tablet = tablet;
+            this.lifecycle = lifecycle;
+        }
+
+        /** Returns the opened tablet, valid until this guard is closed. */
+        public KvTablet getTablet() {
+            return tablet;
         }
 
         @Override
         public void close() {
-            if (!released && tablet != null) {
+            if (!released && lifecycle != null) {
                 released = true;
-                tablet.releasePin();
+                lifecycle.releasePin();
             }
         }
     }
+
+    private final Guard eagerGuard = new Guard(this, null);
 
     private final PhysicalTablePath physicalPath;
     private final TableBucket tableBucket;
@@ -301,10 +303,11 @@ public final class KvTablet {
                         : 0L;
     }
 
-    private KvTablet(
+    KvTablet(
             PhysicalTablePath physicalPath,
             TableBucket tableBucket,
             LogTablet logTablet,
+            File kvTabletDir,
             @Nullable TabletServerMetricGroup serverMetricGroup) {
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
@@ -312,7 +315,7 @@ public final class KvTablet {
         this.serverMetricGroup = serverMetricGroup;
         this.historicalPartition =
                 HISTORICAL_PARTITION_VALUE.equals(physicalPath.getPartitionName());
-        this.kvTabletDir = null;
+        this.kvTabletDir = kvTabletDir;
         this.writeBatchSize = 0;
         this.rocksDBKv = null;
         this.kvPreWriteBuffer = null;
@@ -328,15 +331,6 @@ public final class KvTablet {
         this.autoIncrementManager = null;
         this.rocksDBStatistics = null;
         this.lifecycle = new KvTabletLazyLifecycle(this);
-    }
-
-    /** Creates a tablet whose RocksDB resources are opened on first access. */
-    public static KvTablet createLazySentinel(
-            PhysicalTablePath physicalPath,
-            TableBucket tableBucket,
-            LogTablet logTablet,
-            @Nullable TabletServerMetricGroup serverMetricGroup) {
-        return new KvTablet(physicalPath, tableBucket, logTablet, serverMetricGroup);
     }
 
     /** Returns the lazy lifecycle, or null for an eagerly opened tablet. */
@@ -355,10 +349,6 @@ public final class KvTablet {
         }
     }
 
-    void detachRocksDB() {
-        detachRocksDB(KvCloseMode.PRESERVE_LOCAL_STATE);
-    }
-
     void detachRocksDB(KvCloseMode closeMode) {
         KvTablet opened = openedTablet;
         if (opened != null) {
@@ -371,7 +361,7 @@ public final class KvTablet {
         }
     }
 
-    private KvTablet requireOpenedTablet() {
+    KvTablet requireOpenedTablet() {
         return checkNotNull(openedTablet, "RocksDB is not open for %s", tableBucket);
     }
 
@@ -745,10 +735,6 @@ public final class KvTablet {
 
     /** Returns the physical value layout used by this tablet. */
     public KvValueLayout getKvValueLayout() {
-        if (lifecycle != null) {
-            return requireOpenedTablet().getKvValueLayout();
-        }
-
         return kvValueLayout;
     }
 
@@ -770,11 +756,6 @@ public final class KvTablet {
     }
 
     public void updateAutoIncrementIDRange(AutoIncIDRange newRange) {
-        if (lifecycle != null) {
-            requireOpenedTablet().updateAutoIncrementIDRange(newRange);
-            return;
-        }
-
         autoIncrementManager.updateIDRange(newRange);
     }
 
@@ -784,11 +765,6 @@ public final class KvTablet {
     }
 
     public File getKvTabletDir() {
-        if (lifecycle != null) {
-            KvTablet opened = openedTablet;
-            return opened == null ? lifecycle.getTabletDir() : opened.getKvTabletDir();
-        }
-
         return kvTabletDir;
     }
 
@@ -834,12 +810,6 @@ public final class KvTablet {
             if (opened != null) {
                 return opened.getRowCount();
             }
-            long cached = lifecycle.getCachedRowCount();
-            if (cached == ROW_COUNT_DISABLED) {
-                throw new InvalidTableException(
-                        "Row count is disabled for table " + getTablePath());
-            }
-            return cached;
         }
 
         if (rowCount == ROW_COUNT_DISABLED) {
@@ -918,9 +888,6 @@ public final class KvTablet {
     public LogAppendInfo putAsLeader(
             KvRecordBatch kvRecords, @Nullable int[] targetColumns, MergeMode mergeMode)
             throws Exception {
-        if (lifecycle != null) {
-            return requireOpenedTablet().putAsLeader(kvRecords, targetColumns, mergeMode);
-        }
         checkState(
                 !historicalPartition,
                 "putAsLeader is not supported for historical KV tablet %s",
@@ -942,16 +909,6 @@ public final class KvTablet {
             String originalPartitionName,
             HistoricalValueLookup historicalValueLookup)
             throws Exception {
-        if (lifecycle != null) {
-            return requireOpenedTablet()
-                    .putHistoricalAsLeader(
-                            kvRecords,
-                            targetColumns,
-                            mergeMode,
-                            originalPartitionName,
-                            historicalValueLookup);
-        }
-
         checkState(historicalPartition, "%s is not a historical KV tablet", tableBucket);
         return putAsLeader(
                 kvRecords,
@@ -973,12 +930,6 @@ public final class KvTablet {
             MergeMode mergeMode,
             String originalPartitionName)
             throws Exception {
-        if (lifecycle != null) {
-            return requireOpenedTablet()
-                    .probeLocalPreviousValues(
-                            kvRecords, targetColumns, mergeMode, originalPartitionName);
-        }
-
         checkState(historicalPartition, "%s is not a historical KV tablet", tableBucket);
         return inReadLock(
                 kvLock,
@@ -1073,9 +1024,7 @@ public final class KvTablet {
     public long getFlushedLogOffset() {
         if (lifecycle != null) {
             KvTablet opened = openedTablet;
-            return opened == null
-                    ? lifecycle.getCachedFlushedLogOffset()
-                    : opened.getFlushedLogOffset();
+            return opened == null ? flushedLogOffset : opened.getFlushedLogOffset();
         }
 
         return flushedLogOffset;
@@ -1429,7 +1378,7 @@ public final class KvTablet {
         if (lifecycle != null) {
             KvTablet opened = openedTablet;
             return runnable -> {
-                Guard guard = tryAcquireExistingGuard();
+                Guard guard = lifecycle.tryAcquireExistingGuard();
                 if (guard != null) {
                     try (Guard ignored = guard) {
                         if (opened != null && openedTablet == opened) {
@@ -1444,10 +1393,6 @@ public final class KvTablet {
     }
 
     public List<ByteArraySlice> multiGet(List<byte[]> keys) throws IOException {
-        if (lifecycle != null) {
-            return requireOpenedTablet().multiGet(keys);
-        }
-
         return inReadLock(
                 kvLock,
                 () -> {
@@ -1465,10 +1410,6 @@ public final class KvTablet {
      * #multiGet} so that clients only observe flushed data.
      */
     public List<ByteArraySlice> multiGetFromBufferOrKv(List<byte[]> keys) throws IOException {
-        if (lifecycle != null) {
-            return requireOpenedTablet().multiGetFromBufferOrKv(keys);
-        }
-
         checkState(
                 !historicalPartition,
                 "multiGetFromBufferOrKv is not supported for historical KV tablet %s",
@@ -1490,10 +1431,6 @@ public final class KvTablet {
     /** Looks up one key from the flushed local state for an original historical partition. */
     public KvStateLookupResult lookupHistoricalLocal(String originalPartitionName, byte[] key)
             throws IOException {
-        if (lifecycle != null) {
-            return requireOpenedTablet().lookupHistoricalLocal(originalPartitionName, key);
-        }
-
         checkState(historicalPartition, "%s is not a historical KV tablet", tableBucket);
         return inReadLock(
                 kvLock,
@@ -1512,10 +1449,6 @@ public final class KvTablet {
     }
 
     public List<ByteArraySlice> prefixLookup(byte[] prefixKey) throws IOException {
-        if (lifecycle != null) {
-            return requireOpenedTablet().prefixLookup(prefixKey);
-        }
-
         return inReadLock(
                 kvLock,
                 () -> {
@@ -1525,10 +1458,6 @@ public final class KvTablet {
     }
 
     public List<ByteArraySlice> limitScan(int limit) throws IOException {
-        if (lifecycle != null) {
-            return requireOpenedTablet().limitScan(limit);
-        }
-
         return inReadLock(
                 kvLock,
                 () -> {
@@ -1556,10 +1485,6 @@ public final class KvTablet {
      */
     public OpenScanResult openScan(String scannerId, long limit, long initialAccessTimeMs)
             throws IOException {
-        if (lifecycle != null) {
-            return requireOpenedTablet().openScan(scannerId, limit, initialAccessTimeMs);
-        }
-
         return inReadLock(
                 kvLock,
                 () -> {
@@ -1619,10 +1544,6 @@ public final class KvTablet {
     }
 
     public KvBatchWriter createKvBatchWriter() {
-        if (lifecycle != null) {
-            return requireOpenedTablet().createKvBatchWriter();
-        }
-
         return rocksDBKv.newWriteBatch(
                 writeBatchSize,
                 serverMetricGroup.kvFlushCount(),
@@ -1642,7 +1563,7 @@ public final class KvTablet {
 
     public void close(KvCloseMode closeMode) throws Exception {
         if (lifecycle != null) {
-            lifecycle.closeKvLazy(closeMode);
+            lifecycle.close(closeMode, false);
             return;
         }
         LOG.info(
@@ -1676,7 +1597,7 @@ public final class KvTablet {
     /** Completely delete the kv directory and all contents form the file system with no delay. */
     public void drop() throws Exception {
         if (lifecycle != null) {
-            lifecycle.dropKvLazy();
+            lifecycle.close(KvCloseMode.DISCARD_UNPERSISTED_STATE, true);
             return;
         }
 
@@ -1834,38 +1755,11 @@ public final class KvTablet {
         return lifecycle != null && lifecycle.isOpen();
     }
 
-    /** Returns the current lazy state. */
-    public KvTabletLazyLifecycle.LazyState getLazyState() {
-        return lifecycle != null ? lifecycle.getLazyState() : null;
-    }
-
     /**
-     * Acquire a guard that prevents RocksDB from being released while held. In eager mode, returns
-     * a no-op guard immediately. In lazy mode, ensures RocksDB is open (blocking if necessary) and
-     * pins it.
-     *
-     * <p>Must be called OUTSIDE any Replica-level locks (e.g. leaderIsrUpdateLock) to avoid
-     * blocking leader transitions during slow opens.
+     * Opens and pins this tablet. Call outside replica locks to avoid blocking leadership changes.
      */
     public Guard acquireGuard() {
-        return lifecycle != null ? lifecycle.acquireGuard() : Guard.NOOP;
-    }
-
-    /**
-     * Try to acquire a guard only if RocksDB is already open.
-     *
-     * <p>Returns {@code null} for a lazy tablet that is currently LAZY/FAILED/RELEASING/CLOSED.
-     */
-    @Nullable
-    Guard tryAcquireExistingGuard() {
-        return lifecycle != null ? lifecycle.tryAcquireExistingGuard() : Guard.NOOP;
-    }
-
-    /** Release a pin. Called by Guard.close(). */
-    void releasePin() {
-        if (lifecycle != null) {
-            lifecycle.releasePin();
-        }
+        return lifecycle != null ? lifecycle.acquireGuard() : eagerGuard;
     }
 
     /** Pre-check for idle release eligibility. */
@@ -1875,59 +1769,5 @@ public final class KvTablet {
 
     public boolean releaseKv() {
         return lifecycle != null && lifecycle.releaseKv();
-    }
-
-    public void dropKvLazy() {
-        if (lifecycle != null) {
-            lifecycle.dropKvLazy();
-        }
-    }
-
-    // ---- Lazy state queries ----
-
-    public long getCachedRowCount() {
-        return lifecycle != null ? lifecycle.getCachedRowCount() : 0;
-    }
-
-    public long getCachedFlushedLogOffset() {
-        return lifecycle != null ? lifecycle.getCachedFlushedLogOffset() : 0;
-    }
-
-    public long getLastAccessTimestamp() {
-        return lifecycle != null ? lifecycle.getLastAccessTimestamp() : 0;
-    }
-
-    /**
-     * Returns the number of active pins preventing RocksDB release.
-     *
-     * <p>This is primarily for testing and monitoring purposes. Exposing internal concurrency state
-     * may lead to misuse in production code.
-     */
-    @VisibleForTesting
-    public int getActivePins() {
-        return lifecycle != null ? lifecycle.getActivePins() : 0;
-    }
-
-    // ---- Test helpers ----
-
-    @VisibleForTesting
-    void setLazyStateForTesting(KvTabletLazyLifecycle.LazyState state) {
-        if (lifecycle != null) {
-            lifecycle.setLazyStateForTesting(state);
-        }
-    }
-
-    @VisibleForTesting
-    void setLastAccessTimestampForTesting(long timestamp) {
-        if (lifecycle != null) {
-            lifecycle.setLastAccessTimestampForTesting(timestamp);
-        }
-    }
-
-    @VisibleForTesting
-    void setClockForTesting(Clock clock) {
-        if (lifecycle != null) {
-            lifecycle.setClockForTesting(clock);
-        }
     }
 }

@@ -88,10 +88,8 @@ import org.apache.fluss.server.entity.PutKvDataForBucket;
 import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.StopReplicaResultForBucket;
 import org.apache.fluss.server.entity.UserContext;
-import org.apache.fluss.server.kv.KvIdleReleaseController;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvSnapshotResource;
-import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.kv.scan.ScannerManager;
 import org.apache.fluss.server.kv.snapshot.CompletedKvSnapshotCommitter;
 import org.apache.fluss.server.kv.snapshot.DefaultSnapshotContext;
@@ -154,7 +152,6 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -254,8 +251,7 @@ public class ReplicaManager implements ServerReconfigurable {
     private final ScannerManager scannerManager;
 
     private final HistoricalPartitionManager historicalPartitionManager;
-    private final boolean kvIdleReleaseEnabled;
-    private @Nullable KvIdleReleaseController kvIdleReleaseController;
+    private final long kvIdleTimeoutMs;
     private @Nullable ScheduledExecutorService kvIdleReleaseScheduler;
 
     public ReplicaManager(
@@ -391,29 +387,12 @@ public class ReplicaManager implements ServerReconfigurable {
                         dataDirVolumeBytes,
                         scheduler);
 
-        this.kvIdleReleaseEnabled = kvManager != null && kvManager.isLazyOpenEnabled();
-        if (kvIdleReleaseEnabled) {
-            long closeIdleIntervalMs = conf.get(ConfigOptions.KV_LAZY_OPEN_IDLE_TIMEOUT).toMillis();
-            checkArgument(
-                    closeIdleIntervalMs > 0,
-                    "kv.lazy-open.idle-timeout must be positive, got: %s ms",
-                    closeIdleIntervalMs);
-            this.kvIdleReleaseScheduler =
+        this.kvIdleTimeoutMs = conf.get(ConfigOptions.KV_LAZY_OPEN_IDLE_TIMEOUT).toMillis();
+        if (kvManager != null && kvManager.isLazyOpenEnabled()) {
+            checkArgument(kvIdleTimeoutMs > 0, "kv.lazy-open.idle-timeout must be positive");
+            kvIdleReleaseScheduler =
                     Executors.newSingleThreadScheduledExecutor(
                             new ExecutorThreadFactory("kv-idle-release"));
-            this.kvIdleReleaseController =
-                    new KvIdleReleaseController(
-                            kvIdleReleaseScheduler,
-                            () ->
-                                    onlineReplicas()
-                                            .filter(Replica::isKvTable)
-                                            .map(Replica::getKvTablet)
-                                            .filter(Objects::nonNull)
-                                            .filter(KvTablet::isLazyOpen)
-                                            .collect(Collectors.toList()),
-                            clock,
-                            IDLE_RELEASE_CHECK_INTERVAL_MS,
-                            closeIdleIntervalMs);
         }
         registerMetrics();
     }
@@ -432,9 +411,12 @@ public class ReplicaManager implements ServerReconfigurable {
 
         // Start periodic disk usage monitoring (initial + periodic sampling)
         localDiskManager.startDiskUsageMonitor(scheduler);
-        // Start idle release controller if enabled
-        if (kvIdleReleaseController != null) {
-            kvIdleReleaseController.start();
+        if (kvIdleReleaseScheduler != null) {
+            kvIdleReleaseScheduler.scheduleWithFixedDelay(
+                    () -> kvManager.releaseIdleTablets(kvIdleTimeoutMs, clock.milliseconds()),
+                    IDLE_RELEASE_CHECK_INTERVAL_MS,
+                    IDLE_RELEASE_CHECK_INTERVAL_MS,
+                    TimeUnit.MILLISECONDS);
         }
     }
 
@@ -2718,10 +2700,6 @@ public class ReplicaManager implements ServerReconfigurable {
     public static final class OfflineReplica implements HostedReplica {}
 
     public void shutdown() throws InterruptedException {
-        // Shut down the idle release controller if it was created
-        if (kvIdleReleaseController != null) {
-            kvIdleReleaseController.close();
-        }
         if (kvIdleReleaseScheduler != null) {
             ExecutorUtils.gracefulShutdown(5, TimeUnit.SECONDS, kvIdleReleaseScheduler);
         }
