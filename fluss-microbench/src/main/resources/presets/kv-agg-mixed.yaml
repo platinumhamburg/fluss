@@ -43,7 +43,7 @@ table:
       agg: BOOL_OR
   primary-key: [user_id]
   merge-engine: AGGREGATION
-  buckets: 512
+  buckets: 128
 
 data:
   seed: 42

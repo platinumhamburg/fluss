@@ -36,7 +36,7 @@ table:
     - name: updated_at
       type: BIGINT
   primary-key: [user_id]
-  buckets: 512
+  buckets: 128
 
 data:
   seed: 42

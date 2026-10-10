@@ -17,7 +17,7 @@ Build the distribution with `./mvnw -pl fluss-dist -am package -DskipTests` befo
 
 The client writer buffer defaults to 512 MB and must exceed 256 MB when set in YAML. It uses JVM heap. The launcher defaults to a 2 GB heap and a 1 GB direct-memory limit; set `MICROBENCH_HEAP_SIZE` and `MICROBENCH_DIRECT_MEMORY_SIZE` to size them for the workload and host. Allow additional process memory for JVM metadata, threads, and other native allocations.
 
-The bundled KV scenarios use 512 buckets and at least 32 threads in every phase that writes. They set the Fluss client limits `client.writer.max-inflight-requests-per-bucket: 5` and `client.lookup.max-inflight-requests: 128`. The writer limit applies per bucket and requires idempotent writes, which are enabled by default. The lookup limit applies to unacknowledged lookup requests in the shared client; lookup operations may be batched into requests.
+The bundled KV scenarios use 128 buckets and at least 32 threads in every phase that writes. They set the Fluss client limits `client.writer.max-inflight-requests-per-bucket: 5` and `client.lookup.max-inflight-requests: 128`. The writer limit applies per bucket and requires idempotent writes, which are enabled by default. The lookup limit applies to unacknowledged lookup requests in the shared client; lookup operations may be batched into requests.
 
 Bundled scenarios: `kv-upsert-get`, `kv-agg-mixed`, and `kv-agg-rbm32`.
 
@@ -40,7 +40,7 @@ table:
     - name: value
       type: STRING
   primary-key: [id]
-  buckets: 512
+  buckets: 128
 data:
   seed: 42
   generators:
