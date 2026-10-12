@@ -2621,18 +2621,6 @@ public class ConfigOptions {
                                     + "Partitions use the block cache even when metadata caching is disabled. "
                                     + "Takes effect when opening a RocksDB instance.");
 
-    public static final ConfigOption<Double> KV_BLOCK_CACHE_HIGH_PRIORITY_POOL_RATIO =
-            key("kv.rocksdb.block.cache-high-priority-pool-ratio")
-                    .doubleType()
-                    .defaultValue(0.5)
-                    .withDescription(
-                            "Fraction of each per-DB LRU block cache reserved for high-priority entries. "
-                                    + "Does not apply to the shared HyperClockCache. "
-                                    + "Must be finite and between 0 and 1; 0 disables the priority pool. "
-                                    + "Enable cache-index-and-filter-blocks-with-high-priority to prioritize metadata. "
-                                    + "This changes eviction policy within the cache capacity, not the memory budget. "
-                                    + "Takes effect when creating the cache.");
-
     public static final ConfigOption<Boolean> KV_CACHE_INDEX_AND_FILTER_BLOCKS_WITH_HIGH_PRIORITY =
             key("kv.rocksdb.block.cache-index-and-filter-blocks-with-high-priority")
                     .booleanType()

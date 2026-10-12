@@ -92,17 +92,6 @@ class RocksDBResourceContainerTest {
 
     @Test
     void testInvalidMetadataOptions() {
-        for (double ratio :
-                new double[] {
-                    -0.1, 1.1, Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY
-                }) {
-            Configuration conf = new Configuration();
-            conf.set(ConfigOptions.KV_BLOCK_CACHE_HIGH_PRIORITY_POOL_RATIO, ratio);
-            assertThatThrownBy(() -> RocksDBResourceContainer.validateConfiguration(conf))
-                    .isInstanceOf(IllegalArgumentException.class)
-                    .hasMessageContaining(
-                            ConfigOptions.KV_BLOCK_CACHE_HIGH_PRIORITY_POOL_RATIO.key());
-        }
         Configuration conf = new Configuration();
         conf.set(ConfigOptions.KV_PARTITIONED_INDEX_FILTERS, true);
         conf.set(ConfigOptions.KV_USE_BLOOM_FILTER, true);
@@ -118,7 +107,6 @@ class RocksDBResourceContainerTest {
         conf.set(ConfigOptions.KV_PARTITIONED_INDEX_FILTERS, true);
         conf.set(ConfigOptions.KV_USE_BLOOM_FILTER, false);
         conf.set(ConfigOptions.KV_BLOOM_FILTER_BLOCK_BASED_MODE, true);
-        conf.set(ConfigOptions.KV_BLOCK_CACHE_HIGH_PRIORITY_POOL_RATIO, 0.0);
         try (RocksDBResourceContainer container = new RocksDBResourceContainer(conf, null)) {
             BlockBasedTableConfig table =
                     (BlockBasedTableConfig) container.getColumnOptions().tableFormatConfig();
@@ -360,15 +348,14 @@ class RocksDBResourceContainerTest {
                     (BlockBasedTableConfig) columnOptions.tableFormatConfig();
             assertThat(tableConfig.blockSize()).isEqualTo(4 * SizeUnit.KB);
             assertThat(tableConfig.metadataBlockSize()).isEqualTo(8 * SizeUnit.KB);
-            // Verify block cache was created with explicit LRUCache for memory tracking
-            assertThat(optionsContainer.getBlockCache()).isNotNull();
+            assertThat(optionsContainer.getBlockCache()).isInstanceOf(HyperClockCache.class);
             assertThat(tableConfig.filterPolicy() instanceof BloomFilter).isTrue();
         }
     }
 
     @Test
     void testCacheIndexAndFilterBlocksConfig() throws Exception {
-        // Test with default values (all false, following RocksDB defaults)
+        // Test the Fluss defaults (all false).
         Configuration defaultConfig = new Configuration();
         try (RocksDBResourceContainer container =
                 new RocksDBResourceContainer(defaultConfig, null)) {

@@ -34,9 +34,9 @@ import io.github.fluss_contrib.rocksdb.ColumnFamilyOptions;
 import io.github.fluss_contrib.rocksdb.CompactionStyle;
 import io.github.fluss_contrib.rocksdb.CompressionType;
 import io.github.fluss_contrib.rocksdb.DBOptions;
+import io.github.fluss_contrib.rocksdb.HyperClockCache;
 import io.github.fluss_contrib.rocksdb.IndexType;
 import io.github.fluss_contrib.rocksdb.InfoLogLevel;
-import io.github.fluss_contrib.rocksdb.LRUCache;
 import io.github.fluss_contrib.rocksdb.PlainTableConfig;
 import io.github.fluss_contrib.rocksdb.RateLimiter;
 import io.github.fluss_contrib.rocksdb.ReadOptions;
@@ -179,11 +179,6 @@ public class RocksDBResourceContainer implements AutoCloseable {
 
     /** Validates metadata options before allocating RocksDB resources. */
     public static void validateConfiguration(ReadableConfig configuration) {
-        double ratio = configuration.get(ConfigOptions.KV_BLOCK_CACHE_HIGH_PRIORITY_POOL_RATIO);
-        checkArgument(
-                Double.isFinite(ratio) && ratio >= 0 && ratio <= 1,
-                "%s must be finite and between 0 and 1.",
-                ConfigOptions.KV_BLOCK_CACHE_HIGH_PRIORITY_POOL_RATIO.key());
         if (isPartitioningEnabled(configuration)) {
             checkArgument(
                     configuration.get(ConfigOptions.KV_METADATA_BLOCK_SIZE).getBytes() > 0,
@@ -397,20 +392,14 @@ public class RocksDBResourceContainer implements AutoCloseable {
         blockBasedTableConfig.setMetadataBlockSize(
                 internalGetOption(ConfigOptions.KV_METADATA_BLOCK_SIZE).getBytes());
 
-        // Create explicit LRUCache for accurate memory tracking
+        // Create an explicit block cache for accurate memory tracking
         if (sharedBlockCache != null) {
             // Use shared block cache, do NOT add to handlesToClose (managed by KvManager)
             blockCache = sharedBlockCache;
             blockBasedTableConfig.setBlockCache(sharedBlockCache);
         } else {
             long blockCacheSize = internalGetOption(ConfigOptions.KV_BLOCK_CACHE_SIZE).getBytes();
-            blockCache =
-                    new LRUCache(
-                            blockCacheSize,
-                            -1,
-                            false,
-                            internalGetOption(
-                                    ConfigOptions.KV_BLOCK_CACHE_HIGH_PRIORITY_POOL_RATIO));
+            blockCache = new HyperClockCache(blockCacheSize, 0, -1, false);
             handlesToClose.add(blockCache);
             blockBasedTableConfig.setBlockCache(blockCache);
         }

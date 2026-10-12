@@ -190,11 +190,6 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
             throws IOException {
         super(TabletType.KV, localDiskManager.dataDirs(), conf, recoveryThreadsPerDataDir);
         RocksDBResourceContainer.validateConfiguration(conf);
-        if (conf.get(ConfigOptions.KV_SHARED_BLOCK_CACHE_SIZE).getBytes() == 0
-                && conf.get(ConfigOptions.KV_CACHE_INDEX_AND_FILTER_BLOCKS_WITH_HIGH_PRIORITY)
-                && conf.get(ConfigOptions.KV_BLOCK_CACHE_HIGH_PRIORITY_POOL_RATIO) == 0) {
-            LOG.warn("RocksDB metadata priority is enabled with a zero high-priority pool ratio.");
-        }
         if (conf.get(ConfigOptions.KV_PIN_L0_FILTER_AND_INDEX_BLOCKS_IN_CACHE)
                 && conf.get(ConfigOptions.KV_COMPACTION_STYLE)
                         != ConfigOptions.CompactionStyle.LEVEL) {
