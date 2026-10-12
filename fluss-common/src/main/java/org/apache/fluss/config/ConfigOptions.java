@@ -2626,7 +2626,8 @@ public class ConfigOptions {
                     .doubleType()
                     .defaultValue(0.5)
                     .withDescription(
-                            "Fraction of each shared or per-DB LRU block cache reserved for high-priority entries. "
+                            "Fraction of each per-DB LRU block cache reserved for high-priority entries. "
+                                    + "Does not apply to the shared HyperClockCache. "
                                     + "Must be finite and between 0 and 1; 0 disables the priority pool. "
                                     + "Enable cache-index-and-filter-blocks-with-high-priority to prioritize metadata. "
                                     + "This changes eviction policy within the cache capacity, not the memory budget. "

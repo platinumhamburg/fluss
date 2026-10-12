@@ -31,6 +31,7 @@ import io.github.fluss_contrib.rocksdb.CompactionStyle;
 import io.github.fluss_contrib.rocksdb.CompressionType;
 import io.github.fluss_contrib.rocksdb.DBOptions;
 import io.github.fluss_contrib.rocksdb.FlushOptions;
+import io.github.fluss_contrib.rocksdb.HyperClockCache;
 import io.github.fluss_contrib.rocksdb.IndexType;
 import io.github.fluss_contrib.rocksdb.InfoLogLevel;
 import io.github.fluss_contrib.rocksdb.LRUCache;
@@ -44,6 +45,8 @@ import io.github.fluss_contrib.rocksdb.WriteOptions;
 import io.github.fluss_contrib.rocksdb.util.SizeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.File;
 import java.nio.ByteBuffer;
@@ -129,62 +132,73 @@ class RocksDBResourceContainerTest {
                 .hasMessageContaining("must be positive");
     }
 
-    @Test
-    void testMixedSstIteratorsAfterPartitioningToggleAndCheckpoint(@TempDir Path directory)
-            throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testMixedSstIteratorsAfterPartitioningToggleAndCheckpoint(
+            boolean shared, @TempDir Path directory) throws Exception {
         String dbPath = directory.resolve("db").toString();
         String checkpointPath = directory.resolve("checkpoint").toString();
-        for (int phase = 0; phase < 3; phase++) {
-            Configuration conf = new Configuration();
-            conf.set(ConfigOptions.KV_PARTITIONED_INDEX_FILTERS, phase == 1);
-            conf.set(ConfigOptions.KV_USE_BLOOM_FILTER, true);
-            conf.set(ConfigOptions.KV_BLOCK_SIZE, MemorySize.parse("256b"));
-            conf.set(ConfigOptions.KV_METADATA_BLOCK_SIZE, MemorySize.parse("256b"));
-            try (RocksDBResourceContainer container = new RocksDBResourceContainer(conf, null);
-                    Options options =
-                            new Options(container.getDbOptions(), container.getColumnOptions())
-                                    .setDisableAutoCompactions(true);
-                    RocksDB db = RocksDB.open(options, phase == 2 ? checkpointPath : dbPath)) {
-                if (phase < 2) {
-                    for (int i = phase * 1000; i < (phase + 1) * 1000; i++) {
-                        byte[] key = intKey(i);
-                        db.put(key, key);
+        try (Cache sharedCache =
+                shared ? new HyperClockCache(64 * SizeUnit.MB, 0, -1, false) : null) {
+            for (int phase = 0; phase < 3; phase++) {
+                Configuration conf = new Configuration();
+                conf.set(ConfigOptions.KV_PARTITIONED_INDEX_FILTERS, phase == 1);
+                conf.set(ConfigOptions.KV_USE_BLOOM_FILTER, true);
+                conf.set(ConfigOptions.KV_BLOCK_SIZE, MemorySize.parse("256b"));
+                conf.set(ConfigOptions.KV_METADATA_BLOCK_SIZE, MemorySize.parse("256b"));
+                try (RocksDBResourceContainer container =
+                                new RocksDBResourceContainer(
+                                        conf,
+                                        null,
+                                        false,
+                                        KvManager.getDefaultRateLimiter(),
+                                        sharedCache);
+                        Options options =
+                                new Options(container.getDbOptions(), container.getColumnOptions())
+                                        .setDisableAutoCompactions(true);
+                        RocksDB db = RocksDB.open(options, phase == 2 ? checkpointPath : dbPath)) {
+                    if (phase < 2) {
+                        for (int i = phase * 1000; i < (phase + 1) * 1000; i++) {
+                            byte[] key = intKey(i);
+                            db.put(key, key);
+                        }
+                        try (FlushOptions flush = new FlushOptions().setWaitForFlush(true)) {
+                            db.flush(flush);
+                        }
                     }
-                    try (FlushOptions flush = new FlushOptions().setWaitForFlush(true)) {
-                        db.flush(flush);
-                    }
-                }
-                int count = phase == 0 ? 1000 : 2000;
-                for (int i = 0; i < count; i++) {
-                    assertThat(db.get(intKey(i))).isEqualTo(intKey(i));
-                }
-                try (RocksIterator iterator = db.newIterator()) {
-                    iterator.seekToFirst();
+                    int count = phase == 0 ? 1000 : 2000;
                     for (int i = 0; i < count; i++) {
-                        assertThat(iterator.isValid()).isTrue();
-                        assertThat(iterator.key()).isEqualTo(intKey(i));
-                        assertThat(iterator.value()).isEqualTo(intKey(i));
-                        iterator.next();
+                        assertThat(db.get(intKey(i))).isEqualTo(intKey(i));
                     }
-                    assertThat(iterator.isValid()).isFalse();
-                    iterator.seek(intKey(750));
-                    assertThat(iterator.key()).isEqualTo(intKey(750));
-                    iterator.prev();
-                    assertThat(iterator.key()).isEqualTo(intKey(749));
-                    iterator.status();
-                }
-                if (phase == 1) {
-                    assertThat(db.getPropertiesOfAllTables()).hasSize(2);
-                    assertThat(db.getPropertiesOfAllTables().values())
-                            .anySatisfy(
-                                    properties ->
-                                            assertThat(properties.getIndexPartitions()).isZero())
-                            .anySatisfy(
-                                    properties ->
-                                            assertThat(properties.getIndexPartitions())
-                                                    .isGreaterThan(1));
-                    try (Checkpoint checkpoint = Checkpoint.create(db)) {
-                        checkpoint.createCheckpoint(checkpointPath);
+                    try (RocksIterator iterator = db.newIterator()) {
+                        iterator.seekToFirst();
+                        for (int i = 0; i < count; i++) {
+                            assertThat(iterator.isValid()).isTrue();
+                            assertThat(iterator.key()).isEqualTo(intKey(i));
+                            assertThat(iterator.value()).isEqualTo(intKey(i));
+                            iterator.next();
+                        }
+                        assertThat(iterator.isValid()).isFalse();
+                        iterator.seek(intKey(750));
+                        assertThat(iterator.key()).isEqualTo(intKey(750));
+                        iterator.prev();
+                        assertThat(iterator.key()).isEqualTo(intKey(749));
+                        iterator.status();
+                    }
+                    if (phase == 1) {
+                        assertThat(db.getPropertiesOfAllTables()).hasSize(2);
+                        assertThat(db.getPropertiesOfAllTables().values())
+                                .anySatisfy(
+                                        properties ->
+                                                assertThat(properties.getIndexPartitions())
+                                                        .isZero())
+                                .anySatisfy(
+                                        properties ->
+                                                assertThat(properties.getIndexPartitions())
+                                                        .isGreaterThan(1));
+                        try (Checkpoint checkpoint = Checkpoint.create(db)) {
+                            checkpoint.createCheckpoint(checkpointPath);
+                        }
                     }
                 }
             }
@@ -399,7 +413,7 @@ class RocksDBResourceContainerTest {
         byte[] secondKey = new byte[] {2};
         byte[] secondValue = new byte[4096];
 
-        try (Cache sharedCache = new LRUCache(64 * SizeUnit.MB);
+        try (Cache sharedCache = new HyperClockCache(64 * SizeUnit.MB, 0, -1, false);
                 RocksDBKv firstKv =
                         buildRocksDBKvWithSharedCache(
                                 tempDir.resolve("first").toFile(), sharedCache);

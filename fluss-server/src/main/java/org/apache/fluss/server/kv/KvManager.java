@@ -56,6 +56,7 @@ import org.apache.fluss.utils.function.SupplierWithException;
 import org.apache.fluss.utils.types.Tuple2;
 
 import io.github.fluss_contrib.rocksdb.Cache;
+import io.github.fluss_contrib.rocksdb.HyperClockCache;
 import io.github.fluss_contrib.rocksdb.LRUCache;
 import io.github.fluss_contrib.rocksdb.RateLimiter;
 import io.github.fluss_contrib.rocksdb.RateLimiterMode;
@@ -189,7 +190,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
             throws IOException {
         super(TabletType.KV, localDiskManager.dataDirs(), conf, recoveryThreadsPerDataDir);
         RocksDBResourceContainer.validateConfiguration(conf);
-        if (conf.get(ConfigOptions.KV_CACHE_INDEX_AND_FILTER_BLOCKS_WITH_HIGH_PRIORITY)
+        if (conf.get(ConfigOptions.KV_SHARED_BLOCK_CACHE_SIZE).getBytes() == 0
+                && conf.get(ConfigOptions.KV_CACHE_INDEX_AND_FILTER_BLOCKS_WITH_HIGH_PRIORITY)
                 && conf.get(ConfigOptions.KV_BLOCK_CACHE_HIGH_PRIORITY_POOL_RATIO) == 0) {
             LOG.warn("RocksDB metadata priority is enabled with a zero high-priority pool ratio.");
         }
@@ -281,11 +283,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
             return null;
         }
         RocksDB.loadLibrary();
-        return new LRUCache(
-                sharedBlockCacheSize,
-                -1,
-                false,
-                conf.get(ConfigOptions.KV_BLOCK_CACHE_HIGH_PRIORITY_POOL_RATIO));
+        // Let HyperClockCache size its table automatically and choose its default shard count.
+        return new HyperClockCache(sharedBlockCacheSize, 0, -1, false);
     }
 
     public static KvManager create(

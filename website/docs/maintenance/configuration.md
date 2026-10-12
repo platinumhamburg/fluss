@@ -275,17 +275,18 @@ kv.rocksdb.block.pin-l0-filter-and-index-blocks-in-cache: true
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `kv.rocksdb.block.partitioned-index-filters` | Boolean | Follows `kv.rocksdb.block.cache-index-and-filter-blocks` | Enables two-level indexes and partitions full filters when Bloom filters are enabled. Explicit `false` disables partitioning for newly generated SSTs. Requires positive `metadata-blocksize` and full filters when Bloom filters are enabled. |
-| `kv.rocksdb.block.cache-high-priority-pool-ratio` | Double | `0.5` | Fraction of the shared or per-DB LRU block cache reserved for high-priority entries. Accepts finite values in `[0, 1]`; `0` disables the priority pool. Does not change cache capacity. |
+| `kv.rocksdb.block.cache-high-priority-pool-ratio` | Double | `0.5` | Fraction of the per-DB LRU block cache reserved for high-priority entries. Does not apply to the shared HyperClockCache. Accepts finite values in `[0, 1]`; `0` disables the priority pool. Does not change cache capacity. |
 
 Partitioning reduces the amount of metadata read, checksummed, and decompressed on a cache miss.
-Cache priority and sufficient capacity can reduce miss frequency. Tune the pool ratio against the
+Cache priority and sufficient capacity can reduce miss frequency. Shared block caches use AutoHCC,
+which does not have an LRU priority pool. For per-DB LRU caches, tune the pool ratio against the
 metadata and data working sets; the example does not guarantee sufficient memory or faster reads
 for every workload. Leave L0 pinning disabled for non-LEVEL compaction.
 
 Metadata caching, metadata priority, and both pinning options default to `false` independently.
 Enabling metadata caching without a partitioning override enables partitioning for new SSTs, but
-does not enable priority or pinning. To retain the previous layout and replacement policy, set
-partitioning explicitly to `false` and the pool ratio to `0`.
+does not enable priority or pinning. To retain the unpartitioned layout, set partitioning explicitly
+to `false`. For per-DB LRU caches, set the pool ratio to `0` to retain their previous replacement policy.
 
 Partition blocks use the block cache even with metadata caching disabled; in that case the caching
 switch controls top-level metadata placement. Budget for metadata when moving it into the cache.
