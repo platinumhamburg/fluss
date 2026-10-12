@@ -46,13 +46,15 @@ import io.github.fluss_contrib.rocksdb.util.SizeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -96,9 +98,26 @@ class RocksDBResourceContainerTest {
         conf.set(ConfigOptions.KV_PARTITIONED_INDEX_FILTERS, true);
         conf.set(ConfigOptions.KV_USE_BLOOM_FILTER, true);
         conf.set(ConfigOptions.KV_BLOOM_FILTER_BLOCK_BASED_MODE, true);
-        assertThatThrownBy(() -> RocksDBResourceContainer.validateConfiguration(conf))
+        assertThatThrownBy(
+                        () -> {
+                            try (RocksDBResourceContainer ignored =
+                                    new RocksDBResourceContainer(conf, null)) {
+                                // The constructor must reject invalid options.
+                            }
+                        })
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("full Bloom filters");
+        conf.set(ConfigOptions.KV_BLOOM_FILTER_BLOCK_BASED_MODE, false);
+        conf.set(ConfigOptions.KV_METADATA_BLOCK_SIZE, MemorySize.ZERO);
+        assertThatThrownBy(
+                        () -> {
+                            try (RocksDBResourceContainer ignored =
+                                    new RocksDBResourceContainer(conf, null)) {
+                                // The constructor must reject invalid options.
+                            }
+                        })
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must be positive");
     }
 
     @Test
@@ -114,16 +133,12 @@ class RocksDBResourceContainerTest {
             assertThat(table.partitionFilters()).isFalse();
             assertThat(table.filterPolicy()).isNull();
         }
-        conf.set(ConfigOptions.KV_METADATA_BLOCK_SIZE, MemorySize.ZERO);
-        assertThatThrownBy(() -> RocksDBResourceContainer.validateConfiguration(conf))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("must be positive");
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
+    @CsvSource({"false, false", "true, true"})
     void testMixedSstIteratorsAfterPartitioningToggleAndCheckpoint(
-            boolean shared, @TempDir Path directory) throws Exception {
+            boolean shared, boolean cacheMetadata, @TempDir Path directory) throws Exception {
         String dbPath = directory.resolve("db").toString();
         String checkpointPath = directory.resolve("checkpoint").toString();
         try (Cache sharedCache =
@@ -131,6 +146,7 @@ class RocksDBResourceContainerTest {
             for (int phase = 0; phase < 3; phase++) {
                 Configuration conf = new Configuration();
                 conf.set(ConfigOptions.KV_PARTITIONED_INDEX_FILTERS, phase == 1);
+                conf.set(ConfigOptions.KV_CACHE_INDEX_AND_FILTER_BLOCKS, cacheMetadata);
                 conf.set(ConfigOptions.KV_USE_BLOOM_FILTER, true);
                 conf.set(ConfigOptions.KV_BLOCK_SIZE, MemorySize.parse("256b"));
                 conf.set(ConfigOptions.KV_METADATA_BLOCK_SIZE, MemorySize.parse("256b"));
@@ -145,16 +161,31 @@ class RocksDBResourceContainerTest {
                                 new Options(container.getDbOptions(), container.getColumnOptions())
                                         .setDisableAutoCompactions(true);
                         RocksDB db = RocksDB.open(options, phase == 2 ? checkpointPath : dbPath)) {
-                    if (phase < 2) {
-                        for (int i = phase * 1000; i < (phase + 1) * 1000; i++) {
-                            byte[] key = intKey(i);
-                            db.put(key, key);
-                        }
-                        try (FlushOptions flush = new FlushOptions().setWaitForFlush(true)) {
-                            db.flush(flush);
-                        }
+                    Set<String> existingSstFiles =
+                            new HashSet<>(db.getPropertiesOfAllTables().keySet());
+                    for (int i = phase * 1000; i < (phase + 1) * 1000; i++) {
+                        byte[] key = intKey(i);
+                        db.put(key, key);
                     }
-                    int count = phase == 0 ? 1000 : 2000;
+                    try (FlushOptions flush = new FlushOptions().setWaitForFlush(true)) {
+                        db.flush(flush);
+                    }
+                    boolean partitioned = phase == 1;
+                    assertThat(db.getPropertiesOfAllTables().entrySet())
+                            .filteredOn(entry -> !existingSstFiles.contains(entry.getKey()))
+                            .singleElement()
+                            .satisfies(
+                                    entry -> {
+                                        if (partitioned) {
+                                            assertThat(entry.getValue().getIndexPartitions())
+                                                    .isGreaterThan(1);
+                                        } else {
+                                            assertThat(entry.getValue().getIndexPartitions())
+                                                    .isZero();
+                                        }
+                                    });
+                    assertThat(db.getPropertiesOfAllTables()).hasSize(phase + 1);
+                    int count = (phase + 1) * 1000;
                     for (int i = 0; i < count; i++) {
                         assertThat(db.get(intKey(i))).isEqualTo(intKey(i));
                     }
@@ -167,23 +198,28 @@ class RocksDBResourceContainerTest {
                             iterator.next();
                         }
                         assertThat(iterator.isValid()).isFalse();
+                        iterator.status();
                         iterator.seek(intKey(750));
                         assertThat(iterator.key()).isEqualTo(intKey(750));
                         iterator.prev();
                         assertThat(iterator.key()).isEqualTo(intKey(749));
+                        if (phase > 0) {
+                            iterator.seek(intKey(1750));
+                            assertThat(iterator.isValid()).isTrue();
+                            assertThat(iterator.key()).isEqualTo(intKey(1750));
+                            iterator.prev();
+                            assertThat(iterator.isValid()).isTrue();
+                            assertThat(iterator.key()).isEqualTo(intKey(1749));
+                            iterator.seek(intKey(1000));
+                            assertThat(iterator.isValid()).isTrue();
+                            assertThat(iterator.key()).isEqualTo(intKey(1000));
+                            iterator.prev();
+                            assertThat(iterator.isValid()).isTrue();
+                            assertThat(iterator.key()).isEqualTo(intKey(999));
+                        }
                         iterator.status();
                     }
                     if (phase == 1) {
-                        assertThat(db.getPropertiesOfAllTables()).hasSize(2);
-                        assertThat(db.getPropertiesOfAllTables().values())
-                                .anySatisfy(
-                                        properties ->
-                                                assertThat(properties.getIndexPartitions())
-                                                        .isZero())
-                                .anySatisfy(
-                                        properties ->
-                                                assertThat(properties.getIndexPartitions())
-                                                        .isGreaterThan(1));
                         try (Checkpoint checkpoint = Checkpoint.create(db)) {
                             checkpoint.createCheckpoint(checkpointPath);
                         }
