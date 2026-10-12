@@ -179,7 +179,7 @@ public class RocksDBResourceContainer implements AutoCloseable {
 
     /** Validates metadata options before allocating RocksDB resources. */
     public static void validateConfiguration(ReadableConfig configuration) {
-        if (isPartitioningEnabled(configuration)) {
+        if (configuration.get(ConfigOptions.KV_PARTITIONED_INDEX_FILTERS)) {
             checkArgument(
                     configuration.get(ConfigOptions.KV_METADATA_BLOCK_SIZE).getBytes() > 0,
                     "%s must be positive when partitioning is enabled.",
@@ -191,12 +191,6 @@ public class RocksDBResourceContainer implements AutoCloseable {
                     ConfigOptions.KV_PARTITIONED_INDEX_FILTERS.key(),
                     ConfigOptions.KV_BLOOM_FILTER_BLOCK_BASED_MODE.key());
         }
-    }
-
-    private static boolean isPartitioningEnabled(ReadableConfig configuration) {
-        return configuration
-                .getOptional(ConfigOptions.KV_PARTITIONED_INDEX_FILTERS)
-                .orElse(configuration.get(ConfigOptions.KV_CACHE_INDEX_AND_FILTER_BLOCKS));
     }
 
     /** Gets the RocksDB {@link DBOptions} to be used for RocksDB instances. */
@@ -404,7 +398,7 @@ public class RocksDBResourceContainer implements AutoCloseable {
             blockBasedTableConfig.setBlockCache(blockCache);
         }
 
-        boolean partitioning = isPartitioningEnabled(configuration);
+        boolean partitioning = configuration.get(ConfigOptions.KV_PARTITIONED_INDEX_FILTERS);
         blockBasedTableConfig.setIndexType(
                 partitioning ? IndexType.kTwoLevelIndexSearch : IndexType.kBinarySearch);
         blockBasedTableConfig.setPartitionFilters(

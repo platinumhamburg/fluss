@@ -75,7 +75,7 @@ class RocksDBResourceContainerTest {
                     BlockBasedTableConfig table =
                             (BlockBasedTableConfig)
                                     container.getColumnOptions().tableFormatConfig();
-                    boolean enabled = partitioning == null ? caching : partitioning;
+                    boolean enabled = Boolean.TRUE.equals(partitioning);
                     assertThat(table.indexType())
                             .isEqualTo(
                                     enabled

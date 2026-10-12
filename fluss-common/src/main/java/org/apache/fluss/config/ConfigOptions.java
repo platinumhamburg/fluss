@@ -19,7 +19,6 @@ package org.apache.fluss.config;
 
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.annotation.PublicEvolving;
-import org.apache.fluss.annotation.docs.ConfigOverrideDefault;
 import org.apache.fluss.compression.ArrowCompressionType;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DataLakeFormat;
@@ -2608,14 +2607,12 @@ public class ConfigOptions {
                                     + "so that the total memory used by RocksDB is bounded by block cache size. "
                                     + "The default value is `false`.");
 
-    @ConfigOverrideDefault("Follows kv.rocksdb.block.cache-index-and-filter-blocks")
     public static final ConfigOption<Boolean> KV_PARTITIONED_INDEX_FILTERS =
             key("kv.rocksdb.block.partitioned-index-filters")
                     .booleanType()
-                    .noDefaultValue()
+                    .defaultValue(false)
                     .withDescription(
                             "Enable partitioned indexes and, when Bloom filters are enabled, partitioned full filters. "
-                                    + "When unset, follows kv.rocksdb.block.cache-index-and-filter-blocks. "
                                     + "Requires full filters and a positive metadata-blocksize. Only newly generated SSTs "
                                     + "use this format; existing SSTs remain readable when this option is enabled or disabled. "
                                     + "Partitions use the block cache even when metadata caching is disabled. "
