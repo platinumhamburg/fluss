@@ -34,6 +34,7 @@ import io.github.fluss_contrib.rocksdb.ColumnFamilyOptions;
 import io.github.fluss_contrib.rocksdb.CompactionStyle;
 import io.github.fluss_contrib.rocksdb.CompressionType;
 import io.github.fluss_contrib.rocksdb.DBOptions;
+import io.github.fluss_contrib.rocksdb.IndexType;
 import io.github.fluss_contrib.rocksdb.InfoLogLevel;
 import io.github.fluss_contrib.rocksdb.LRUCache;
 import io.github.fluss_contrib.rocksdb.PlainTableConfig;
@@ -54,6 +55,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 
+import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /* This file is based on source code of Apache Flink Project (https://flink.apache.org/), licensed by the Apache
@@ -159,6 +161,7 @@ public class RocksDBResourceContainer implements AutoCloseable {
             RateLimiter sharedRateLimiter,
             @Nullable Cache sharedBlockCache,
             @Nullable WriteBufferManager sharedWriteBufferManager) {
+        validateConfiguration(configuration);
         this.configuration = configuration;
 
         this.instanceRocksDBPath =
@@ -172,6 +175,33 @@ public class RocksDBResourceContainer implements AutoCloseable {
         this.sharedWriteBufferManager = sharedWriteBufferManager;
 
         this.handlesToClose = new ArrayList<>();
+    }
+
+    /** Validates metadata options before allocating RocksDB resources. */
+    public static void validateConfiguration(ReadableConfig configuration) {
+        double ratio = configuration.get(ConfigOptions.KV_BLOCK_CACHE_HIGH_PRIORITY_POOL_RATIO);
+        checkArgument(
+                Double.isFinite(ratio) && ratio >= 0 && ratio <= 1,
+                "%s must be finite and between 0 and 1.",
+                ConfigOptions.KV_BLOCK_CACHE_HIGH_PRIORITY_POOL_RATIO.key());
+        if (isPartitioningEnabled(configuration)) {
+            checkArgument(
+                    configuration.get(ConfigOptions.KV_METADATA_BLOCK_SIZE).getBytes() > 0,
+                    "%s must be positive when partitioning is enabled.",
+                    ConfigOptions.KV_METADATA_BLOCK_SIZE.key());
+            checkArgument(
+                    !configuration.get(ConfigOptions.KV_USE_BLOOM_FILTER)
+                            || !configuration.get(ConfigOptions.KV_BLOOM_FILTER_BLOCK_BASED_MODE),
+                    "%s requires full Bloom filters; disable %s.",
+                    ConfigOptions.KV_PARTITIONED_INDEX_FILTERS.key(),
+                    ConfigOptions.KV_BLOOM_FILTER_BLOCK_BASED_MODE.key());
+        }
+    }
+
+    private static boolean isPartitioningEnabled(ReadableConfig configuration) {
+        return configuration
+                .getOptional(ConfigOptions.KV_PARTITIONED_INDEX_FILTERS)
+                .orElse(configuration.get(ConfigOptions.KV_CACHE_INDEX_AND_FILTER_BLOCKS));
     }
 
     /** Gets the RocksDB {@link DBOptions} to be used for RocksDB instances. */
@@ -374,10 +404,22 @@ public class RocksDBResourceContainer implements AutoCloseable {
             blockBasedTableConfig.setBlockCache(sharedBlockCache);
         } else {
             long blockCacheSize = internalGetOption(ConfigOptions.KV_BLOCK_CACHE_SIZE).getBytes();
-            blockCache = new LRUCache(blockCacheSize);
+            blockCache =
+                    new LRUCache(
+                            blockCacheSize,
+                            -1,
+                            false,
+                            internalGetOption(
+                                    ConfigOptions.KV_BLOCK_CACHE_HIGH_PRIORITY_POOL_RATIO));
             handlesToClose.add(blockCache);
             blockBasedTableConfig.setBlockCache(blockCache);
         }
+
+        boolean partitioning = isPartitioningEnabled(configuration);
+        blockBasedTableConfig.setIndexType(
+                partitioning ? IndexType.kTwoLevelIndexSearch : IndexType.kBinarySearch);
+        blockBasedTableConfig.setPartitionFilters(
+                partitioning && internalGetOption(ConfigOptions.KV_USE_BLOOM_FILTER));
 
         // Configure index and filter blocks caching
         blockBasedTableConfig.setCacheIndexAndFilterBlocks(

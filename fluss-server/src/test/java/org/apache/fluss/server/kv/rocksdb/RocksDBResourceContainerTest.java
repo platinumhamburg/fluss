@@ -19,20 +19,26 @@ package org.apache.fluss.server.kv.rocksdb;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.server.kv.KvManager;
 
 import io.github.fluss_contrib.rocksdb.BlockBasedTableConfig;
 import io.github.fluss_contrib.rocksdb.BloomFilter;
 import io.github.fluss_contrib.rocksdb.Cache;
+import io.github.fluss_contrib.rocksdb.Checkpoint;
 import io.github.fluss_contrib.rocksdb.ColumnFamilyOptions;
 import io.github.fluss_contrib.rocksdb.CompactionStyle;
 import io.github.fluss_contrib.rocksdb.CompressionType;
 import io.github.fluss_contrib.rocksdb.DBOptions;
 import io.github.fluss_contrib.rocksdb.FlushOptions;
+import io.github.fluss_contrib.rocksdb.IndexType;
 import io.github.fluss_contrib.rocksdb.InfoLogLevel;
 import io.github.fluss_contrib.rocksdb.LRUCache;
+import io.github.fluss_contrib.rocksdb.Options;
 import io.github.fluss_contrib.rocksdb.RateLimiter;
 import io.github.fluss_contrib.rocksdb.ReadOptions;
+import io.github.fluss_contrib.rocksdb.RocksDB;
+import io.github.fluss_contrib.rocksdb.RocksIterator;
 import io.github.fluss_contrib.rocksdb.WriteBufferManager;
 import io.github.fluss_contrib.rocksdb.WriteOptions;
 import io.github.fluss_contrib.rocksdb.util.SizeUnit;
@@ -40,14 +46,154 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests to guard {@link org.apache.fluss.server.kv.rocksdb.RocksDBResourceContainer}. */
 class RocksDBResourceContainerTest {
+
+    @Test
+    void testPartitioningDefaultsAndOverrides() throws Exception {
+        for (boolean caching : new boolean[] {false, true}) {
+            for (Boolean partitioning : new Boolean[] {null, false, true}) {
+                Configuration conf = new Configuration();
+                conf.set(ConfigOptions.KV_CACHE_INDEX_AND_FILTER_BLOCKS, caching);
+                conf.set(ConfigOptions.KV_USE_BLOOM_FILTER, true);
+                if (partitioning != null) {
+                    conf.set(ConfigOptions.KV_PARTITIONED_INDEX_FILTERS, partitioning);
+                }
+                try (RocksDBResourceContainer container =
+                        new RocksDBResourceContainer(conf, null)) {
+                    BlockBasedTableConfig table =
+                            (BlockBasedTableConfig)
+                                    container.getColumnOptions().tableFormatConfig();
+                    boolean enabled = partitioning == null ? caching : partitioning;
+                    assertThat(table.indexType())
+                            .isEqualTo(
+                                    enabled
+                                            ? IndexType.kTwoLevelIndexSearch
+                                            : IndexType.kBinarySearch);
+                    assertThat(table.partitionFilters()).isEqualTo(enabled);
+                    assertThat(table.cacheIndexAndFilterBlocksWithHighPriority()).isFalse();
+                    assertThat(table.pinTopLevelIndexAndFilter()).isFalse();
+                    assertThat(table.pinL0FilterAndIndexBlocksInCache()).isFalse();
+                }
+            }
+        }
+    }
+
+    @Test
+    void testInvalidMetadataOptions() {
+        for (double ratio :
+                new double[] {
+                    -0.1, 1.1, Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY
+                }) {
+            Configuration conf = new Configuration();
+            conf.set(ConfigOptions.KV_BLOCK_CACHE_HIGH_PRIORITY_POOL_RATIO, ratio);
+            assertThatThrownBy(() -> RocksDBResourceContainer.validateConfiguration(conf))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining(
+                            ConfigOptions.KV_BLOCK_CACHE_HIGH_PRIORITY_POOL_RATIO.key());
+        }
+        Configuration conf = new Configuration();
+        conf.set(ConfigOptions.KV_PARTITIONED_INDEX_FILTERS, true);
+        conf.set(ConfigOptions.KV_USE_BLOOM_FILTER, true);
+        conf.set(ConfigOptions.KV_BLOOM_FILTER_BLOCK_BASED_MODE, true);
+        assertThatThrownBy(() -> RocksDBResourceContainer.validateConfiguration(conf))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("full Bloom filters");
+    }
+
+    @Test
+    void testPartitionedIndexWithoutBloomFilter() throws Exception {
+        Configuration conf = new Configuration();
+        conf.set(ConfigOptions.KV_PARTITIONED_INDEX_FILTERS, true);
+        conf.set(ConfigOptions.KV_USE_BLOOM_FILTER, false);
+        conf.set(ConfigOptions.KV_BLOOM_FILTER_BLOCK_BASED_MODE, true);
+        conf.set(ConfigOptions.KV_BLOCK_CACHE_HIGH_PRIORITY_POOL_RATIO, 0.0);
+        try (RocksDBResourceContainer container = new RocksDBResourceContainer(conf, null)) {
+            BlockBasedTableConfig table =
+                    (BlockBasedTableConfig) container.getColumnOptions().tableFormatConfig();
+            assertThat(table.indexType()).isEqualTo(IndexType.kTwoLevelIndexSearch);
+            assertThat(table.partitionFilters()).isFalse();
+            assertThat(table.filterPolicy()).isNull();
+        }
+        conf.set(ConfigOptions.KV_METADATA_BLOCK_SIZE, MemorySize.ZERO);
+        assertThatThrownBy(() -> RocksDBResourceContainer.validateConfiguration(conf))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("must be positive");
+    }
+
+    @Test
+    void testMixedSstIteratorsAfterPartitioningToggleAndCheckpoint(@TempDir Path directory)
+            throws Exception {
+        String dbPath = directory.resolve("db").toString();
+        String checkpointPath = directory.resolve("checkpoint").toString();
+        for (int phase = 0; phase < 3; phase++) {
+            Configuration conf = new Configuration();
+            conf.set(ConfigOptions.KV_PARTITIONED_INDEX_FILTERS, phase == 1);
+            conf.set(ConfigOptions.KV_USE_BLOOM_FILTER, true);
+            conf.set(ConfigOptions.KV_BLOCK_SIZE, MemorySize.parse("256b"));
+            conf.set(ConfigOptions.KV_METADATA_BLOCK_SIZE, MemorySize.parse("256b"));
+            try (RocksDBResourceContainer container = new RocksDBResourceContainer(conf, null);
+                    Options options =
+                            new Options(container.getDbOptions(), container.getColumnOptions())
+                                    .setDisableAutoCompactions(true);
+                    RocksDB db = RocksDB.open(options, phase == 2 ? checkpointPath : dbPath)) {
+                if (phase < 2) {
+                    for (int i = phase * 1000; i < (phase + 1) * 1000; i++) {
+                        byte[] key = intKey(i);
+                        db.put(key, key);
+                    }
+                    try (FlushOptions flush = new FlushOptions().setWaitForFlush(true)) {
+                        db.flush(flush);
+                    }
+                }
+                int count = phase == 0 ? 1000 : 2000;
+                for (int i = 0; i < count; i++) {
+                    assertThat(db.get(intKey(i))).isEqualTo(intKey(i));
+                }
+                try (RocksIterator iterator = db.newIterator()) {
+                    iterator.seekToFirst();
+                    for (int i = 0; i < count; i++) {
+                        assertThat(iterator.isValid()).isTrue();
+                        assertThat(iterator.key()).isEqualTo(intKey(i));
+                        assertThat(iterator.value()).isEqualTo(intKey(i));
+                        iterator.next();
+                    }
+                    assertThat(iterator.isValid()).isFalse();
+                    iterator.seek(intKey(750));
+                    assertThat(iterator.key()).isEqualTo(intKey(750));
+                    iterator.prev();
+                    assertThat(iterator.key()).isEqualTo(intKey(749));
+                    iterator.status();
+                }
+                if (phase == 1) {
+                    assertThat(db.getPropertiesOfAllTables()).hasSize(2);
+                    assertThat(db.getPropertiesOfAllTables().values())
+                            .anySatisfy(
+                                    properties ->
+                                            assertThat(properties.getIndexPartitions()).isZero())
+                            .anySatisfy(
+                                    properties ->
+                                            assertThat(properties.getIndexPartitions())
+                                                    .isGreaterThan(1));
+                    try (Checkpoint checkpoint = Checkpoint.create(db)) {
+                        checkpoint.createCheckpoint(checkpointPath);
+                    }
+                }
+            }
+        }
+    }
+
+    private static byte[] intKey(int value) {
+        return ByteBuffer.allocate(4).putInt(value).array();
+    }
 
     @Test
     void testFreeDBOptionsAfterClose() throws Exception {

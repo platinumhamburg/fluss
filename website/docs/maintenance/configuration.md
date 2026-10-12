@@ -256,3 +256,47 @@ Kafka protocol compatibility is still in development.
 | kafka.listener.names           | String   | KAFKA   | The listener names for Kafka wire protocol communication. Support multiple listener names, separated by comma.     |
 | kafka.database                 | String   | kafka   | The database for Fluss Kafka. The default database is `kafka`.                                                     |
 | kafka.connection.max-idle-time | Duration | 60s     | Close kafka idle connections after the given time specified by this config.                                        |
+
+
+## RocksDB metadata cache tuning
+
+The following initialization settings enable partitioned indexes and full Bloom filters, with
+metadata priority and pinning for LEVEL compaction:
+
+```yaml
+kv.rocksdb.block.cache-index-and-filter-blocks: true
+kv.rocksdb.block.partitioned-index-filters: true
+kv.rocksdb.block.cache-high-priority-pool-ratio: 0.5
+kv.rocksdb.block.cache-index-and-filter-blocks-with-high-priority: true
+kv.rocksdb.block.pin-top-level-index-and-filter: true
+kv.rocksdb.block.pin-l0-filter-and-index-blocks-in-cache: true
+```
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `kv.rocksdb.block.partitioned-index-filters` | Boolean | Follows `kv.rocksdb.block.cache-index-and-filter-blocks` | Enables two-level indexes and partitions full filters when Bloom filters are enabled. Explicit `false` disables partitioning for newly generated SSTs. Requires positive `metadata-blocksize` and full filters when Bloom filters are enabled. |
+| `kv.rocksdb.block.cache-high-priority-pool-ratio` | Double | `0.5` | Fraction of the shared or per-DB LRU block cache reserved for high-priority entries. Accepts finite values in `[0, 1]`; `0` disables the priority pool. Does not change cache capacity. |
+
+Partitioning reduces the amount of metadata read, checksummed, and decompressed on a cache miss.
+Cache priority and sufficient capacity can reduce miss frequency. Tune the pool ratio against the
+metadata and data working sets; the example does not guarantee sufficient memory or faster reads
+for every workload. Leave L0 pinning disabled for non-LEVEL compaction.
+
+Metadata caching, metadata priority, and both pinning options default to `false` independently.
+Enabling metadata caching without a partitioning override enables partitioning for new SSTs, but
+does not enable priority or pinning. To retain the previous layout and replacement policy, set
+partitioning explicitly to `false` and the pool ratio to `0`.
+
+Partition blocks use the block cache even with metadata caching disabled; in that case the caching
+switch controls top-level metadata placement. Budget for metadata when moving it into the cache.
+Pinned blocks reduce reclaimable space and may exceed nominal capacity under the existing
+non-strict capacity policy. Block cache capacity does not bound total RocksDB or process memory.
+
+These options apply when opening DBs or creating caches, not through live reconfiguration.
+Existing SSTs retain their format until compaction rewrites them. Ordinary and partitioned SSTs
+can coexist and remain readable when partitioning is disabled. Disabling partitioning does not
+immediately restore the previous metadata cache behavior for existing partitioned SSTs. No manual
+compaction or data migration is triggered automatically.
+
+See the RocksDB [partitioned index/filter guidance](https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters)
+and [block cache guidance](https://github.com/facebook/rocksdb/wiki/Block-Cache).
