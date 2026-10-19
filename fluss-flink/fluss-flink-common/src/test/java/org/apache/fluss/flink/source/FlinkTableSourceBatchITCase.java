@@ -21,6 +21,7 @@ import org.apache.fluss.client.table.Table;
 import org.apache.fluss.client.table.writer.AppendWriter;
 import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.flink.utils.FlinkTestBase;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericArray;
@@ -271,6 +272,19 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
                 partitionTable
                         ? prepareSourceTable(new String[] {"id", "dt"}, "dt")
                         : prepareSourceTable(new String[] {"id", "name"}, null);
+        if (partitionTable) {
+            TablePath tablePath = TablePath.of(databaseName, tableName);
+            long tableId =
+                    FLUSS_CLUSTER_EXTENSION.getZooKeeperClient().getTable(tablePath).get().tableId;
+            for (long partitionId :
+                    waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath)
+                            .keySet()) {
+                for (int bucket = 0; bucket < 4; bucket++) {
+                    FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(
+                            new TableBucket(tableId, partitionId, bucket));
+                }
+            }
+        }
         String query = String.format("SELECT * FROM %s", tableName);
 
         CloseableIterator<Row> collected = tEnv.executeSql(query).collect();
