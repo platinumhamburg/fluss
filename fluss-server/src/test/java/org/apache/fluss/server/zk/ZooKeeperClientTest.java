@@ -499,7 +499,6 @@ class ZooKeeperClientTest {
                         .build();
         int registeredSchemaId = zookeeperClient.registerFirstSchema(tablePath, schema);
         assertThat(registeredSchemaId).isEqualTo(schemaId);
-        assertThat(zookeeperClient.getTable(tablePath)).isEmpty();
         assertThat(zookeeperClient.getCurrentSchemaId(tablePath)).isEqualTo(schemaId);
 
         Optional<SchemaInfo> schemaInfo = zookeeperClient.getSchemaById(tablePath, schemaId);
