@@ -49,6 +49,7 @@ import org.apache.fluss.server.replica.ReplicaManager;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.server.utils.ResourceGuard;
 import org.apache.fluss.server.zk.ZkSequenceIDCounter;
+import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.ZkData;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.FlussPaths;
@@ -81,7 +82,7 @@ import static org.apache.fluss.testutils.DataTestUtils.toKvRecordBatch;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Registration, recovery and replication from an externally produced KV snapshot. */
+/** Recovery and replication from an externally produced KV snapshot. */
 class ExternalKvSnapshotITCase {
 
     @RegisterExtension public final RocksDBExtension rocksDB = new RocksDBExtension();
@@ -125,16 +126,13 @@ class ExternalKvSnapshotITCase {
             long boundary = 10_017L;
             CompletedSnapshotHandle external =
                     produceSnapshot(cluster, path, bucket, records, boundary);
-            CompletedSnapshotStoreManager manager =
-                    cluster.getCoordinatorServer()
-                            .getCoordinatorEventProcessor()
-                            .completedSnapshotStoreManager();
-            int epoch =
-                    cluster.getZooKeeperClient().getCurrentEpoch().getCoordinatorEpochZkVersion();
-            manager.registerExternalSnapshot(path, bucket, external, epoch);
-            manager.registerExternalSnapshot(path, bucket, external, epoch);
-            assertThat(manager.getOrCreateCompletedSnapshotStore(path, bucket).getNumSnapshots())
-                    .isEqualTo(1);
+            cluster.getZooKeeperClient()
+                    .registerTableBucketSnapshot(
+                            bucket,
+                            new BucketSnapshot(
+                                    external.getSnapshotId(),
+                                    external.getLogOffset(),
+                                    external.getMetadataFilePath().toString()));
             cluster.stopCoordinatorServer();
             cluster.startCoordinatorServer();
             for (int server = 0; server < 2; server++) {

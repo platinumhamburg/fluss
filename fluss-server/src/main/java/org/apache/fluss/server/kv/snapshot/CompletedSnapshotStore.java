@@ -42,7 +42,6 @@ import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.locks.ReentrantLock;
 
-import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 import static org.apache.fluss.utils.concurrent.LockUtils.inLock;
 
@@ -115,53 +114,6 @@ public class CompletedSnapshotStore {
                 () ->
                         addSnapshotAndSubsumeOldestOne(
                                 completedSnapshot, snapshotsCleaner, () -> {}));
-    }
-
-    /**
-     * Registers an immutable external snapshot and includes it in ordinary snapshot retention.
-     *
-     * <p>Identity and ordering checks, persistent handle confirmation and retention updates are
-     * serialized with ordinary snapshot additions. Even an already retained snapshot must have its
-     * handle confirmed under the supplied coordinator epoch before a retry succeeds. Obsolete
-     * snapshot cleanup follows ordinary retention semantics and may be deferred on failure.
-     */
-    public void registerExternalSnapshot(final CompletedSnapshot snapshot, int coordinatorZkVersion)
-            throws Exception {
-        checkNotNull(snapshot, "Snapshot");
-        inLock(
-                lock,
-                () -> {
-                    CompletedSnapshot existing = stillInUseSnapshots.get(snapshot.getSnapshotID());
-                    for (CompletedSnapshot retained : completedSnapshots) {
-                        if (retained.getSnapshotID() == snapshot.getSnapshotID()) {
-                            existing = retained;
-                            break;
-                        }
-                    }
-                    if (existing != null) {
-                        checkArgument(
-                                existing.equals(snapshot),
-                                "Conflicting snapshot identity for %s snapshot %s.",
-                                snapshot.getTableBucket(),
-                                snapshot.getSnapshotID());
-                    } else {
-                        checkArgument(
-                                completedSnapshots.isEmpty()
-                                        || completedSnapshots.peekLast().getSnapshotID()
-                                                < snapshot.getSnapshotID(),
-                                "Cannot register an older snapshot that has already been subsumed.");
-                    }
-                    completedSnapshotHandleStore.registerExternal(
-                            snapshot.getTableBucket(),
-                            new CompletedSnapshotHandle(
-                                    snapshot.getSnapshotID(),
-                                    snapshot.getMetadataFilePath(),
-                                    snapshot.getLogOffset()),
-                            coordinatorZkVersion);
-                    if (existing == null) {
-                        adoptConfirmedSnapshot(snapshot, snapshotsCleaner, () -> {});
-                    }
-                });
     }
 
     public long getPhysicalStorageRemoteKvSize() {
