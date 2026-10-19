@@ -106,7 +106,8 @@ class RocksDBResourceContainerTest {
                             }
                         })
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("full Bloom filters");
+                .hasMessageContaining(
+                        "kv.rocksdb.bloom-filter.block-based-mode must be false to use partitioned Bloom filters.");
         conf.set(ConfigOptions.KV_BLOOM_FILTER_BLOCK_BASED_MODE, false);
         conf.set(ConfigOptions.KV_METADATA_BLOCK_SIZE, MemorySize.ZERO);
         assertThatThrownBy(

@@ -2612,8 +2612,11 @@ public class ConfigOptions {
                     .booleanType()
                     .defaultValue(false)
                     .withDescription(
-                            "Enable partitioned indexes and, when Bloom filters are enabled, partitioned full filters. "
-                                    + "Requires full filters and a positive metadata-blocksize. Only newly generated SSTs "
+                            "Enables partitioned indexes. If `kv.rocksdb.use-bloom-filter` is true, "
+                                    + "Bloom filters are partitioned as well. Requires a positive "
+                                    + "`kv.rocksdb.block.metadata-blocksize`; when `kv.rocksdb.use-bloom-filter` "
+                                    + "is true, `kv.rocksdb.bloom-filter.block-based-mode` must be `false`. "
+                                    + "Only newly generated SSTs "
                                     + "use this format; existing SSTs remain readable when this option is enabled or disabled. "
                                     + "Partitions use the block cache even when metadata caching is disabled. "
                                     + "Takes effect when opening a RocksDB instance.");

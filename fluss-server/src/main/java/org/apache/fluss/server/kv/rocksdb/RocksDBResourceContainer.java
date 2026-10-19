@@ -184,12 +184,12 @@ public class RocksDBResourceContainer implements AutoCloseable {
                     configuration.get(ConfigOptions.KV_METADATA_BLOCK_SIZE).getBytes() > 0,
                     "%s must be positive when partitioning is enabled.",
                     ConfigOptions.KV_METADATA_BLOCK_SIZE.key());
-            checkArgument(
-                    !configuration.get(ConfigOptions.KV_USE_BLOOM_FILTER)
-                            || !configuration.get(ConfigOptions.KV_BLOOM_FILTER_BLOCK_BASED_MODE),
-                    "%s requires full Bloom filters; disable %s.",
-                    ConfigOptions.KV_PARTITIONED_INDEX_FILTERS.key(),
-                    ConfigOptions.KV_BLOOM_FILTER_BLOCK_BASED_MODE.key());
+            if (configuration.get(ConfigOptions.KV_USE_BLOOM_FILTER)) {
+                checkArgument(
+                        !configuration.get(ConfigOptions.KV_BLOOM_FILTER_BLOCK_BASED_MODE),
+                        "%s must be false to use partitioned Bloom filters.",
+                        ConfigOptions.KV_BLOOM_FILTER_BLOCK_BASED_MODE.key());
+            }
         }
     }
 
