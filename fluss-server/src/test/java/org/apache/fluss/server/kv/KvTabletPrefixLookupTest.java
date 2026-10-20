@@ -64,8 +64,11 @@ class KvTabletPrefixLookupTest extends ReplicaTestBase {
     private KvTablet kvTablet;
 
     @AfterEach
-    void stopExecutor() {
+    void stopExecutor() throws InterruptedException {
         executor.shutdownNow();
+        assertThat(executor.awaitTermination(10, TimeUnit.SECONDS))
+                .as("Prefix lookup test executor must terminate before tablet cleanup")
+                .isTrue();
     }
 
     @Test
