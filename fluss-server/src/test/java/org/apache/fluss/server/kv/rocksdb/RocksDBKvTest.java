@@ -25,26 +25,36 @@ import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.server.kv.KvCloseMode;
+import org.apache.fluss.server.utils.ResourceGuard;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 
+import io.github.fluss_contrib.rocksdb.ColumnFamilyHandle;
 import io.github.fluss_contrib.rocksdb.ColumnFamilyOptions;
 import io.github.fluss_contrib.rocksdb.FlushOptions;
+import io.github.fluss_contrib.rocksdb.ReadOptions;
+import io.github.fluss_contrib.rocksdb.RocksDB;
 import io.github.fluss_contrib.rocksdb.RocksDBException;
+import io.github.fluss_contrib.rocksdb.RocksIterator;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Arrays;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /** Test for {@link org.apache.fluss.server.kv.rocksdb.RocksDBKv}. */
 class RocksDBKvTest {
@@ -137,9 +147,11 @@ class RocksDBKvTest {
                                                                 Arrays.copyOf(key, prefix.length),
                                                                 prefix))
                                 .toArray(byte[][]::new);
-                assertThat(kv.prefixLookup(prefix))
-                        .as("prefix %s (flushed=%s)", Arrays.toString(prefix), flush)
-                        .containsExactly(expected);
+                try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(prefix)) {
+                    assertThat(lookup.readAll())
+                            .as("prefix %s (flushed=%s)", Arrays.toString(prefix), flush)
+                            .containsExactly(expected);
+                }
             }
         }
     }
@@ -166,14 +178,20 @@ class RocksDBKvTest {
                 kv.put(key1, new byte[] {5});
                 kv.delete(key2);
                 kv.put(key4, new byte[] {4});
-                assertThat(kv.prefixLookup(prefix))
-                        .containsExactly(new byte[] {5}, new byte[] {3}, new byte[] {4});
+                try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(prefix)) {
+                    assertThat(lookup.readAll())
+                            .containsExactly(new byte[] {5}, new byte[] {3}, new byte[] {4});
+                }
                 kv.db.flush(options);
-                assertThat(kv.prefixLookup(prefix))
-                        .containsExactly(new byte[] {5}, new byte[] {3}, new byte[] {4});
+                try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(prefix)) {
+                    assertThat(lookup.readAll())
+                            .containsExactly(new byte[] {5}, new byte[] {3}, new byte[] {4});
+                }
                 kv.db.compactRange();
-                assertThat(kv.prefixLookup(prefix))
-                        .containsExactly(new byte[] {5}, new byte[] {3}, new byte[] {4});
+                try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(prefix)) {
+                    assertThat(lookup.readAll())
+                            .containsExactly(new byte[] {5}, new byte[] {3}, new byte[] {4});
+                }
             }
         }
     }
@@ -206,11 +224,47 @@ class RocksDBKvTest {
                 assertThat(lookup.readAll()).containsExactly(new byte[] {10}, new byte[] {11});
             }
             assertThat(kv.getResourceGuard().getLeaseCount()).isZero();
-            assertThat(kv.prefixLookup(new byte[] {1}))
-                    .containsExactly(new byte[] {12}, new byte[] {13});
-            assertThat(kv.prefixLookup(new byte[] {3})).isEmpty();
+            try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(new byte[] {1})) {
+                assertThat(lookup.readAll()).containsExactly(new byte[] {12}, new byte[] {13});
+            }
+            try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(new byte[] {3})) {
+                assertThat(lookup.readAll()).isEmpty();
+            }
             assertThat(kv.getResourceGuard().getLeaseCount()).isZero();
         }
+    }
+
+    @Test
+    void testPrefixReadStatusFailurePreservesIOExceptionAndReleasesLease() throws Exception {
+        RocksIterator iterator = mock(RocksIterator.class);
+        RocksDBException failure = new RocksDBException("read failed");
+        doThrow(failure).when(iterator).status();
+        ResourceGuard guard = new ResourceGuard();
+        RocksDBKv kv = buildRocksDBKv(iterator, guard);
+
+        try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(new byte[] {1})) {
+            assertThatThrownBy(lookup::readAll)
+                    .isInstanceOf(IOException.class)
+                    .hasMessage("Failed to iterate prefix lookup.")
+                    .hasCause(failure);
+        }
+        verify(iterator).close();
+        assertThat(guard.getLeaseCount()).isZero();
+    }
+
+    @Test
+    void testPrefixReadPreservesUnexpectedRuntimeExceptionAndReleasesLease() throws Exception {
+        RocksIterator iterator = mock(RocksIterator.class);
+        IllegalStateException failure = new IllegalStateException("unexpected failure");
+        doThrow(failure).when(iterator).seek(any(byte[].class));
+        ResourceGuard guard = new ResourceGuard();
+        RocksDBKv kv = buildRocksDBKv(iterator, guard);
+
+        try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(new byte[] {1})) {
+            assertThatThrownBy(lookup::readAll).isSameAs(failure);
+        }
+        verify(iterator).close();
+        assertThat(guard.getLeaseCount()).isZero();
     }
 
     @Test
@@ -515,6 +569,24 @@ class RocksDBKvTest {
 
         // Reopening the same path also proves the native DB handle was released.
         try (RocksDBKv ignored = buildRocksDBKv(tempDir.toFile())) {}
+    }
+
+    private RocksDBKv buildRocksDBKv(RocksIterator iterator, ResourceGuard guard) {
+        RocksDB.loadLibrary();
+        RocksDB db = mock(RocksDB.class);
+        when(db.newIterator(any(ColumnFamilyHandle.class), any(ReadOptions.class)))
+                .thenReturn(iterator);
+        return new RocksDBKv(
+                mock(RocksDBResourceContainer.class),
+                db,
+                guard,
+                mock(ColumnFamilyHandle.class),
+                null,
+                20,
+                36,
+                2,
+                64L * 1024 * 1024,
+                Integer.MAX_VALUE);
     }
 
     private RocksDBKv buildRocksDBKv(File instanceBasePath) throws Exception {

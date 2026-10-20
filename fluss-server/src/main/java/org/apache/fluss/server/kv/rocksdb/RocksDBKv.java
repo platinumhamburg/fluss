@@ -22,6 +22,7 @@ import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.metrics.Counter;
 import org.apache.fluss.metrics.Histogram;
 import org.apache.fluss.rocksdb.RocksDBOperationUtils;
+import org.apache.fluss.rocksdb.RocksIteratorWrapper;
 import org.apache.fluss.server.kv.KvCloseMode;
 import org.apache.fluss.server.utils.ResourceGuard;
 import org.apache.fluss.utils.IOUtils;
@@ -210,12 +211,6 @@ public class RocksDBKv implements AutoCloseable {
         }
     }
 
-    public List<byte[]> prefixLookup(byte[] prefixKey) throws IOException {
-        try (PrefixLookup lookup = openPrefixLookup(prefixKey)) {
-            return lookup.readAll();
-        }
-    }
-
     /**
      * Fixes a prefix lookup's read view without seeking. The caller must serialize creation with
      * tablet mutations and close, and must close the returned lookup after use.
@@ -250,8 +245,9 @@ public class RocksDBKv implements AutoCloseable {
      */
     public static class PrefixLookup implements AutoCloseable {
         private final byte[] prefixKey;
-        private final RocksIterator iterator;
+        private final RocksIteratorWrapper iterator;
         private final ReadOptions readOptions;
+        // The upper bound must outlive the iterator and read options that reference it.
         @Nullable private final Slice upperBoundSlice;
         private final ResourceGuard.Lease lease;
         private boolean closed;
@@ -263,7 +259,7 @@ public class RocksDBKv implements AutoCloseable {
                 @Nullable Slice upperBoundSlice,
                 ResourceGuard.Lease lease) {
             this.prefixKey = prefixKey;
-            this.iterator = iterator;
+            this.iterator = new RocksIteratorWrapper(iterator);
             this.readOptions = readOptions;
             this.upperBoundSlice = upperBoundSlice;
             this.lease = lease;
@@ -275,15 +271,17 @@ public class RocksDBKv implements AutoCloseable {
                 throw new IOException("Prefix lookup is closed.");
             }
             List<byte[]> values = new ArrayList<>();
-            iterator.seek(prefixKey);
-            while (iterator.isValid()) {
-                values.add(iterator.value());
-                iterator.next();
-            }
             try {
-                iterator.status();
-            } catch (RocksDBException e) {
-                throw new IOException("Failed to iterate prefix lookup.", e);
+                iterator.seek(prefixKey);
+                while (iterator.isValid()) {
+                    values.add(iterator.value());
+                    iterator.next();
+                }
+            } catch (RuntimeException e) {
+                if (e.getCause() instanceof RocksDBException) {
+                    throw new IOException("Failed to iterate prefix lookup.", e.getCause());
+                }
+                throw e;
             }
             return values;
         }
