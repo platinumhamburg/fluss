@@ -925,6 +925,7 @@ class KvTabletTest {
                 null);
         long offset = logTablet.localLogEndOffset();
         Statistics statistics = kvTablet.getRocksDBKv().getStatistics();
+        long gets = statistics.getTickerCount(TickerType.NUMBER_KEYS_READ);
         long calls = statistics.getTickerCount(TickerType.NUMBER_MULTIGET_CALLS);
         long keys = statistics.getTickerCount(TickerType.NUMBER_MULTIGET_KEYS_READ);
         kvTablet.putAsLeader(
@@ -941,6 +942,7 @@ class KvTabletTest {
                 .isEqualTo(1);
         assertThat(statistics.getTickerCount(TickerType.NUMBER_MULTIGET_KEYS_READ) - keys)
                 .isEqualTo(2);
+        assertThat(statistics.getTickerCount(TickerType.NUMBER_KEYS_READ) - gets).isZero();
         checkEqual(
                 readLogRecords(offset),
                 Collections.singletonList(
@@ -2459,8 +2461,9 @@ class KvTabletTest {
         }
         List<ByteArraySlice> readValues = kvTablet.multiGet(keysToRead);
         assertThat(readValues).hasSize(100);
+        assertThat(kvTablet.getRocksDBKv().get("key".getBytes())).isEqualTo("value".getBytes());
 
-        // After reads: get latency must be tracked
+        // After point reads: get latency must be tracked
         long getLatency = statistics.getGetLatencyMicros();
         assertThat(getLatency)
                 .as("Get latency must be tracked after read operations")
