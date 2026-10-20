@@ -210,25 +210,94 @@ public class RocksDBKv implements AutoCloseable {
         }
     }
 
-    public List<byte[]> prefixLookup(byte[] prefixKey) {
-        List<byte[]> pkList = new ArrayList<>();
-        byte[] upperBound = prefixUpperBound(prefixKey);
-        // The bound must outlive both the read options and the iterator that reference it.
-        try (Slice upperBoundSlice = upperBound == null ? null : new Slice(upperBound);
-                ReadOptions readOptions = new ReadOptions().setTotalOrderSeek(true)) {
+    public List<byte[]> prefixLookup(byte[] prefixKey) throws IOException {
+        try (PrefixLookup lookup = openPrefixLookup(prefixKey)) {
+            return lookup.readAll();
+        }
+    }
+
+    /**
+     * Fixes a prefix lookup's read view without seeking. The caller must serialize creation with
+     * tablet mutations and close, and must close the returned lookup after use.
+     */
+    public PrefixLookup openPrefixLookup(byte[] prefixKey) throws IOException {
+        ResourceGuard.Lease lease = rocksDBResourceGuard.acquireResource();
+        Slice upperBoundSlice = null;
+        ReadOptions readOptions = null;
+        RocksIterator iterator = null;
+        try {
+            byte[] upperBound = prefixUpperBound(prefixKey);
+            if (upperBound != null) {
+                upperBoundSlice = new Slice(upperBound);
+            }
+            readOptions = new ReadOptions().setTotalOrderSeek(true);
             if (upperBoundSlice != null) {
                 readOptions.setIterateUpperBound(upperBoundSlice);
             }
-            try (RocksIterator iterator = db.newIterator(defaultColumnFamilyHandle, readOptions)) {
-                iterator.seek(prefixKey);
-                while (iterator.isValid()) {
-                    pkList.add(iterator.value());
-                    iterator.next();
-                }
-            }
+            iterator = db.newIterator(defaultColumnFamilyHandle, readOptions);
+            return new PrefixLookup(prefixKey.clone(), iterator, readOptions, upperBoundSlice, lease);
+        } catch (Throwable t) {
+            IOUtils.closeQuietly(iterator);
+            IOUtils.closeQuietly(readOptions);
+            IOUtils.closeQuietly(upperBoundSlice);
+            lease.close();
+            throw t;
+        }
+    }
+
+    /**
+     * A single-owner prefix read with a fixed iterator view and a lease on its RocksDB instance.
+     */
+    public static class PrefixLookup implements AutoCloseable {
+        private final byte[] prefixKey;
+        private final RocksIterator iterator;
+        private final ReadOptions readOptions;
+        @Nullable private final Slice upperBoundSlice;
+        private final ResourceGuard.Lease lease;
+        private boolean closed;
+
+        private PrefixLookup(
+                byte[] prefixKey,
+                RocksIterator iterator,
+                ReadOptions readOptions,
+                @Nullable Slice upperBoundSlice,
+                ResourceGuard.Lease lease) {
+            this.prefixKey = prefixKey;
+            this.iterator = iterator;
+            this.readOptions = readOptions;
+            this.upperBoundSlice = upperBoundSlice;
+            this.lease = lease;
         }
 
-        return pkList;
+        /** Seeks and collects values from the view fixed when this lookup was opened. */
+        public List<byte[]> readAll() throws IOException {
+            if (closed) {
+                throw new IOException("Prefix lookup is closed.");
+            }
+            List<byte[]> values = new ArrayList<>();
+            iterator.seek(prefixKey);
+            while (iterator.isValid()) {
+                values.add(iterator.value());
+                iterator.next();
+            }
+            try {
+                iterator.status();
+            } catch (RocksDBException e) {
+                throw new IOException("Failed to iterate prefix lookup.", e);
+            }
+            return values;
+        }
+
+        @Override
+        public void close() {
+            if (!closed) {
+                closed = true;
+                IOUtils.closeQuietly(iterator);
+                IOUtils.closeQuietly(readOptions);
+                IOUtils.closeQuietly(upperBoundSlice);
+                lease.close();
+            }
+        }
     }
 
     public List<byte[]> limitScan(Integer limit) {

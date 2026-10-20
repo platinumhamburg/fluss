@@ -178,6 +178,41 @@ class RocksDBKvTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testPrefixReadViewSurvivesConcurrentMutations(boolean flush, @TempDir Path tempDir)
+            throws Exception {
+        try (RocksDBKv kv = buildRocksDBKv(tempDir.toFile())) {
+            kv.put(new byte[] {1, 0}, new byte[] {10});
+            kv.put(new byte[] {1, 1}, new byte[] {11});
+            kv.put(new byte[] {2}, new byte[] {20});
+            if (flush) {
+                try (FlushOptions options = new FlushOptions().setWaitForFlush(true)) {
+                    kv.db.flush(options);
+                }
+            }
+            byte[] prefix = {1};
+            try (RocksDBKv.PrefixLookup lookup = kv.openPrefixLookup(prefix)) {
+                prefix[0] = 2;
+                assertThat(kv.getResourceGuard().getLeaseCount()).isEqualTo(1);
+                kv.put(new byte[] {1, 0}, new byte[] {12});
+                kv.delete(new byte[] {1, 1});
+                kv.put(new byte[] {1, 2}, new byte[] {13});
+                try (FlushOptions options = new FlushOptions().setWaitForFlush(true)) {
+                    kv.db.flush(options);
+                }
+                kv.db.compactRange();
+                // Seek has not run yet: the view must date from opening, not the first seek.
+                assertThat(lookup.readAll()).containsExactly(new byte[] {10}, new byte[] {11});
+            }
+            assertThat(kv.getResourceGuard().getLeaseCount()).isZero();
+            assertThat(kv.prefixLookup(new byte[] {1}))
+                    .containsExactly(new byte[] {12}, new byte[] {13});
+            assertThat(kv.prefixLookup(new byte[] {3})).isEmpty();
+            assertThat(kv.getResourceGuard().getLeaseCount()).isZero();
+        }
+    }
+
     @Test
     void testLiveSstFilesSize(@TempDir Path tempDir) throws Exception {
         try (RocksDBKv rocksDBKv = buildRocksDBKv(tempDir.toFile())) {
