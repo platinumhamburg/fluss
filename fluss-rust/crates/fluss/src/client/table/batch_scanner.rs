@@ -128,10 +128,24 @@ async fn run_limit_scan(pending: &PendingScan, bucket: &TableBucket) -> Result<S
     let leader = pending
         .metadata
         .leader_for(&pending.table_info.table_path, bucket)
-        .await?
-        .ok_or_else(|| {
-            Error::leader_not_available(format!("No leader found for table bucket: {bucket}"))
-        })?;
+        .await?;
+    let bucket_count = pending
+        .metadata
+        .get_cluster()
+        .bucket_count(bucket.table_or_partition());
+    if let Some(bucket_count) = bucket_count {
+        if bucket.bucket_id() >= bucket_count {
+            return Err(Error::IllegalArgument {
+                message: format!(
+                    "Bucket id {} out of range for {bucket_count} buckets",
+                    bucket.bucket_id()
+                ),
+            });
+        }
+    }
+    let leader = leader.ok_or_else(|| {
+        Error::leader_not_available(format!("No leader found for table bucket: {bucket}"))
+    })?;
     let connection = pending.rpc_client.get_connection(&leader).await?;
 
     let request = LimitScanRequest::new(
@@ -139,7 +153,8 @@ async fn run_limit_scan(pending: &PendingScan, bucket: &TableBucket) -> Result<S
         bucket.partition_id(),
         bucket.bucket_id(),
         pending.limit,
-    );
+    )
+    .with_routing_bucket_count(bucket_count);
     let response = connection.request(request).await?;
 
     if let Some(error_code) = response.error_code
@@ -459,10 +474,6 @@ fn project_batch(
 mod tests {
     use super::*;
     use crate::client::WriteRecord;
-    use crate::compression::{
-        ArrowCompressionInfo, ArrowCompressionRatioEstimator, ArrowCompressionType,
-        DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
-    };
     use crate::metadata::{
         Column, DataField, DataType, DataTypes, PhysicalTablePath, Schema, TableInfo, TablePath,
     };
@@ -470,7 +481,7 @@ mod tests {
     use crate::row::GenericRow;
     use crate::row::binary::BinaryWriter;
     use crate::row::compacted::CompactedRowWriter;
-    use crate::test_utils::build_table_info_with_columns;
+    use crate::test_utils::{build_table_info_with_columns, uncompressed_arrow_batch_config};
     use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 
     fn build_two_col_table_info() -> TableInfo {
@@ -499,15 +510,8 @@ mod tests {
             table_info.table_path.clone(),
         )));
         let mut builder = MemoryLogRecordsArrowBuilder::new(
-            schema_id,
-            table_info.get_row_type(),
+            uncompressed_arrow_batch_config(schema_id, table_info.get_row_type(), usize::MAX),
             false,
-            ArrowCompressionInfo {
-                compression_type: ArrowCompressionType::None,
-                compression_level: DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
-            },
-            usize::MAX,
-            Arc::new(ArrowCompressionRatioEstimator::default()),
         )
         .expect("builder");
         for (i, row) in rows.iter().enumerate() {

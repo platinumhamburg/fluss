@@ -27,16 +27,16 @@ import org.apache.fluss.server.utils.ResourceGuard;
 import org.apache.fluss.utils.BytesUtils;
 import org.apache.fluss.utils.IOUtils;
 
-import org.rocksdb.Cache;
-import org.rocksdb.ColumnFamilyHandle;
-import org.rocksdb.ColumnFamilyOptions;
-import org.rocksdb.MutableDBOptions;
-import org.rocksdb.ReadOptions;
-import org.rocksdb.RocksDB;
-import org.rocksdb.RocksDBException;
-import org.rocksdb.RocksIterator;
-import org.rocksdb.Statistics;
-import org.rocksdb.WriteOptions;
+import io.github.fluss_contrib.rocksdb.Cache;
+import io.github.fluss_contrib.rocksdb.ColumnFamilyHandle;
+import io.github.fluss_contrib.rocksdb.ColumnFamilyOptions;
+import io.github.fluss_contrib.rocksdb.MutableDBOptions;
+import io.github.fluss_contrib.rocksdb.ReadOptions;
+import io.github.fluss_contrib.rocksdb.RocksDB;
+import io.github.fluss_contrib.rocksdb.RocksDBException;
+import io.github.fluss_contrib.rocksdb.RocksIterator;
+import io.github.fluss_contrib.rocksdb.Statistics;
+import io.github.fluss_contrib.rocksdb.WriteOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,13 +49,16 @@ import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
-/** A wrapper for the operation of {@link org.rocksdb.RocksDB}. */
+/** A wrapper for the operation of {@link io.github.fluss_contrib.rocksdb.RocksDB}. */
 public class RocksDBKv implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(RocksDBKv.class);
 
     /** RocksDB property name for the number of SST files at level 0 (column-family scoped). */
     private static final String NUM_FILES_AT_LEVEL0 = "rocksdb.num-files-at-level0";
+
+    /** RocksDB property name for the total size of SST files in the current LSM tree. */
+    private static final String LIVE_SST_FILES_SIZE = "rocksdb.live-sst-files-size";
 
     private static final float DELAYED_WRITE_PRESSURE_FLOOR = 0.8f;
 
@@ -270,6 +273,11 @@ public class RocksDBKv implements AutoCloseable {
         }
     }
 
+    /** Returns the total size in bytes of the live SST files. */
+    public long liveSstFilesSize() {
+        return readLongProperty(LIVE_SST_FILES_SIZE);
+    }
+
     @Override
     public void close() throws Exception {
         close(KvCloseMode.PRESERVE_LOCAL_STATE);
@@ -406,21 +414,7 @@ public class RocksDBKv implements AutoCloseable {
     }
 
     private long sampleL0FileCount() {
-        if (closed) {
-            return 0L;
-        }
-        ResourceGuard.Lease lease = null;
-        try {
-            lease = rocksDBResourceGuard.acquireResource();
-            return readLongProperty(NUM_FILES_AT_LEVEL0);
-        } catch (IOException acquireFailed) {
-            // RocksDB is already closed (or being closed); treat as no pressure.
-            return 0L;
-        } finally {
-            if (lease != null) {
-                lease.close();
-            }
-        }
+        return readLongProperty(NUM_FILES_AT_LEVEL0);
     }
 
     /**
@@ -443,14 +437,20 @@ public class RocksDBKv implements AutoCloseable {
     }
 
     private long readLongProperty(String propertyName) {
-        try {
+        if (closed) {
+            return 0L;
+        }
+        try (ResourceGuard.Lease ignored = rocksDBResourceGuard.acquireResource()) {
             String value = db.getProperty(defaultColumnFamilyHandle, propertyName);
             if (value == null || value.isEmpty()) {
                 return 0L;
             }
             return Long.parseLong(value);
+        } catch (IOException ignored) {
+            // RocksDB is already closed or being closed.
+            return 0L;
         } catch (RocksDBException | NumberFormatException e) {
-            LOG.warn("Failed to query RocksDB property {} for backpressure", propertyName, e);
+            LOG.warn("Failed to query RocksDB property {}", propertyName, e);
             return 0L;
         }
     }

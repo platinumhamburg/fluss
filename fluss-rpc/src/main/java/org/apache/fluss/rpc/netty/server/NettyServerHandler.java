@@ -27,6 +27,7 @@ import org.apache.fluss.rpc.messages.AuthenticateRequest;
 import org.apache.fluss.rpc.messages.AuthenticateResponse;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
 import org.apache.fluss.rpc.messages.LookupRequest;
+import org.apache.fluss.rpc.messages.PutKvRequest;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.rpc.protocol.ApiManager;
@@ -57,6 +58,7 @@ import static org.apache.fluss.rpc.protocol.MessageCodec.encodeErrorResponse;
 import static org.apache.fluss.rpc.protocol.MessageCodec.encodeServerFailure;
 import static org.apache.fluss.rpc.protocol.MessageCodec.encodeSuccessResponse;
 import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.hasHistoricalLookup;
+import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.hasHistoricalPut;
 
 /** Implementation of the channel handler to process inbound requests for RPC server. */
 public final class NettyServerHandler extends ChannelInboundHandlerAdapter {
@@ -135,6 +137,16 @@ public final class NettyServerHandler extends ChannelInboundHandlerAdapter {
                             ((InetSocketAddress) ctx.channel().remoteAddress()).getAddress(),
                             future);
 
+            // Reject requests from inactive connections before they enter the request queue. Lazy
+            // requests retain the underlying ByteBuf and rely on the request processor to release
+            // it after processing.
+            if (!state.isActive()) {
+                LOG.warn("Received a request on an inactive channel: {}", remoteAddress);
+                request.fail(new NetworkException("Channel is inactive"));
+                needRelease = true;
+                return;
+            }
+
             future.whenCompleteAsync((r, t) -> sendResponse(ctx, request), ctx.executor());
             if (apiKey == ApiKeys.AUTHENTICATE.id
                     || (state.isAuthenticating() && apiKey != ApiKeys.API_VERSIONS.id)) {
@@ -147,11 +159,6 @@ public final class NettyServerHandler extends ChannelInboundHandlerAdapter {
                 requestChannel.putRequest(request);
             }
 
-            if (!state.isActive()) {
-                LOG.warn("Received a request on an inactive channel: {}", remoteAddress);
-                request.fail(new NetworkException("Channel is inactive"));
-                needRelease = true;
-            }
         } catch (Throwable t) {
             needRelease = true;
             LOG.error("Error while parsing request.", t);
@@ -272,7 +279,7 @@ public final class NettyServerHandler extends ChannelInboundHandlerAdapter {
         ByteBuf byteBuf = encodeErrorResponse(alloc, request.getRequestId(), error);
         ctx.writeAndFlush(byteBuf);
 
-        getMetrics(request).ifPresent(metrics -> metrics.getErrorsCount().inc());
+        getMetrics(request).ifPresent(metrics -> metrics.markError(error.error()));
     }
 
     private void updateRequestMetrics(FlussRequest request, long requestEndTimeMs) {
@@ -308,6 +315,8 @@ public final class NettyServerHandler extends ChannelInboundHandlerAdapter {
             isFromFollower = fetchLogRequest.getFollowerServerId() >= 0;
         } else if (request.getApiKey() == ApiKeys.LOOKUP.id) {
             isHistorical = hasHistoricalLookup((LookupRequest) requestMessage);
+        } else if (request.getApiKey() == ApiKeys.PUT_KV.id) {
+            isHistorical = hasHistoricalPut((PutKvRequest) requestMessage);
         }
         return requestsMetrics.getMetrics(request.getApiKey(), isFromFollower, isHistorical);
     }

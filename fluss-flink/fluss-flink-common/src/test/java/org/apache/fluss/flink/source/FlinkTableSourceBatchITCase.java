@@ -20,7 +20,6 @@ package org.apache.fluss.flink.source;
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.client.table.writer.AppendWriter;
 import org.apache.fluss.client.table.writer.UpsertWriter;
-import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.flink.utils.FlinkTestBase;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.BinaryString;
@@ -105,7 +104,7 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
         String tableName = prepareSourceTable(new String[] {"name", "id"}, null);
         String query = String.format("SELECT * FROM %s WHERE id = 1 AND name = 'name1'", tableName);
 
-        assertThat(tEnv.explainSql(query))
+        assertThat(FlinkTableSourceITCase.withLowerCaseAnd(tEnv.explainSql(query)))
                 .contains(
                         String.format(
                                 "TableSourceScan(table=[[testcatalog, %s, %s, "
@@ -122,7 +121,7 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
         String tableName = prepareSourceTable(new String[] {"id", "name"}, null);
         String query = String.format("SELECT * FROM %s WHERE id = 1 AND name = 'name1'", tableName);
 
-        assertThat(tEnv.explainSql(query))
+        assertThat(FlinkTableSourceITCase.withLowerCaseAnd(tEnv.explainSql(query)))
                 .contains(
                         String.format(
                                 "TableSourceScan(table=[[testcatalog, %s, %s, "
@@ -163,7 +162,7 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
         String query =
                 String.format("SELECT * FROM %s WHERE id = 1 AND dt='%s'", tableName, partition1);
 
-        assertThat(tEnv.explainSql(query))
+        assertThat(FlinkTableSourceITCase.withLowerCaseAnd(tEnv.explainSql(query)))
                 .contains(
                         String.format(
                                 "TableSourceScan(table=[[testcatalog, %s, %s, "
@@ -658,14 +657,37 @@ abstract class FlinkTableSourceBatchITCase extends FlinkTestBase {
                                         + " with ('bucket.num' = '4', 'table.changelog.image' = 'wal')",
                                 tableName))
                 .await();
-        // normal scan
+
         String query = String.format("SELECT COUNT(*) FROM %s", tableName);
-        assertThatThrownBy(() -> tEnv.executeSql(query))
-                .hasRootCauseInstanceOf(InvalidTableException.class)
+        assertThatThrownBy(() -> tEnv.explainSql(query))
                 .hasMessageContaining(
                         String.format(
                                 "Row count is disabled for this table '%s.test_count_table_with_wal'.",
                                 databaseName));
+    }
+
+    @Test
+    void testCountIsNotPushedDownForRowTtlTable() throws Exception {
+        String tableName = "test_count_table_with_row_ttl";
+        tEnv.executeSql(
+                        String.format(
+                                "create table %s ("
+                                        + "  id int not null,"
+                                        + "  address varchar,"
+                                        + "  name varchar,"
+                                        + "  primary key (id) NOT ENFORCED)"
+                                        + " with ('bucket.num' = '4',"
+                                        + " 'table.kv.ttl' = '1 h')",
+                                tableName))
+                .await();
+
+        String query = String.format("SELECT COUNT(*) FROM %s", tableName);
+        assertThat(tEnv.explainSql(query))
+                .contains("HashAggregate", "TableSourceScan")
+                .doesNotContain("aggregates=[grouping=[]");
+        CloseableIterator<Row> iterRows = tEnv.executeSql(query).collect();
+        assertThat(collectRowsWithTimeout(iterRows, 1))
+                .isEqualTo(Collections.singletonList("+I[0]"));
     }
 
     @ParameterizedTest
