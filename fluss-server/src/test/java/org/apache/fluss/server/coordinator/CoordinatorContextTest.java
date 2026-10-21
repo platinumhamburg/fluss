@@ -222,12 +222,13 @@ class CoordinatorContextTest {
         TableBucket tb1 = new TableBucket(1L, 0);
         TableBucket tb2 = new TableBucket(1L, 1);
 
-        context.addPendingLeaderActivations(Arrays.asList(tb1, tb2));
+        long activationId1 = context.addPendingLeaderActivationAndGetId(tb1);
+        long activationId2 = context.addPendingLeaderActivationAndGetId(tb2);
 
-        context.clearPendingLeaderActivation(tb1);
+        context.clearPendingLeaderActivation(tb1, activationId1);
         assertThat(context.getPendingLeaderActivationBuckets()).containsExactly(tb2);
 
-        context.clearPendingLeaderActivation(tb2);
+        context.clearPendingLeaderActivation(tb2, activationId2);
         assertThat(context.getPendingLeaderActivationBuckets()).isEmpty();
     }
 
@@ -237,7 +238,7 @@ class CoordinatorContextTest {
         TableBucket tb1 = new TableBucket(1L, 0);
 
         // Should not throw
-        context.clearPendingLeaderActivation(tb1);
+        context.clearPendingLeaderActivation(tb1, 1L);
         assertThat(context.getPendingLeaderActivationBuckets()).isEmpty();
     }
 
@@ -291,11 +292,11 @@ class CoordinatorContextTest {
         assertThat(context.isLeaderActive(tb)).isTrue();
 
         // Add to pending → not active
-        context.addPendingLeaderActivation(tb);
+        long activationId = context.addPendingLeaderActivationAndGetId(tb);
         assertThat(context.isLeaderActive(tb)).isFalse();
 
         // Clear pending → active again
-        context.clearPendingLeaderActivation(tb);
+        context.clearPendingLeaderActivation(tb, activationId);
         assertThat(context.isLeaderActive(tb)).isTrue();
 
         // Leader is NO_LEADER → not active

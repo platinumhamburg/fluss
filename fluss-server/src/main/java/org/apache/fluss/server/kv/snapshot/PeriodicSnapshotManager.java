@@ -203,7 +203,10 @@ public class PeriodicSnapshotManager implements Closeable {
         // of using guardedExecutor
         guardedExecutor.execute(
                 () -> {
-                    if (started) {
+                    synchronized (this) {
+                        if (!started) {
+                            return;
+                        }
                         LOG.debug("TableBucket {} triggers snapshot.", tableBucket);
                         long triggerTime = System.currentTimeMillis();
 
@@ -383,14 +386,12 @@ public class PeriodicSnapshotManager implements Closeable {
     }
 
     @Override
-    public void close() {
-        synchronized (this) {
-            // do-nothing, please make the periodicExecutor will be closed by external
-            started = false;
-            // cancel the scheduled task if not completed yet
-            if (scheduledTask != null && !scheduledTask.isDone()) {
-                scheduledTask.cancel(true);
-            }
+    public synchronized void close() {
+        // do-nothing, please make the periodicExecutor will be closed by external
+        started = false;
+        // cancel the scheduled task if not completed yet
+        if (scheduledTask != null && !scheduledTask.isDone()) {
+            scheduledTask.cancel(true);
         }
     }
 

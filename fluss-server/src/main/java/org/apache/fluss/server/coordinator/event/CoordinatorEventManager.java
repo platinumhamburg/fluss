@@ -243,6 +243,11 @@ public final class CoordinatorEventManager implements EventManager {
                 });
     }
 
+    @Override
+    public boolean isEventThread() {
+        return Thread.currentThread() == thread;
+    }
+
     public void clearAndPut(CoordinatorEvent event) {
         inLock(
                 putLock,
