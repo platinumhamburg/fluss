@@ -230,7 +230,8 @@ public class RocksDBKv implements AutoCloseable {
                 readOptions.setIterateUpperBound(upperBoundSlice);
             }
             iterator = db.newIterator(defaultColumnFamilyHandle, readOptions);
-            return new PrefixLookup(prefixKey.clone(), iterator, readOptions, upperBoundSlice, lease);
+            return new PrefixLookup(
+                    prefixKey.clone(), iterator, readOptions, upperBoundSlice, lease);
         } catch (Throwable t) {
             IOUtils.closeQuietly(iterator);
             IOUtils.closeQuietly(readOptions);
