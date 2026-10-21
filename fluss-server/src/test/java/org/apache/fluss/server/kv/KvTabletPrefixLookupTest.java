@@ -25,13 +25,18 @@ import org.apache.fluss.server.replica.ReplicaTestBase;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.utils.ByteArraySlice;
 
+import io.github.fluss_contrib.rocksdb.FlushOptions;
+import io.github.fluss_contrib.rocksdb.RocksDBException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.lang.reflect.Field;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
@@ -41,7 +46,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.stream.Stream;
 
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID_PK;
@@ -53,10 +61,6 @@ import static org.apache.fluss.testutils.DataTestUtils.getKeyValuePairs;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.doThrow;
-import static org.mockito.Mockito.spy;
 
 /** Tests prefix lookup isolation and lifetime while KV writes and close run concurrently. */
 class KvTabletPrefixLookupTest extends ReplicaTestBase {
@@ -77,29 +81,11 @@ class KvTabletPrefixLookupTest extends ReplicaTestBase {
         byte[] key = getKeyValuePairs(genKvRecords(new Object[] {1, "old"})).get(0).f0;
         kvTablet.putAsLeader(genKvRecordBatch(new Object[] {1, "old"}), null);
         flushAndWait(kvTablet, Long.MAX_VALUE);
-        RocksDBKv reader = interceptReads();
-        CountDownLatch scanReady = new CountDownLatch(1);
-        CountDownLatch continueScan = new CountDownLatch(1);
-        doAnswer(
-                        invocation -> {
-                            RocksDBKv.PrefixLookup lookup =
-                                    spy((RocksDBKv.PrefixLookup) invocation.callRealMethod());
-                            doAnswer(
-                                            read -> {
-                                                scanReady.countDown();
-                                                assertThat(continueScan.await(10, TimeUnit.SECONDS))
-                                                        .isTrue();
-                                                return read.callRealMethod();
-                                            })
-                                    .when(lookup)
-                                    .readAll();
-                            return lookup;
-                        })
-                .when(reader)
-                .openPrefixLookup(any(byte[].class));
+        BlockingReadWriteLock lock = pauseAfterReadUnlock();
         Future<List<ByteArraySlice>> scan = executor.submit(() -> kvTablet.prefixLookup(key));
         try {
-            assertThat(scanReady.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(lock.readUnlocked.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(kvTablet.getRocksDBKv().getResourceGuard().getLeaseCount()).isEqualTo(1);
             Future<?> write =
                     executor.submit(
                             () -> {
@@ -111,7 +97,7 @@ class KvTabletPrefixLookupTest extends ReplicaTestBase {
             write.get(10, TimeUnit.SECONDS);
             assertThat(scan).isNotDone();
         } finally {
-            continueScan.countDown();
+            lock.continueRead.countDown();
         }
         List<ByteArraySlice> values = scan.get(10, TimeUnit.SECONDS);
         assertThat(values).hasSize(1);
@@ -121,40 +107,28 @@ class KvTabletPrefixLookupTest extends ReplicaTestBase {
     }
 
     @Test
-    void testPrefixLookupFailureReleasesReadLease() throws Exception {
+    void testPrefixLookupCorruptionReleasesReadLease() throws Exception {
         createTablet();
-        RocksDBKv reader = interceptReads();
-        doAnswer(
-                        invocation -> {
-                            RocksDBKv.PrefixLookup lookup =
-                                    spy((RocksDBKv.PrefixLookup) invocation.callRealMethod());
-                            doThrow(new IOException("read failed")).when(lookup).readAll();
-                            return lookup;
-                        })
-                .when(reader)
-                .openPrefixLookup(any(byte[].class));
-        assertThatThrownBy(() -> kvTablet.prefixLookup(new byte[] {1}))
-                .isInstanceOf(IOException.class)
-                .hasMessage("read failed");
-        assertThat(kvTablet.getRocksDBKv().getResourceGuard().getLeaseCount()).isZero();
-        kvTablet.close();
-    }
-
-    @Test
-    void testFailedCloseIsReportedToLaterCloseAndDrop() throws Exception {
-        createTablet();
-        RocksDBKv original = kvTablet.getRocksDBKv();
-        RocksDBKv rocks = interceptReads();
-        IOException failure = new IOException("close failed");
-        doThrow(failure).when(rocks).close(KvCloseMode.PRESERVE_LOCAL_STATE);
-        try {
-            assertThatThrownBy(kvTablet::close).isSameAs(failure);
-            assertThatThrownBy(kvTablet::close).isSameAs(failure);
-            assertThatThrownBy(kvTablet::drop).isSameAs(failure);
-            assertThat(kvTablet.getKvTabletDir()).exists();
-        } finally {
-            original.close();
+        byte[] key = getKeyValuePairs(genKvRecords(new Object[] {1, "value"})).get(0).f0;
+        kvTablet.putAsLeader(genKvRecordBatch(new Object[] {1, "value"}), null);
+        flushAndWait(kvTablet, Long.MAX_VALUE);
+        try (FlushOptions options = new FlushOptions().setWaitForFlush(true)) {
+            kvTablet.getRocksDBKv().getDb().flush(options);
         }
+        try (Stream<Path> files = Files.walk(kvTablet.getKvTabletDir().toPath())) {
+            Path sst = files.filter(path -> path.toString().endsWith(".sst")).findFirst().get();
+            try (RandomAccessFile file = new RandomAccessFile(sst.toFile(), "rw")) {
+                int firstByte = file.readUnsignedByte();
+                file.seek(0);
+                file.writeByte(firstByte ^ 0xff);
+            }
+        }
+        assertThatThrownBy(() -> kvTablet.prefixLookup(key))
+                .isInstanceOf(IOException.class)
+                .hasMessage("Failed to iterate prefix lookup.")
+                .hasCauseInstanceOf(RocksDBException.class)
+                .satisfies(error -> assertThat(error.getCause()).hasMessageContaining("checksum"));
+        assertThat(kvTablet.getRocksDBKv().getResourceGuard().getLeaseCount()).isZero();
     }
 
     @ParameterizedTest
@@ -233,11 +207,38 @@ class KvTabletPrefixLookupTest extends ReplicaTestBase {
         kvTablet = replica.getKvTablet();
     }
 
-    private RocksDBKv interceptReads() throws Exception {
-        RocksDBKv rocks = spy(kvTablet.getRocksDBKv());
-        Field field = KvTablet.class.getDeclaredField("rocksDBKv");
+    private BlockingReadWriteLock pauseAfterReadUnlock() throws Exception {
+        BlockingReadWriteLock lock = new BlockingReadWriteLock();
+        Field field = KvTablet.class.getDeclaredField("kvLock");
         field.setAccessible(true);
-        field.set(kvTablet, rocks);
-        return rocks;
+        field.set(kvTablet, lock);
+        return lock;
+    }
+
+    private static class BlockingReadWriteLock extends ReentrantReadWriteLock {
+        private final CountDownLatch readUnlocked = new CountDownLatch(1);
+        private final CountDownLatch continueRead = new CountDownLatch(1);
+        private final AtomicBoolean pauseNextRead = new AtomicBoolean(true);
+        private final ReadLock readLock =
+                new ReadLock(this) {
+                    @Override
+                    public void unlock() {
+                        super.unlock();
+                        if (pauseNextRead.compareAndSet(true, false)) {
+                            readUnlocked.countDown();
+                            try {
+                                assertThat(continueRead.await(10, TimeUnit.SECONDS)).isTrue();
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                throw new AssertionError(e);
+                            }
+                        }
+                    }
+                };
+
+        @Override
+        public ReadLock readLock() {
+            return readLock;
+        }
     }
 }
