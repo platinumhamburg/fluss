@@ -1211,12 +1211,19 @@ public final class KvTablet {
     }
 
     public List<ByteArraySlice> multiGet(List<byte[]> keys) throws IOException {
-        return inReadLock(
-                kvLock,
-                () -> {
-                    rocksDBKv.checkIfRocksDBClosed();
-                    return toValueBodySlices(rocksDBKv.multiGet(keys));
-                });
+        List<byte[]> values;
+        try (RocksDBKv.MultiGetLookup lookup =
+                inReadLock(
+                        kvLock,
+                        () -> {
+                            if (isClosed) {
+                                throw new IOException("KV tablet is closing: " + tableBucket);
+                            }
+                            return rocksDBKv.openMultiGet();
+                        })) {
+            values = lookup.read(keys);
+        }
+        return toValueBodySlices(values);
     }
 
     /**
