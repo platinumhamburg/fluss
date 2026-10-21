@@ -26,13 +26,13 @@ import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.utils.ByteArraySlice;
 
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -41,6 +41,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID_PK;
@@ -52,10 +54,6 @@ import static org.apache.fluss.testutils.DataTestUtils.getKeyValuePairs;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.doThrow;
-import static org.mockito.Mockito.spy;
 
 /** Tests lookup isolation and resource lifetime while writes and close run concurrently. */
 class KvTabletLookupTest extends ReplicaTestBase {
@@ -68,37 +66,27 @@ class KvTabletLookupTest extends ReplicaTestBase {
         assertThat(executor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
     }
 
-    @Test
-    void testMultiGetAllowsFlushAndPreservesReadView() throws Exception {
+    @ParameterizedTest
+    @ValueSource(ints = {1, 15, 16, 32})
+    void testMultiGetPreservesReadViewAcrossFlush(int keyCount) throws Exception {
         createTablet();
         kvTablet.putAsLeader(genKvRecordBatch(new Object[] {1, "old"}), null);
         flushAndWait(kvTablet, Long.MAX_VALUE);
         byte[] key = getKeyValuePairs(genKvRecords(new Object[] {1, "old"})).get(0).f0;
         byte[] missing = getKeyValuePairs(genKvRecords(new Object[] {2, "missing"})).get(0).f0;
-        CountDownLatch readReady = new CountDownLatch(1);
-        CountDownLatch continueRead = new CountDownLatch(1);
-        RocksDBKv reader = interceptReads();
-        doAnswer(
-                        invocation -> {
-                            RocksDBKv.MultiGetLookup lookup =
-                                    spy((RocksDBKv.MultiGetLookup) invocation.callRealMethod());
-                            doAnswer(
-                                            read -> {
-                                                readReady.countDown();
-                                                assertThat(continueRead.await(10, TimeUnit.SECONDS))
-                                                        .isTrue();
-                                                return read.callRealMethod();
-                                            })
-                                    .when(lookup)
-                                    .read(any());
-                            return lookup;
-                        })
-                .when(reader)
-                .openMultiGet();
-        Future<List<ByteArraySlice>> read =
-                executor.submit(() -> kvTablet.multiGet(Arrays.asList(key, missing, key)));
+        List<byte[]> keys = new ArrayList<>(Collections.nCopies(keyCount, key));
+        if (keyCount > 1) {
+            keys.set(1, missing);
+        }
+        BlockingReadWriteLock lock = pauseAfterReadUnlock();
+        RocksDBKv reader = kvTablet.getRocksDBKv();
+        Future<List<ByteArraySlice>> read = executor.submit(() -> kvTablet.multiGet(keys));
         try {
-            assertThat(readReady.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(lock.readUnlocked.await(10, TimeUnit.SECONDS)).isTrue();
+            int expectedViews = keyCount < 16 ? 0 : 1;
+            assertThat(reader.getResourceGuard().getLeaseCount()).isEqualTo(expectedViews);
+            assertThat(reader.getDb().getLongProperty("rocksdb.num-snapshots"))
+                    .isEqualTo(expectedViews);
             executor.submit(
                             () -> {
                                 kvTablet.putAsLeader(
@@ -112,35 +100,33 @@ class KvTabletLookupTest extends ReplicaTestBase {
                     .get(10, TimeUnit.SECONDS);
             assertThat(read).isNotDone();
         } finally {
-            continueRead.countDown();
+            lock.continueRead.countDown();
         }
         List<ByteArraySlice> values = read.get(10, TimeUnit.SECONDS);
         byte[] expected = getKeyValuePairs(genKvRecords(new Object[] {1, "old"})).get(0).f1;
-        assertThat(values).hasSize(3);
-        assertThat(values.get(0).toByteArray()).containsExactly(expected);
-        assertThat(values.get(1)).isNull();
-        assertThat(values.get(2).toByteArray()).containsExactly(expected);
-        assertThat(reader.getResourceGuard().getLeaseCount()).isZero();
-    }
-
-    @Test
-    void testMultiGetFailureReleasesSnapshotAndLease() throws Exception {
-        createTablet();
-        RocksDBKv reader = interceptReads();
-        doAnswer(
-                        invocation -> {
-                            RocksDBKv.MultiGetLookup lookup =
-                                    spy((RocksDBKv.MultiGetLookup) invocation.callRealMethod());
-                            doThrow(new IOException("read failed")).when(lookup).read(any());
-                            return lookup;
-                        })
-                .when(reader)
-                .openMultiGet();
-        assertThatThrownBy(() -> kvTablet.multiGet(Collections.singletonList(new byte[] {1})))
-                .isInstanceOf(IOException.class)
-                .hasMessage("read failed");
+        assertThat(values).hasSize(keyCount);
+        for (int i = 0; i < keyCount; i++) {
+            if (i == 1) {
+                assertThat(values.get(i)).isNull();
+            } else {
+                assertThat(values.get(i).toByteArray()).containsExactly(expected);
+            }
+        }
         assertThat(reader.getResourceGuard().getLeaseCount()).isZero();
         assertThat(reader.getDb().getLongProperty("rocksdb.num-snapshots")).isZero();
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {15, 16})
+    void testInvalidMultiGetReleasesResources(int keyCount) throws Exception {
+        createTablet();
+        RocksDBKv reader = kvTablet.getRocksDBKv();
+        assertThatThrownBy(() -> kvTablet.multiGet(Collections.nCopies(keyCount, null)))
+                .isInstanceOf(NullPointerException.class);
+        assertThat(reader.getResourceGuard().getLeaseCount()).isZero();
+        assertThat(reader.getDb().getLongProperty("rocksdb.num-snapshots")).isZero();
+        assertThat(kvTablet.multiGet(Collections.nCopies(keyCount, new byte[] {1})))
+                .containsOnlyNulls();
     }
 
     @ParameterizedTest
@@ -166,9 +152,14 @@ class KvTabletLookupTest extends ReplicaTestBase {
                     "Close must wait for the lookup lease.");
             assertThat(closing).isNotDone();
             assertThat(kvTablet.getKvTabletDir()).exists();
-            assertThatThrownBy(() -> kvTablet.multiGet(Collections.singletonList(new byte[] {1})))
-                    .isInstanceOf(IOException.class)
-                    .hasMessageContaining("closing");
+            for (int keyCount : new int[] {1, 16}) {
+                assertThatThrownBy(
+                                () ->
+                                        kvTablet.multiGet(
+                                                Collections.nCopies(keyCount, new byte[] {1})))
+                        .isInstanceOf(IOException.class)
+                        .hasMessageContaining("closing");
+            }
             assertThat(read.read(Collections.singletonList(new byte[] {1})))
                     .containsExactly((byte[]) null);
         } finally {
@@ -199,11 +190,38 @@ class KvTabletLookupTest extends ReplicaTestBase {
         kvTablet = replica.getKvTablet();
     }
 
-    private RocksDBKv interceptReads() throws Exception {
-        RocksDBKv rocks = spy(kvTablet.getRocksDBKv());
-        Field field = KvTablet.class.getDeclaredField("rocksDBKv");
+    private BlockingReadWriteLock pauseAfterReadUnlock() throws Exception {
+        BlockingReadWriteLock lock = new BlockingReadWriteLock();
+        Field field = KvTablet.class.getDeclaredField("kvLock");
         field.setAccessible(true);
-        field.set(kvTablet, rocks);
-        return rocks;
+        field.set(kvTablet, lock);
+        return lock;
+    }
+
+    private static class BlockingReadWriteLock extends ReentrantReadWriteLock {
+        private final CountDownLatch readUnlocked = new CountDownLatch(1);
+        private final CountDownLatch continueRead = new CountDownLatch(1);
+        private final AtomicBoolean pauseNextRead = new AtomicBoolean(true);
+        private final ReadLock readLock =
+                new ReadLock(this) {
+                    @Override
+                    public void unlock() {
+                        super.unlock();
+                        if (pauseNextRead.compareAndSet(true, false)) {
+                            readUnlocked.countDown();
+                            try {
+                                assertThat(continueRead.await(10, TimeUnit.SECONDS)).isTrue();
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                throw new AssertionError(e);
+                            }
+                        }
+                    }
+                };
+
+        @Override
+        public ReadLock readLock() {
+            return readLock;
+        }
     }
 }
