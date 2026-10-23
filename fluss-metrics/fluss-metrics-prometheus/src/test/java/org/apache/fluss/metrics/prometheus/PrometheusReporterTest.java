@@ -145,6 +145,19 @@ class PrometheusReporterTest {
         }
     }
 
+    @Test
+    void emptyHistogramWindowOmitsQuantilesButKeepsCumulativeCount() throws UnirestException {
+        TestHistogram histogram = new TestHistogram();
+        histogram.setCount(10);
+        histogram.setSize(0);
+
+        String response = addMetricAndPollResponse(histogram, "idleHistogram");
+
+        assertThat(response)
+                .contains(createExpectedPollResponse("idleHistogram", "_count", "summary", "10.0"))
+                .doesNotContain(SCOPE_PREFIX + "idleHistogram{" + DIMENSIONS + ",quantile=");
+    }
+
     /**
      * Metrics with the same name are stored by the reporter in a shared data-structure. This test
      * ensures that a metric is unregistered from Prometheus even if other metrics with the same
