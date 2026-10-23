@@ -305,6 +305,8 @@ public class JMXReporter implements MetricReporter {
     public interface JmxHistogramMBean extends MetricMBean {
         long getCount();
 
+        int getWindowCount();
+
         double getMean();
 
         double getStdDev();
@@ -337,6 +339,11 @@ public class JMXReporter implements MetricReporter {
         @Override
         public long getCount() {
             return histogram.getCount();
+        }
+
+        @Override
+        public int getWindowCount() {
+            return histogram.getStatistics().size();
         }
 
         @Override
