@@ -22,8 +22,11 @@ import org.apache.fluss.cluster.compaction.CompactionInfo;
 import org.apache.fluss.cluster.compaction.CompactionProgress;
 import org.apache.fluss.cluster.compaction.CompactionStatus;
 import org.apache.fluss.cluster.compaction.CompactionType;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.CompactionNotExistException;
+import org.apache.fluss.flink.procedure.FlussProcedureContext;
 import org.apache.fluss.flink.procedure.GetCompactionProcedure;
+import org.apache.fluss.flink.procedure.ProcedureManager;
 import org.apache.fluss.flink.utils.FlinkTestBase;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.TableBucket;
@@ -36,6 +39,7 @@ import org.apache.flink.table.api.EnvironmentSettings;
 import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.api.TableResult;
 import org.apache.flink.table.api.config.TableConfigOptions;
+import org.apache.flink.table.catalog.ObjectPath;
 import org.apache.flink.types.Row;
 import org.apache.flink.util.CloseableIterator;
 import org.junit.jupiter.api.AfterEach;
@@ -263,8 +267,17 @@ public abstract class CompactionProcedureITCase extends FlinkTestBase {
         Admin responseAdmin = mock(Admin.class);
         when(responseAdmin.getCompaction(info.operationId()))
                 .thenReturn(CompletableFuture.completedFuture(progress));
-        GetCompactionProcedure procedure = new GetCompactionProcedure();
-        procedure.withAdmin(responseAdmin);
+        GetCompactionProcedure procedure =
+                (GetCompactionProcedure)
+                        ProcedureManager.getProcedure(
+                                        new FlussProcedureContext(
+                                                responseAdmin,
+                                                DEFAULT_DB,
+                                                new Configuration(),
+                                                Collections.emptyMap(),
+                                                getClass().getClassLoader()),
+                                        new ObjectPath("sys", "get_compaction"))
+                                .get();
 
         Row[] results = procedure.call(null, info.operationId());
         assertThat(results).hasSize(1);
