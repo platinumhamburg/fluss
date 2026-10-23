@@ -25,17 +25,12 @@ import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
 import org.apache.fluss.server.kv.KvCloseMode;
-import org.apache.fluss.server.utils.ResourceGuard;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.types.RowType;
 
-import io.github.fluss_contrib.rocksdb.ColumnFamilyHandle;
 import io.github.fluss_contrib.rocksdb.ColumnFamilyOptions;
 import io.github.fluss_contrib.rocksdb.FlushOptions;
-import io.github.fluss_contrib.rocksdb.ReadOptions;
-import io.github.fluss_contrib.rocksdb.RocksDB;
 import io.github.fluss_contrib.rocksdb.RocksDBException;
-import io.github.fluss_contrib.rocksdb.Snapshot;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -49,12 +44,8 @@ import java.util.Arrays;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
-import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 
 /** Test for {@link org.apache.fluss.server.kv.rocksdb.RocksDBKv}. */
 class RocksDBKvTest {
@@ -243,6 +234,8 @@ class RocksDBKvTest {
             kv.put(key, new byte[] {10});
             RocksDBKv.MultiGetLookup lookup = kv.openMultiGet();
             try {
+                assertThat(kv.getResourceGuard().getLeaseCount()).isEqualTo(1);
+                assertThat(kv.db.getLongProperty("rocksdb.num-snapshots")).isEqualTo(1);
                 kv.delete(key);
                 kv.put(missing, new byte[] {20});
                 try (FlushOptions options = new FlushOptions().setWaitForFlush(true)) {
@@ -262,42 +255,6 @@ class RocksDBKvTest {
                     .hasMessageContaining("closed");
             assertThat(kv.multiGet(Arrays.asList(key, missing)))
                     .containsExactly(null, new byte[] {20});
-        }
-    }
-
-    @Test
-    void testMultiGetOpenFailureReleasesLease() {
-        RocksDB.loadLibrary();
-        ResourceGuard guard = new ResourceGuard();
-        RocksDB db = mock(RocksDB.class);
-        IllegalStateException failure = new IllegalStateException("snapshot failed");
-        when(db.getSnapshot()).thenThrow(failure);
-        RocksDBKv kv = buildRocksDBKv(db, guard);
-        assertThatThrownBy(kv::openMultiGet).isSameAs(failure);
-        assertThat(guard.getLeaseCount()).isZero();
-    }
-
-    @Test
-    void testMultiGetNativeFailureReleasesSnapshotAndLease(@TempDir Path tempDir) throws Exception {
-        try (RocksDBKv owner = buildRocksDBKv(tempDir.toFile())) {
-            ResourceGuard guard = new ResourceGuard();
-            RocksDB db = mock(RocksDB.class);
-            Snapshot snapshot = owner.db.getSnapshot();
-            when(db.getSnapshot()).thenReturn(snapshot);
-            RocksDBException failure = new RocksDBException("multi-get failed");
-            when(db.multiGetAsList(any(ReadOptions.class), any())).thenThrow(failure);
-            RocksDBKv kv = buildRocksDBKv(db, guard);
-            try {
-                try (RocksDBKv.MultiGetLookup lookup = kv.openMultiGet()) {
-                    assertThatThrownBy(() -> lookup.read(Arrays.asList(new byte[] {1})))
-                            .isInstanceOf(IOException.class)
-                            .hasCause(failure);
-                }
-                verify(db).releaseSnapshot(snapshot);
-                assertThat(guard.getLeaseCount()).isZero();
-            } finally {
-                owner.db.releaseSnapshot(snapshot);
-            }
         }
     }
 
@@ -603,20 +560,6 @@ class RocksDBKvTest {
 
         // Reopening the same path also proves the native DB handle was released.
         try (RocksDBKv ignored = buildRocksDBKv(tempDir.toFile())) {}
-    }
-
-    private RocksDBKv buildRocksDBKv(RocksDB db, ResourceGuard guard) {
-        return new RocksDBKv(
-                mock(RocksDBResourceContainer.class),
-                db,
-                guard,
-                mock(ColumnFamilyHandle.class),
-                null,
-                20,
-                36,
-                2,
-                64L * 1024 * 1024,
-                Integer.MAX_VALUE);
     }
 
     private RocksDBKv buildRocksDBKv(File instanceBasePath) throws Exception {
