@@ -39,6 +39,7 @@ public class FieldMergeMapAgg extends FieldAggregator {
 
     private static final long serialVersionUID = 1L;
     private final boolean binaryKeys;
+    private final boolean binaryValues;
     private final InternalArray.ElementGetter keyGetter;
     private final InternalArray.ElementGetter valueGetter;
 
@@ -46,6 +47,8 @@ public class FieldMergeMapAgg extends FieldAggregator {
     public FieldMergeMapAgg(MapType dataType) {
         super(dataType);
         this.binaryKeys = dataType.getKeyType().isAnyOf(DataTypeRoot.BINARY, DataTypeRoot.BYTES);
+        this.binaryValues =
+                dataType.getValueType().isAnyOf(DataTypeRoot.BINARY, DataTypeRoot.BYTES);
         this.keyGetter = InternalArray.createElementGetter(dataType.getKeyType());
         this.valueGetter = InternalArray.createElementGetter(dataType.getValueType());
     }
@@ -68,8 +71,13 @@ public class FieldMergeMapAgg extends FieldAggregator {
         int expectedSize = accumulatorMap.size() + inputMap.size();
         int capacity = (int) (expectedSize / 0.75f) + 1;
         Map<Object, Object> resultMap = new HashMap<>(capacity);
-        putToMap(resultMap, accumulatorMap);
-        putToMap(resultMap, inputMap);
+        if (binaryValues) {
+            putToMap(resultMap, inputMap);
+            putMissingToMap(resultMap, accumulatorMap);
+        } else {
+            putToMap(resultMap, accumulatorMap);
+            putToMap(resultMap, inputMap);
+        }
         if (binaryKeys) {
             Object[] keys = new Object[resultMap.size()];
             Object[] values = new Object[resultMap.size()];
@@ -91,6 +99,19 @@ public class FieldMergeMapAgg extends FieldAggregator {
             Object key = keyGetter.getElementOrNull(keyArray, i);
             Object value = valueGetter.getElementOrNull(valueArray, i);
             map.put(binaryKeys ? new ByteArrayWrapper((byte[]) key) : key, value);
+        }
+    }
+
+    private void putMissingToMap(Map<Object, Object> map, InternalMap mapData) {
+        InternalArray keyArray = mapData.keyArray();
+        InternalArray valueArray = mapData.valueArray();
+        // Scan backwards so duplicate stored keys retain their last value.
+        for (int i = keyArray.size() - 1; i >= 0; i--) {
+            Object key = keyGetter.getElementOrNull(keyArray, i);
+            Object mapKey = binaryKeys ? new ByteArrayWrapper((byte[]) key) : key;
+            if (!map.containsKey(mapKey)) {
+                map.put(mapKey, valueGetter.getElementOrNull(valueArray, i));
+            }
         }
     }
 }

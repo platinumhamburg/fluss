@@ -33,6 +33,7 @@ import org.apache.fluss.row.GenericMap;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalArray;
 import org.apache.fluss.row.InternalMap;
+import org.apache.fluss.row.columnar.ColumnarMap;
 import org.apache.fluss.row.encode.RowEncoder;
 import org.apache.fluss.server.kv.rowmerger.AggregateRowMerger;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldCollectAgg;
@@ -94,6 +95,51 @@ class FieldCollectionAggregatorTest {
     }
 
     @ParameterizedTest
+    @EnumSource(KvFormat.class)
+    void testDistinctCollectWithRepeatedInput(KvFormat format) {
+        Schema schema = schema(DataTypes.ARRAY(DataTypes.INT()), AggFunctions.COLLECT(true));
+        AggregateRowMerger merger = merger(schema, format);
+        BinaryValue old = value(schema, format, GenericArray.of(3, 1, null));
+        BinaryValue result =
+                merger.merge(old, value(schema, format, GenericArray.of(null, 1, 3, 1)));
+        assertThat(result.row).isEqualTo(old.row);
+
+        result =
+                merger.merge(
+                        value(schema, format, GenericArray.of(3, 3, null, null)),
+                        value(schema, format, GenericArray.of(3, null)));
+        assertThat(result.row).isEqualTo(value(schema, format, GenericArray.of(3, null)).row);
+    }
+
+    @ParameterizedTest
+    @MethodSource("collectModes")
+    void testCollectWithEmptyArrays(KvFormat format, boolean distinct) {
+        Schema schema = schema(DataTypes.ARRAY(DataTypes.INT()), AggFunctions.COLLECT(distinct));
+        AggregateRowMerger merger = merger(schema, format);
+        BinaryValue empty = value(schema, format, GenericArray.of());
+        BinaryValue input = value(schema, format, GenericArray.of(3, 3, null));
+        BinaryValue expected =
+                value(
+                        schema,
+                        format,
+                        distinct ? GenericArray.of(3, null) : GenericArray.of(3, 3, null));
+
+        assertThat(merger.merge(null, empty).row).isEqualTo(empty.row);
+        assertThat(merger.merge(value(schema, format, null), empty).row).isEqualTo(empty.row);
+        assertThat(merger.merge(empty, empty).row).isEqualTo(empty.row);
+        assertThat(merger.merge(empty, input).row).isEqualTo(expected.row);
+        assertThat(merger.merge(input, empty).row).isEqualTo(expected.row);
+    }
+
+    static Stream<Arguments> collectModes() {
+        return Stream.of(KvFormat.values())
+                .flatMap(
+                        format ->
+                                Stream.of(false, true)
+                                        .map(distinct -> Arguments.of(format, distinct)));
+    }
+
+    @ParameterizedTest
     @MethodSource("complexElements")
     void testCollectComplexElements(
             KvFormat format, boolean distinct, DataType elementType, Object first, Object second) {
@@ -108,6 +154,17 @@ class FieldCollectionAggregatorTest {
                         ? GenericArray.of(first, null, second)
                         : GenericArray.of(first, null, first, second, null);
         assertThat(result.row).isEqualTo(value(schema, format, expected).row);
+        if (distinct) {
+            BinaryValue repeated =
+                    merger(schema, format)
+                            .merge(
+                                    value(schema, format, expected),
+                                    value(
+                                            schema,
+                                            format,
+                                            GenericArray.of(second, first, null, second)));
+            assertThat(repeated.row).isEqualTo(value(schema, format, expected).row);
+        }
     }
 
     static Stream<Arguments> complexElements() {
@@ -121,6 +178,13 @@ class FieldCollectionAggregatorTest {
                                 DataTypes.STRING(),
                                 BinaryString.fromString("b"),
                                 BinaryString.fromString("a")));
+                cases.add(
+                        Arguments.of(
+                                format,
+                                distinct,
+                                DataTypes.BYTES(),
+                                new byte[] {2, 3},
+                                new byte[] {1, 4}));
                 cases.add(
                         Arguments.of(
                                 format,
@@ -155,7 +219,7 @@ class FieldCollectionAggregatorTest {
     }
 
     @ParameterizedTest
-    @MethodSource("binaryMapKeys")
+    @MethodSource("binaryTypes")
     void testMergeMapBinaryKeys(KvFormat format, DataType keyType) {
         Schema schema =
                 schema(DataTypes.MAP(keyType, DataTypes.STRING()), AggFunctions.MERGE_MAP());
@@ -188,7 +252,49 @@ class FieldCollectionAggregatorTest {
                         entry("[1, 2]", null), entry("[3, 4]", "kept"), entry("[5, 6]", "added"));
     }
 
-    static Stream<Arguments> binaryMapKeys() {
+    @ParameterizedTest
+    @MethodSource("binaryTypes")
+    void testMergeMapKeepsLastStoredValue(KvFormat format, DataType keyType) {
+        Schema schema = schema(DataTypes.MAP(keyType, DataTypes.BYTES()), AggFunctions.MERGE_MAP());
+        InternalMap old =
+                new ColumnarMap(
+                        GenericArray.of(new byte[] {1, 2}, new byte[] {1, 2}),
+                        GenericArray.of(new byte[] {1}, new byte[] {2}));
+        BinaryValue result =
+                merger(schema, format)
+                        .merge(
+                                value(schema, format, old),
+                                value(
+                                        schema,
+                                        format,
+                                        GenericMap.of(new byte[] {3, 4}, new byte[] {3})));
+        InternalMap map = result.row.getMap(1);
+        assertThat(map.size()).isEqualTo(2);
+        Map<String, String> entries = new HashMap<>();
+        for (int i = 0; i < map.size(); i++) {
+            entries.put(
+                    Arrays.toString(map.keyArray().getBytes(i)),
+                    Arrays.toString(map.valueArray().getBytes(i)));
+        }
+        assertThat(entries).containsOnly(entry("[1, 2]", "[2]"), entry("[3, 4]", "[3]"));
+    }
+
+    @ParameterizedTest
+    @MethodSource("binaryTypes")
+    void testMergeMapNullValueOverridesStoredBytes(KvFormat format, DataType valueType) {
+        Schema schema = schema(DataTypes.MAP(DataTypes.INT(), valueType), AggFunctions.MERGE_MAP());
+        BinaryValue result =
+                merger(schema, format)
+                        .merge(
+                                value(schema, format, GenericMap.of(1, new byte[] {1, 2})),
+                                value(schema, format, GenericMap.of(1, null)));
+        InternalMap map = result.row.getMap(1);
+        assertThat(map.size()).isEqualTo(1);
+        assertThat(map.keyArray().getInt(0)).isEqualTo(1);
+        assertThat(map.valueArray().isNullAt(0)).isTrue();
+    }
+
+    static Stream<Arguments> binaryTypes() {
         return Stream.of(KvFormat.values())
                 .flatMap(
                         format ->

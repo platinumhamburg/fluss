@@ -58,7 +58,16 @@ public class FieldCollectAgg extends FieldAggregator {
         InternalArray inputArray = (InternalArray) inputField;
         int expectedSize =
                 (accumulatorArray == null ? 0 : accumulatorArray.size()) + inputArray.size();
+        if (expectedSize == 0) {
+            return inputField;
+        }
         if (!distinct) {
+            if (inputArray.size() == 0) {
+                return accumulator;
+            }
+            if (accumulatorArray.size() == 0) {
+                return inputField;
+            }
             Object[] result = new Object[expectedSize];
             int accumulatorSize = accumulatorArray.size();
             for (int i = 0; i < accumulatorSize; i++) {
@@ -72,7 +81,13 @@ public class FieldCollectAgg extends FieldAggregator {
 
         Set<Object> elements = new LinkedHashSet<>(expectedSize);
         collectDistinct(elements, accumulatorArray);
+        int accumulatorDistinctSize = elements.size();
         collectDistinct(elements, inputArray);
+        if (accumulatorArray != null
+                && accumulatorDistinctSize == accumulatorArray.size()
+                && elements.size() == accumulatorDistinctSize) {
+            return accumulator;
+        }
         Object[] result = elements.toArray();
         for (int i = 0; i < result.length; i++) {
             if (result[i] instanceof ByteArrayWrapper) {
