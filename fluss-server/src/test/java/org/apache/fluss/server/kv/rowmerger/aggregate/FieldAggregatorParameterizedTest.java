@@ -25,12 +25,7 @@ import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.record.BinaryValue;
 import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.row.BinaryRow;
-import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.Decimal;
-import org.apache.fluss.row.GenericArray;
-import org.apache.fluss.row.GenericMap;
-import org.apache.fluss.row.InternalArray;
-import org.apache.fluss.row.InternalMap;
 import org.apache.fluss.row.TimestampLtz;
 import org.apache.fluss.row.TimestampNtz;
 import org.apache.fluss.server.kv.rowmerger.AggregateRowMerger;
@@ -53,9 +48,6 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.ZoneOffset;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
@@ -637,139 +629,6 @@ class FieldAggregatorParameterizedTest {
     }
 
     // ===================================================================================
-    // Collection Aggregation Tests
-    // ===================================================================================
-
-    @Test
-    void testCollectAggregationNonDistinct() {
-        Schema schema =
-                Schema.newBuilder()
-                        .column("id", DataTypes.INT())
-                        .column(
-                                "values",
-                                DataTypes.ARRAY(DataTypes.INT()),
-                                AggFunctions.COLLECT(false))
-                        .primaryKey("id")
-                        .build();
-
-        TableConfig tableConfig = new TableConfig(new Configuration());
-        AggregateRowMerger merger = createMerger(schema, tableConfig);
-
-        BinaryRow row1 = compactedRow(schema.getRowType(), new Object[] {1, GenericArray.of(1, 2)});
-        BinaryRow row2 =
-                compactedRow(schema.getRowType(), new Object[] {1, GenericArray.of(2, null, 3)});
-
-        BinaryValue merged = merger.merge(toBinaryValue(row1), toBinaryValue(row2));
-        InternalArray resultArray = merged.row.getArray(1);
-        Object[] actual = toObjectArray(resultArray, DataTypes.INT());
-        assertThat(actual).containsExactly(1, 2, 2, null, 3);
-    }
-
-    @Test
-    void testCollectAggregationDistinct() {
-        Schema schema =
-                Schema.newBuilder()
-                        .column("id", DataTypes.INT())
-                        .column(
-                                "values",
-                                DataTypes.ARRAY(DataTypes.INT()),
-                                AggFunctions.COLLECT(true))
-                        .primaryKey("id")
-                        .build();
-
-        TableConfig tableConfig = new TableConfig(new Configuration());
-        AggregateRowMerger merger = createMerger(schema, tableConfig);
-
-        BinaryRow row1 =
-                compactedRow(schema.getRowType(), new Object[] {1, GenericArray.of(1, 2, null)});
-        BinaryRow row2 =
-                compactedRow(schema.getRowType(), new Object[] {1, GenericArray.of(2, 3, null)});
-
-        BinaryValue merged = merger.merge(toBinaryValue(row1), toBinaryValue(row2));
-        InternalArray resultArray = merged.row.getArray(1);
-        Object[] actual = toObjectArray(resultArray, DataTypes.INT());
-        assertThat(actual).containsExactlyInAnyOrder(1, 2, 3, null);
-    }
-
-    @Test
-    void testCollectAggregationDistinctBytes() {
-        Schema schema =
-                Schema.newBuilder()
-                        .column("id", DataTypes.INT())
-                        .column(
-                                "values",
-                                DataTypes.ARRAY(DataTypes.BYTES()),
-                                AggFunctions.COLLECT(true))
-                        .primaryKey("id")
-                        .build();
-
-        TableConfig tableConfig = new TableConfig(new Configuration());
-        AggregateRowMerger merger = createMerger(schema, tableConfig);
-
-        byte[] v1 = new byte[] {1, 2};
-        byte[] v2 = new byte[] {3};
-        byte[] v3 = new byte[] {1, 2};
-        byte[] v4 = new byte[] {4};
-
-        BinaryRow row1 =
-                compactedRow(schema.getRowType(), new Object[] {1, GenericArray.of(v1, v2)});
-        BinaryRow row2 =
-                compactedRow(schema.getRowType(), new Object[] {1, GenericArray.of(v3, null, v4)});
-
-        BinaryValue merged = merger.merge(toBinaryValue(row1), toBinaryValue(row2));
-        InternalArray resultArray = merged.row.getArray(1);
-        Object[] actual = toObjectArray(resultArray, DataTypes.BYTES());
-
-        // Null values are included in collect, distinct keeps a single null.
-        assertThat(actual).hasSize(4);
-        assertThat(Arrays.toString((byte[]) actual[0])).isEqualTo(Arrays.toString(v1));
-        assertThat(Arrays.toString((byte[]) actual[1])).isEqualTo(Arrays.toString(v2));
-        assertThat(actual[2]).isNull();
-        assertThat(Arrays.toString((byte[]) actual[3])).isEqualTo(Arrays.toString(v4));
-    }
-
-    @Test
-    void testMergeMapAggregation() {
-        Schema schema =
-                Schema.newBuilder()
-                        .column("id", DataTypes.INT())
-                        .column(
-                                "attributes",
-                                DataTypes.MAP(DataTypes.INT(), DataTypes.STRING()),
-                                AggFunctions.MERGE_MAP())
-                        .primaryKey("id")
-                        .build();
-
-        TableConfig tableConfig = new TableConfig(new Configuration());
-        AggregateRowMerger merger = createMerger(schema, tableConfig);
-
-        BinaryRow row1 =
-                compactedRow(
-                        schema.getRowType(),
-                        new Object[] {
-                            1,
-                            GenericMap.of(
-                                    1,
-                                    BinaryString.fromString("a"),
-                                    2,
-                                    BinaryString.fromString("b"))
-                        });
-        BinaryRow row2 =
-                compactedRow(
-                        schema.getRowType(),
-                        new Object[] {1, GenericMap.of(2, BinaryString.fromString("c"), 3, null)});
-
-        BinaryValue merged = merger.merge(toBinaryValue(row1), toBinaryValue(row2));
-        InternalMap resultMap = merged.row.getMap(1);
-        Map<Object, Object> actual = toJavaMap(resultMap, DataTypes.INT(), DataTypes.STRING());
-        Map<Object, Object> expected = new HashMap<>();
-        expected.put(1, "a");
-        expected.put(2, "c");
-        expected.put(3, null);
-        assertThat(actual).isEqualTo(expected);
-    }
-
-    // ===================================================================================
     // Listagg Aggregation Tests
     // ===================================================================================
 
@@ -1027,39 +886,5 @@ class FieldAggregatorParameterizedTest {
     private static TimestampLtz timestampLtz(String timestamp) {
         Instant instant = LocalDateTime.parse(timestamp).toInstant(ZoneOffset.UTC);
         return TimestampLtz.fromInstant(instant);
-    }
-
-    private static Object[] toObjectArray(InternalArray array, DataType elementType) {
-        Object[] result = new Object[array.size()];
-        InternalArray.ElementGetter elementGetter = InternalArray.createElementGetter(elementType);
-        for (int i = 0; i < array.size(); i++) {
-            Object element = elementGetter.getElementOrNull(array, i);
-            if (element instanceof BinaryString) {
-                element = element.toString();
-            }
-            result[i] = element;
-        }
-        return result;
-    }
-
-    private static Map<Object, Object> toJavaMap(
-            InternalMap map, DataType keyType, DataType valueType) {
-        Map<Object, Object> result = new HashMap<>();
-        InternalArray keyArray = map.keyArray();
-        InternalArray valueArray = map.valueArray();
-        InternalArray.ElementGetter keyGetter = InternalArray.createElementGetter(keyType);
-        InternalArray.ElementGetter valueGetter = InternalArray.createElementGetter(valueType);
-        for (int i = 0; i < keyArray.size(); i++) {
-            Object key = keyGetter.getElementOrNull(keyArray, i);
-            Object value = valueGetter.getElementOrNull(valueArray, i);
-            if (key instanceof BinaryString) {
-                key = key.toString();
-            }
-            if (value instanceof BinaryString) {
-                value = value.toString();
-            }
-            result.put(key, value);
-        }
-        return result;
     }
 }

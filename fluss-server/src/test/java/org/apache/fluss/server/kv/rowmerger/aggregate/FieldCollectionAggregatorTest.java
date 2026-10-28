@@ -39,6 +39,7 @@ import org.apache.fluss.server.kv.rowmerger.AggregateRowMerger;
 import org.apache.fluss.server.kv.rowmerger.aggregate.functions.FieldCollectAgg;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypes;
+import org.apache.fluss.types.MapType;
 
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -51,6 +52,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.stream.Stream;
 
+import static org.apache.fluss.testutils.InternalMapAssert.assertThatMap;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.entry;
 
@@ -63,23 +65,22 @@ class FieldCollectionAggregatorTest {
         Schema schema = schema(DataTypes.ARRAY(DataTypes.INT()), AggFunctions.COLLECT(true));
         AggregateRowMerger merger = merger(schema, format);
         BinaryValue input = value(schema, format, GenericArray.of(3, 1, 3, null, null));
-        BinaryValue expected = value(schema, format, GenericArray.of(3, 1, null));
-
         BinaryValue result = merger.merge(null, input);
-        assertThat(result.row).isEqualTo(expected.row);
-        assertThat(merger.merge(result, value(schema, format, null)).row).isEqualTo(expected.row);
+        assertCollectedValues(result, DataTypes.INT(), 3, 1, null);
+        assertCollectedValues(
+                merger.merge(result, value(schema, format, null)), DataTypes.INT(), 3, 1, null);
     }
 
     @ParameterizedTest
     @EnumSource(KvFormat.class)
     void testDistinctCollectAfterNull(KvFormat format) {
         Schema schema = schema(DataTypes.ARRAY(DataTypes.INT()), AggFunctions.COLLECT(true));
-        AggregateRowMerger merger = merger(schema, format);
         BinaryValue result =
-                merger.merge(
-                        value(schema, format, null),
-                        value(schema, format, GenericArray.of(3, 1, 3, null, null)));
-        assertThat(result.row).isEqualTo(value(schema, format, GenericArray.of(3, 1, null)).row);
+                merger(schema, format)
+                        .merge(
+                                value(schema, format, null),
+                                value(schema, format, GenericArray.of(3, 1, 3, null, null)));
+        assertCollectedValues(result, DataTypes.INT(), 3, 1, null);
     }
 
     @ParameterizedTest
@@ -91,7 +92,7 @@ class FieldCollectionAggregatorTest {
                         .merge(
                                 value(schema, format, GenericArray.of(3, 1)),
                                 value(schema, format, GenericArray.of(1, 2, 3, null)));
-        assertThat(result.row).isEqualTo(value(schema, format, GenericArray.of(3, 1, 2, null)).row);
+        assertCollectedValues(result, DataTypes.INT(), 3, 1, 2, null);
     }
 
     @ParameterizedTest
@@ -99,16 +100,16 @@ class FieldCollectionAggregatorTest {
     void testDistinctCollectWithRepeatedInput(KvFormat format) {
         Schema schema = schema(DataTypes.ARRAY(DataTypes.INT()), AggFunctions.COLLECT(true));
         AggregateRowMerger merger = merger(schema, format);
-        BinaryValue old = value(schema, format, GenericArray.of(3, 1, null));
         BinaryValue result =
-                merger.merge(old, value(schema, format, GenericArray.of(null, 1, 3, 1)));
-        assertThat(result.row).isEqualTo(old.row);
-
+                merger.merge(
+                        value(schema, format, GenericArray.of(3, 1, null)),
+                        value(schema, format, GenericArray.of(null, 1, 3, 1)));
+        assertCollectedValues(result, DataTypes.INT(), 3, 1, null);
         result =
                 merger.merge(
                         value(schema, format, GenericArray.of(3, 3, null, null)),
                         value(schema, format, GenericArray.of(3, null)));
-        assertThat(result.row).isEqualTo(value(schema, format, GenericArray.of(3, null)).row);
+        assertCollectedValues(result, DataTypes.INT(), 3, null);
     }
 
     @ParameterizedTest
@@ -118,17 +119,12 @@ class FieldCollectionAggregatorTest {
         AggregateRowMerger merger = merger(schema, format);
         BinaryValue empty = value(schema, format, GenericArray.of());
         BinaryValue input = value(schema, format, GenericArray.of(3, 3, null));
-        BinaryValue expected =
-                value(
-                        schema,
-                        format,
-                        distinct ? GenericArray.of(3, null) : GenericArray.of(3, 3, null));
-
-        assertThat(merger.merge(null, empty).row).isEqualTo(empty.row);
-        assertThat(merger.merge(value(schema, format, null), empty).row).isEqualTo(empty.row);
-        assertThat(merger.merge(empty, empty).row).isEqualTo(empty.row);
-        assertThat(merger.merge(empty, input).row).isEqualTo(expected.row);
-        assertThat(merger.merge(input, empty).row).isEqualTo(expected.row);
+        Object[] expected = distinct ? new Object[] {3, null} : new Object[] {3, 3, null};
+        assertCollectedValues(merger.merge(null, empty), DataTypes.INT());
+        assertCollectedValues(merger.merge(value(schema, format, null), empty), DataTypes.INT());
+        assertCollectedValues(merger.merge(empty, empty), DataTypes.INT());
+        assertCollectedValues(merger.merge(empty, input), DataTypes.INT(), expected);
+        assertCollectedValues(merger.merge(input, empty), DataTypes.INT(), expected);
     }
 
     static Stream<Arguments> collectModes() {
@@ -139,66 +135,78 @@ class FieldCollectionAggregatorTest {
                                         .map(distinct -> Arguments.of(format, distinct)));
     }
 
-    @ParameterizedTest
-    @MethodSource("complexElements")
-    void testCollectComplexElements(
-            KvFormat format, boolean distinct, DataType elementType, Object first, Object second) {
+    @ParameterizedTest(name = "{0}, distinct={1}, element={2}")
+    @MethodSource("collectElements")
+    void testCollectElements(
+            KvFormat format,
+            boolean distinct,
+            DataType elementType,
+            Object first,
+            Object second,
+            Object third) {
         Schema schema = schema(DataTypes.ARRAY(elementType), AggFunctions.COLLECT(distinct));
         BinaryValue result =
                 merger(schema, format)
                         .merge(
-                                value(schema, format, GenericArray.of(first, null)),
-                                value(schema, format, GenericArray.of(first, second, null)));
-        GenericArray expected =
+                                value(schema, format, GenericArray.of(first, second, null)),
+                                value(schema, format, GenericArray.of(first, third, null, first)));
+        Object[] expected =
                 distinct
-                        ? GenericArray.of(first, null, second)
-                        : GenericArray.of(first, null, first, second, null);
-        assertThat(result.row).isEqualTo(value(schema, format, expected).row);
+                        ? new Object[] {first, second, null, third}
+                        : new Object[] {first, second, null, first, third, null, first};
+        assertCollectedValues(result, elementType, expected);
         if (distinct) {
             BinaryValue repeated =
                     merger(schema, format)
                             .merge(
-                                    value(schema, format, expected),
+                                    value(schema, format, new GenericArray(expected)),
                                     value(
                                             schema,
                                             format,
-                                            GenericArray.of(second, first, null, second)));
-            assertThat(repeated.row).isEqualTo(value(schema, format, expected).row);
+                                            GenericArray.of(third, first, null, second)));
+            assertCollectedValues(repeated, elementType, expected);
         }
     }
 
-    static Stream<Arguments> complexElements() {
+    static Stream<Arguments> collectElements() {
         Stream.Builder<Arguments> cases = Stream.builder();
         for (KvFormat format : KvFormat.values()) {
             for (boolean distinct : new boolean[] {false, true}) {
+                cases.add(Arguments.of(format, distinct, DataTypes.INT(), 1, 2, 3));
                 cases.add(
                         Arguments.of(
                                 format,
                                 distinct,
                                 DataTypes.STRING(),
                                 BinaryString.fromString("b"),
-                                BinaryString.fromString("a")));
+                                BinaryString.fromString("a"),
+                                BinaryString.fromString("c")));
                 cases.add(
                         Arguments.of(
                                 format,
                                 distinct,
                                 DataTypes.BYTES(),
                                 new byte[] {2, 3},
-                                new byte[] {1, 4}));
+                                new byte[] {4},
+                                new byte[] {1, 4, 5}));
                 cases.add(
                         Arguments.of(
                                 format,
                                 distinct,
                                 DataTypes.ARRAY(DataTypes.INT()),
-                                GenericArray.of(2, null),
-                                GenericArray.of(1, 3)));
+                                GenericArray.of(1, null),
+                                GenericArray.of(1, 3),
+                                GenericArray.of(1, 4)));
                 cases.add(
                         Arguments.of(
                                 format,
                                 distinct,
-                                DataTypes.ROW(DataTypes.FIELD("v", DataTypes.INT())),
-                                GenericRow.of(2),
-                                GenericRow.of(1)));
+                                DataTypes.ROW(
+                                        DataTypes.FIELD("id", DataTypes.INT()),
+                                        DataTypes.FIELD("name", DataTypes.STRING())),
+                                GenericRow.of(1, BinaryString.fromString("a")),
+                                GenericRow.of(1, BinaryString.fromString("b")),
+                                GenericRow.of(1, BinaryString.fromString("c"))));
             }
         }
         return cases.build();
@@ -216,6 +224,40 @@ class FieldCollectionAggregatorTest {
         for (int i = 0; i < result.size(); i++) {
             assertThat(result.getInt(i)).isEqualTo(i + 1);
         }
+    }
+
+    @ParameterizedTest
+    @EnumSource(KvFormat.class)
+    void testMergeMap(KvFormat format) {
+        MapType type = DataTypes.MAP(DataTypes.INT(), DataTypes.STRING());
+        Schema schema = schema(type, AggFunctions.MERGE_MAP());
+        BinaryValue result =
+                merger(schema, format)
+                        .merge(
+                                value(
+                                        schema,
+                                        format,
+                                        GenericMap.of(
+                                                1,
+                                                BinaryString.fromString("a"),
+                                                2,
+                                                BinaryString.fromString("b"))),
+                                value(
+                                        schema,
+                                        format,
+                                        GenericMap.of(2, BinaryString.fromString("c"), 3, null)));
+        InternalMap map = result.row.getMap(1);
+        assertThat(map.size()).isEqualTo(3);
+        assertThatMap(map)
+                .withMapType(type)
+                .isEqualTo(
+                        GenericMap.of(
+                                1,
+                                BinaryString.fromString("a"),
+                                2,
+                                BinaryString.fromString("c"),
+                                3,
+                                null));
     }
 
     @ParameterizedTest
@@ -310,6 +352,19 @@ class FieldCollectionAggregatorTest {
                     map.valueArray().isNullAt(i) ? null : map.valueArray().getString(i).toString());
         }
         return entries;
+    }
+
+    private static void assertCollectedValues(
+            BinaryValue value, DataType elementType, Object... expected) {
+        assertThat(value.row.isNullAt(1)).isFalse();
+        InternalArray array = value.row.getArray(1);
+        InternalArray.ElementGetter getter =
+                InternalArray.createDeepElementGetter(elementType, true);
+        Object[] actual = new Object[array.size()];
+        for (int i = 0; i < array.size(); i++) {
+            actual[i] = getter.getElementOrNull(array, i);
+        }
+        assertThat(actual).containsExactly(expected);
     }
 
     private static Schema schema(DataType type, AggFunction function) {
