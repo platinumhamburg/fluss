@@ -22,9 +22,11 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.functions;
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
  * additional information regarding copyright ownership. */
 
+import org.apache.fluss.row.GenericArray;
 import org.apache.fluss.row.GenericMap;
 import org.apache.fluss.row.InternalArray;
 import org.apache.fluss.row.InternalMap;
+import org.apache.fluss.row.columnar.ColumnarMap;
 import org.apache.fluss.types.DataTypeRoot;
 import org.apache.fluss.types.MapType;
 import org.apache.fluss.utils.ByteArrayWrapper;
@@ -69,11 +71,15 @@ public class FieldMergeMapAgg extends FieldAggregator {
         putToMap(resultMap, accumulatorMap);
         putToMap(resultMap, inputMap);
         if (binaryKeys) {
-            Map<Object, Object> unwrappedMap = new HashMap<>(resultMap.size());
+            Object[] keys = new Object[resultMap.size()];
+            Object[] values = new Object[resultMap.size()];
+            int i = 0;
             for (Map.Entry<Object, Object> entry : resultMap.entrySet()) {
-                unwrappedMap.put(((ByteArrayWrapper) entry.getKey()).getData(), entry.getValue());
+                keys[i] = ((ByteArrayWrapper) entry.getKey()).getData();
+                values[i] = entry.getValue();
+                i++;
             }
-            return new GenericMap(unwrappedMap);
+            return new ColumnarMap(new GenericArray(keys), new GenericArray(values));
         }
         return new GenericMap(resultMap);
     }

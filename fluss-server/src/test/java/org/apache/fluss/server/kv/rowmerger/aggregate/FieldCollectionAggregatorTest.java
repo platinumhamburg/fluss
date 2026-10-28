@@ -45,9 +45,13 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.entry;
 
 /** Tests for collection aggregation semantics and encoding in both KV formats. */
 class FieldCollectionAggregatorTest {
@@ -161,20 +165,27 @@ class FieldCollectionAggregatorTest {
                         value(
                                 schema,
                                 format,
-                                GenericMap.of(new byte[] {1, 2}, BinaryString.fromString("old"))),
+                                GenericMap.of(
+                                        new byte[] {1, 2}, BinaryString.fromString("old"),
+                                        new byte[] {3, 4}, BinaryString.fromString("kept"))),
                         value(
                                 schema,
                                 format,
-                                GenericMap.of(new byte[] {1, 2}, BinaryString.fromString("new"))));
+                                GenericMap.of(
+                                        new byte[] {1, 2}, BinaryString.fromString("new"),
+                                        new byte[] {5, 6}, BinaryString.fromString("added"))));
         InternalMap map = result.row.getMap(1);
-        assertThat(map.size()).isEqualTo(1);
-        assertThat(map.keyArray().getBytes(0)).containsExactly((byte) 1, (byte) 2);
-        assertThat(map.valueArray().getString(0)).isEqualTo(BinaryString.fromString("new"));
+        assertThat(map.size()).isEqualTo(3);
+        assertThat(binaryMapEntries(map))
+                .containsOnly(
+                        entry("[1, 2]", "new"), entry("[3, 4]", "kept"), entry("[5, 6]", "added"));
 
         result =
                 merger.merge(result, value(schema, format, GenericMap.of(new byte[] {1, 2}, null)));
-        assertThat(result.row.getMap(1).size()).isEqualTo(1);
-        assertThat(result.row.getMap(1).valueArray().isNullAt(0)).isTrue();
+        assertThat(result.row.getMap(1).size()).isEqualTo(3);
+        assertThat(binaryMapEntries(result.row.getMap(1)))
+                .containsOnly(
+                        entry("[1, 2]", null), entry("[3, 4]", "kept"), entry("[5, 6]", "added"));
     }
 
     static Stream<Arguments> binaryMapKeys() {
@@ -183,6 +194,16 @@ class FieldCollectionAggregatorTest {
                         format ->
                                 Stream.of(DataTypes.BYTES(), DataTypes.BINARY(2))
                                         .map(type -> Arguments.of(format, type)));
+    }
+
+    private static Map<String, String> binaryMapEntries(InternalMap map) {
+        Map<String, String> entries = new HashMap<>();
+        for (int i = 0; i < map.size(); i++) {
+            entries.put(
+                    Arrays.toString(map.keyArray().getBytes(i)),
+                    map.valueArray().isNullAt(i) ? null : map.valueArray().getString(i).toString());
+        }
+        return entries;
     }
 
     private static Schema schema(DataType type, AggFunction function) {
