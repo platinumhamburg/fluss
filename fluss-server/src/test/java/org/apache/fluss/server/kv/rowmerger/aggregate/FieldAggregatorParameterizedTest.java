@@ -30,9 +30,7 @@ import org.apache.fluss.row.Decimal;
 import org.apache.fluss.row.GenericArray;
 import org.apache.fluss.row.GenericMap;
 import org.apache.fluss.row.InternalArray;
-import org.apache.fluss.row.InternalArrayUtils;
 import org.apache.fluss.row.InternalMap;
-import org.apache.fluss.row.InternalMapUtils;
 import org.apache.fluss.row.TimestampLtz;
 import org.apache.fluss.row.TimestampNtz;
 import org.apache.fluss.server.kv.rowmerger.AggregateRowMerger;
@@ -663,7 +661,7 @@ class FieldAggregatorParameterizedTest {
 
         BinaryValue merged = merger.merge(toBinaryValue(row1), toBinaryValue(row2));
         InternalArray resultArray = merged.row.getArray(1);
-        Object[] actual = InternalArrayUtils.toObjectArray(resultArray, DataTypes.INT());
+        Object[] actual = toObjectArray(resultArray, DataTypes.INT());
         assertThat(actual).containsExactly(1, 2, 2, null, 3);
     }
 
@@ -689,7 +687,7 @@ class FieldAggregatorParameterizedTest {
 
         BinaryValue merged = merger.merge(toBinaryValue(row1), toBinaryValue(row2));
         InternalArray resultArray = merged.row.getArray(1);
-        Object[] actual = InternalArrayUtils.toObjectArray(resultArray, DataTypes.INT());
+        Object[] actual = toObjectArray(resultArray, DataTypes.INT());
         assertThat(actual).containsExactlyInAnyOrder(1, 2, 3, null);
     }
 
@@ -720,7 +718,7 @@ class FieldAggregatorParameterizedTest {
 
         BinaryValue merged = merger.merge(toBinaryValue(row1), toBinaryValue(row2));
         InternalArray resultArray = merged.row.getArray(1);
-        Object[] actual = InternalArrayUtils.toObjectArray(resultArray, DataTypes.BYTES());
+        Object[] actual = toObjectArray(resultArray, DataTypes.BYTES());
 
         // Null values are included in collect, distinct keeps a single null.
         assertThat(actual).hasSize(4);
@@ -763,8 +761,7 @@ class FieldAggregatorParameterizedTest {
 
         BinaryValue merged = merger.merge(toBinaryValue(row1), toBinaryValue(row2));
         InternalMap resultMap = merged.row.getMap(1);
-        Map<Object, Object> actual =
-                InternalMapUtils.toJavaMap(resultMap, DataTypes.INT(), DataTypes.STRING());
+        Map<Object, Object> actual = toJavaMap(resultMap, DataTypes.INT(), DataTypes.STRING());
         Map<Object, Object> expected = new HashMap<>();
         expected.put(1, "a");
         expected.put(2, "c");
@@ -1030,5 +1027,39 @@ class FieldAggregatorParameterizedTest {
     private static TimestampLtz timestampLtz(String timestamp) {
         Instant instant = LocalDateTime.parse(timestamp).toInstant(ZoneOffset.UTC);
         return TimestampLtz.fromInstant(instant);
+    }
+
+    private static Object[] toObjectArray(InternalArray array, DataType elementType) {
+        Object[] result = new Object[array.size()];
+        InternalArray.ElementGetter elementGetter = InternalArray.createElementGetter(elementType);
+        for (int i = 0; i < array.size(); i++) {
+            Object element = elementGetter.getElementOrNull(array, i);
+            if (element instanceof BinaryString) {
+                element = element.toString();
+            }
+            result[i] = element;
+        }
+        return result;
+    }
+
+    private static Map<Object, Object> toJavaMap(
+            InternalMap map, DataType keyType, DataType valueType) {
+        Map<Object, Object> result = new HashMap<>();
+        InternalArray keyArray = map.keyArray();
+        InternalArray valueArray = map.valueArray();
+        InternalArray.ElementGetter keyGetter = InternalArray.createElementGetter(keyType);
+        InternalArray.ElementGetter valueGetter = InternalArray.createElementGetter(valueType);
+        for (int i = 0; i < keyArray.size(); i++) {
+            Object key = keyGetter.getElementOrNull(keyArray, i);
+            Object value = valueGetter.getElementOrNull(valueArray, i);
+            if (key instanceof BinaryString) {
+                key = key.toString();
+            }
+            if (value instanceof BinaryString) {
+                value = value.toString();
+            }
+            result.put(key, value);
+        }
+        return result;
     }
 }

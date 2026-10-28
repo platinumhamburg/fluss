@@ -342,7 +342,8 @@ public final class AggFunctions {
     /**
      * Creates a COLLECT aggregation function with distinct behavior.
      *
-     * <p>Collects multiple elements into an array, optionally removing duplicates.
+     * <p>Collects multiple elements into an array, optionally removing duplicates. Elements retain
+     * their first occurrence order when duplicates are removed.
      *
      * <p>Supported data types: ARRAY&lt;T&gt;
      *

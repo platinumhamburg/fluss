@@ -1160,8 +1160,13 @@ Collects array elements into a single array.
 
 - **Supported Data Types**: `ARRAY<T>`
 - **Behavior**: Concatenates array elements; with `distinct=true`, duplicates are removed
+- **Ordering**: Elements follow the order writes reach the server. With `distinct=true`, the first occurrence of each element is retained
 - **Null Handling**: Null elements are retained; null inputs are ignored
 - **Parameters**: `distinct` (`true` or `false`, default is `false`)
+
+:::note
+The collected array has no size limit. Every update rewrites the whole stored array. With the default `'table.changelog.image' = 'full'`, both the old and the new array are also written to the changelog on every update. As the array grows, so do memory usage, write costs, and changelog volume. Use `last_n` when only a bounded number of recent elements is needed.
+:::
 
 **Example:**
 <Tabs>
@@ -1175,7 +1180,7 @@ CREATE TABLE test_collect  (
 ) WITH (
     'table.merge-engine' = 'aggregation',
     'fields.tags.agg' = 'collect',
-    'fields.tags.distinct' = 'true'
+    'fields.tags.collect.distinct' = 'true'
 );
 
 INSERT INTO test_collect VALUES
@@ -1183,7 +1188,7 @@ INSERT INTO test_collect VALUES
     (1, ARRAY[2, 3, NULL]);
 
 SELECT * FROM test_collect;
--- Result (order is not guaranteed with distinct):
+-- Result:
 -- (1, [1, 2, 3, NULL])
 ```
 
@@ -1203,7 +1208,7 @@ TableDescriptor.builder()
     .build();
 
 // Input: (1, [1, 2, 2]), (1, [2, 3, null])
-// Result: (1, [1, 2, 3, null]) -- order not guaranteed when distinct is true
+// Result: (1, [1, 2, 3, null])
 ```
 
 </TabItem>

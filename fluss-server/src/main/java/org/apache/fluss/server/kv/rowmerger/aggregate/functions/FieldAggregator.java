@@ -22,7 +22,6 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.functions;
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
  * additional information regarding copyright ownership. */
 
-import org.apache.fluss.row.BinaryRow.BinaryRowFormat;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeRoot;
 
@@ -35,7 +34,6 @@ public abstract class FieldAggregator implements Serializable {
 
     protected final DataType fieldType;
     protected final DataTypeRoot typeRoot;
-    protected BinaryRowFormat rowFormat = BinaryRowFormat.COMPACTED;
 
     public FieldAggregator(DataType dataType) {
         this.fieldType = dataType;
@@ -69,10 +67,6 @@ public abstract class FieldAggregator implements Serializable {
      */
     public boolean requiresAggOnFirstWrite() {
         return false;
-    }
-
-    public void setRowFormat(BinaryRowFormat rowFormat) {
-        this.rowFormat = rowFormat;
     }
 
     /** Resets the aggregator to a clean start state. */

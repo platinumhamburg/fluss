@@ -24,132 +24,71 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.functions;
 
 import org.apache.fluss.row.GenericArray;
 import org.apache.fluss.row.InternalArray;
-import org.apache.fluss.row.InternalArrayUtils;
 import org.apache.fluss.types.ArrayType;
-import org.apache.fluss.types.DataType;
-import org.apache.fluss.types.DataTypeRoot;
+import org.apache.fluss.utils.ByteArrayWrapper;
 
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.Collection;
+import java.util.LinkedHashSet;
 
-/** Collect elements into an ARRAY. */
+/** Collects array elements, retaining their first occurrence order when distinct is enabled. */
 public class FieldCollectAgg extends FieldAggregator {
 
     private static final long serialVersionUID = 1L;
 
     private final boolean distinct;
-    private final DataType elementType;
-    private final DataTypeRoot elementTypeRoot;
     private final InternalArray.ElementGetter elementGetter;
 
+    /** Creates a collector for the given array type and duplicate handling. */
     public FieldCollectAgg(ArrayType dataType, boolean distinct) {
         super(dataType);
         this.distinct = distinct;
-        this.elementType = dataType.getElementType();
-        this.elementTypeRoot = dataType.getElementType().getTypeRoot();
-        this.elementGetter = InternalArray.createElementGetter(elementType);
+        this.elementGetter = InternalArray.createElementGetter(dataType.getElementType());
     }
 
     @Override
     public Object agg(Object accumulator, Object inputField) {
-        if (accumulator == null && inputField == null) {
-            return null;
-        }
-
-        if (accumulator == null) {
-            return inputField;
-        }
         if (inputField == null) {
             return accumulator;
+        }
+        if (accumulator == null && !distinct) {
+            return inputField;
         }
 
         InternalArray accumulatorArray = (InternalArray) accumulator;
         InternalArray inputArray = (InternalArray) inputField;
-        int expectedSize = accumulatorArray.size() + inputArray.size();
-
+        int expectedSize =
+                (accumulatorArray == null ? 0 : accumulatorArray.size()) + inputArray.size();
+        Collection<Object> elements =
+                distinct ? new LinkedHashSet<>(expectedSize) : new ArrayList<>(expectedSize);
+        collect(elements, accumulatorArray);
+        collect(elements, inputArray);
+        Object[] result = elements.toArray();
         if (distinct) {
-            int capacity = (int) (expectedSize / 0.75f) + 1;
-            if (elementTypeRoot == DataTypeRoot.BINARY || elementTypeRoot == DataTypeRoot.BYTES) {
-                List<Object> collection = new ArrayList<>(expectedSize);
-                Set<ByteArrayWrapper> seen = new HashSet<>(capacity);
-                boolean seenNull = false;
-                seenNull = collectDistinctBinary(collection, seen, seenNull, accumulatorArray);
-                collectDistinctBinary(collection, seen, seenNull, inputArray);
-                return new GenericArray(collection.toArray());
-            } else {
-                Set<Object> seen = new HashSet<>(capacity);
-                collectDistinct(seen, accumulatorArray);
-                collectDistinct(seen, inputArray);
-                return new GenericArray(seen.toArray());
+            for (int i = 0; i < result.length; i++) {
+                if (result[i] instanceof ByteArrayWrapper) {
+                    result[i] = ((ByteArrayWrapper) result[i]).getData();
+                }
             }
         }
-
-        // No distinct: encode directly to binary to avoid extra heap allocations/copies.
-        return InternalArrayUtils.concatToBinaryArray(
-                accumulatorArray, inputArray, elementType, rowFormat);
+        return new GenericArray(result);
     }
 
     @Override
-    public Object aggReversed(Object accumulator, Object inputField) {
-        // For collect, order doesn't matter for distinct sets
-        // For non-distinct, we just append, so reversed is same as normal
-        return agg(accumulator, inputField);
+    public boolean requiresAggOnFirstWrite() {
+        return distinct;
     }
 
-    private void collectDistinct(Set<Object> seen, InternalArray array) {
+    private void collect(Collection<Object> elements, InternalArray array) {
+        if (array == null) {
+            return;
+        }
         for (int i = 0; i < array.size(); i++) {
             Object element = elementGetter.getElementOrNull(array, i);
-            seen.add(element);
-        }
-    }
-
-    private boolean collectDistinctBinary(
-            List<Object> collection,
-            Set<ByteArrayWrapper> seen,
-            boolean seenNull,
-            InternalArray array) {
-        for (int i = 0; i < array.size(); i++) {
-            Object element = elementGetter.getElementOrNull(array, i);
-            if (element == null) {
-                if (!seenNull) {
-                    seenNull = true;
-                    collection.add(null);
-                }
-                continue;
-            }
-            byte[] bytes = (byte[]) element;
-            if (seen.add(new ByteArrayWrapper(bytes))) {
-                collection.add(bytes);
-            }
-        }
-        return seenNull;
-    }
-
-    private static final class ByteArrayWrapper {
-        private final byte[] bytes;
-
-        private ByteArrayWrapper(byte[] bytes) {
-            this.bytes = bytes;
-        }
-
-        @Override
-        public boolean equals(Object obj) {
-            if (this == obj) {
-                return true;
-            }
-            if (!(obj instanceof ByteArrayWrapper)) {
-                return false;
-            }
-            ByteArrayWrapper other = (ByteArrayWrapper) obj;
-            return Arrays.equals(bytes, other.bytes);
-        }
-
-        @Override
-        public int hashCode() {
-            return Arrays.hashCode(bytes);
+            elements.add(
+                    distinct && element instanceof byte[]
+                            ? new ByteArrayWrapper((byte[]) element)
+                            : element);
         }
     }
 }

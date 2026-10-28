@@ -25,7 +25,9 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.functions;
 import org.apache.fluss.row.GenericMap;
 import org.apache.fluss.row.InternalArray;
 import org.apache.fluss.row.InternalMap;
+import org.apache.fluss.types.DataTypeRoot;
 import org.apache.fluss.types.MapType;
+import org.apache.fluss.utils.ByteArrayWrapper;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -34,11 +36,14 @@ import java.util.Map;
 public class FieldMergeMapAgg extends FieldAggregator {
 
     private static final long serialVersionUID = 1L;
+    private final boolean binaryKeys;
     private final InternalArray.ElementGetter keyGetter;
     private final InternalArray.ElementGetter valueGetter;
 
+    /** Creates a map merger whose duplicate keys are resolved in favor of the input. */
     public FieldMergeMapAgg(MapType dataType) {
         super(dataType);
+        this.binaryKeys = dataType.getKeyType().isAnyOf(DataTypeRoot.BINARY, DataTypeRoot.BYTES);
         this.keyGetter = InternalArray.createElementGetter(dataType.getKeyType());
         this.valueGetter = InternalArray.createElementGetter(dataType.getValueType());
     }
@@ -63,6 +68,13 @@ public class FieldMergeMapAgg extends FieldAggregator {
         Map<Object, Object> resultMap = new HashMap<>(capacity);
         putToMap(resultMap, accumulatorMap);
         putToMap(resultMap, inputMap);
+        if (binaryKeys) {
+            Map<Object, Object> unwrappedMap = new HashMap<>(resultMap.size());
+            for (Map.Entry<Object, Object> entry : resultMap.entrySet()) {
+                unwrappedMap.put(((ByteArrayWrapper) entry.getKey()).getData(), entry.getValue());
+            }
+            return new GenericMap(unwrappedMap);
+        }
         return new GenericMap(resultMap);
     }
 
@@ -72,7 +84,7 @@ public class FieldMergeMapAgg extends FieldAggregator {
         for (int i = 0; i < keyArray.size(); i++) {
             Object key = keyGetter.getElementOrNull(keyArray, i);
             Object value = valueGetter.getElementOrNull(valueArray, i);
-            map.put(key, value);
+            map.put(binaryKeys ? new ByteArrayWrapper((byte[]) key) : key, value);
         }
     }
 }

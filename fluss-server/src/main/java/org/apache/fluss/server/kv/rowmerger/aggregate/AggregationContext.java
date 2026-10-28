@@ -23,7 +23,6 @@ import org.apache.fluss.metadata.AggFunctionType;
 import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.Schema;
-import org.apache.fluss.row.BinaryRow.BinaryRowFormat;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.RowEncoder;
 import org.apache.fluss.server.kv.rowmerger.aggregate.factory.FieldAggregatorFactory;
@@ -232,13 +231,6 @@ public class AggregationContext {
 
         // Create aggregators
         FieldAggregator[] aggregators = createAggregators(schema);
-        BinaryRowFormat rowFormat =
-                kvFormat == KvFormat.COMPACTED
-                        ? BinaryRowFormat.COMPACTED
-                        : BinaryRowFormat.INDEXED;
-        for (FieldAggregator aggregator : aggregators) {
-            aggregator.setRowFormat(rowFormat);
-        }
 
         // Create row encoder
         RowEncoder rowEncoder = RowEncoder.create(kvFormat, rowType);

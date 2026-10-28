@@ -40,8 +40,8 @@ public class FieldCollectAggFactory implements FieldAggregatorFactory {
                 "Data type for collect column must be 'ArrayType' but was '%s'.",
                 fieldType);
 
-        // Get distinct parameter, default to false
-        boolean distinct = aggFunction.getBooleanParameter(AggFunctionType.PARAM_DISTINCT, false);
+        boolean distinct =
+                Boolean.parseBoolean(aggFunction.getParameter(AggFunctionType.PARAM_DISTINCT));
 
         return new FieldCollectAgg((ArrayType) fieldType, distinct);
     }
