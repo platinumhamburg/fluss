@@ -149,20 +149,31 @@ class PrometheusReporterTest {
     }
 
     @Test
-    void emptyHistogramWindowOmitsQuantilesButKeepsCumulativeCount() throws UnirestException {
+    void emptyHistogramWindowReportsNaNQuantilesAndCumulativeCount() throws UnirestException {
         TestHistogram histogram = new TestHistogram();
         histogram.setCount(10);
         histogram.setSize(0);
 
-        String response = addMetricAndPollResponse(histogram, "idleHistogram");
+        String histogramName = "idleHistogram";
+        String response = addMetricAndPollResponse(histogram, histogramName);
 
         assertThat(response)
-                .contains(createExpectedPollResponse("idleHistogram", "_count", "summary", "10.0"))
-                .doesNotContain(SCOPE_PREFIX + "idleHistogram{" + DIMENSIONS + ",quantile=");
+                .contains(createExpectedPollResponse(histogramName, "_count", "summary", "10.0"));
+        for (String quantile : Arrays.asList("0.5", "0.75", "0.95", "0.98", "0.99", "0.999")) {
+            assertThat(response)
+                    .contains(
+                            SCOPE_PREFIX
+                                    + histogramName
+                                    + "{"
+                                    + DIMENSIONS
+                                    + ",quantile=\""
+                                    + quantile
+                                    + "\",} NaN\n");
+        }
     }
 
     @Test
-    void expiringHistogramStopsAndResumesExportingQuantiles() throws UnirestException {
+    void expiringHistogramReportsNaNQuantilesUntilNextObservation() throws UnirestException {
         ManualClock clock = new ManualClock();
         TestingExpiringHistogram histogram =
                 new TestingExpiringHistogram(3, Duration.ofMinutes(5), clock);
@@ -181,7 +192,7 @@ class PrometheusReporterTest {
         response = pollMetrics(reporter.getPort()).getBody();
         assertThat(response)
                 .contains(createExpectedPollResponse(metricName, "_count", "summary", "1.0"))
-                .doesNotContain(quantileSeries);
+                .contains(quantileSeries + "NaN\n");
 
         histogram.update(10);
         response = pollMetrics(reporter.getPort()).getBody();
