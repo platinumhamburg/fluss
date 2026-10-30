@@ -32,9 +32,13 @@ import org.apache.fluss.metrics.groups.MetricGroup;
 import org.apache.fluss.metrics.registry.MetricRegistry;
 import org.apache.fluss.server.kv.rocksdb.RocksDBStatistics;
 
+import io.github.fluss_contrib.rocksdb.Statistics;
+
 import javax.annotation.Nullable;
 
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
@@ -362,36 +366,41 @@ public class TableMetricGroup extends AbstractMetricGroup {
                 .filter(stats -> stats != null);
     }
 
+    private Stream<RocksDBStatistics> distinctStatisticsSources() {
+        Set<Statistics> seen = new HashSet<>();
+        return allRocksDBStatistics()
+                .filter(stats -> stats.getStatistics() != null && seen.add(stats.getStatistics()));
+    }
+
     public TabletServerMetricGroup getServerMetricGroup() {
         return (TabletServerMetricGroup) parent;
     }
 
     /**
-     * Register RocksDB aggregated metrics at table level. These metrics aggregate values from all
-     * buckets of this table.
+     * Registers native statistics once per shared object, and DB properties over all live buckets.
+     * The historical Max metric names are retained for reporter compatibility; shared histograms
+     * represent all samples of this table on this server, and stall time is cumulative across DBs.
      *
      * <p>This method is called once during TableMetricGroup construction for KV tables.
      */
     private void registerRocksDBMetrics() {
-        // Max aggregation metrics - track the maximum value across all buckets
         gauge(
                 MetricNames.ROCKSDB_WRITE_STALL_MICROS_MAX,
                 () ->
-                        allRocksDBStatistics()
+                        distinctStatisticsSources()
                                 .mapToLong(RocksDBStatistics::getWriteStallMicros)
-                                .max()
-                                .orElse(0L));
+                                .sum());
         gauge(
                 MetricNames.ROCKSDB_GET_LATENCY_MICROS_MAX,
                 () ->
-                        allRocksDBStatistics()
+                        distinctStatisticsSources()
                                 .mapToLong(RocksDBStatistics::getGetLatencyMicros)
                                 .max()
                                 .orElse(0L));
         gauge(
                 MetricNames.ROCKSDB_WRITE_LATENCY_MICROS_MAX,
                 () ->
-                        allRocksDBStatistics()
+                        distinctStatisticsSources()
                                 .mapToLong(RocksDBStatistics::getWriteLatencyMicros)
                                 .max()
                                 .orElse(0L));
@@ -419,33 +428,35 @@ public class TableMetricGroup extends AbstractMetricGroup {
         gauge(
                 MetricNames.ROCKSDB_COMPACTION_TIME_MICROS_MAX,
                 () ->
-                        allRocksDBStatistics()
+                        distinctStatisticsSources()
                                 .mapToLong(RocksDBStatistics::getCompactionTimeMicros)
                                 .max()
                                 .orElse(0L));
-        // Sum aggregation metrics - track the total value across all buckets
         gauge(
                 MetricNames.ROCKSDB_BYTES_READ_TOTAL,
-                () -> allRocksDBStatistics().mapToLong(RocksDBStatistics::getBytesRead).sum());
+                () -> distinctStatisticsSources().mapToLong(RocksDBStatistics::getBytesRead).sum());
         gauge(
                 MetricNames.ROCKSDB_BYTES_WRITTEN_TOTAL,
-                () -> allRocksDBStatistics().mapToLong(RocksDBStatistics::getBytesWritten).sum());
+                () ->
+                        distinctStatisticsSources()
+                                .mapToLong(RocksDBStatistics::getBytesWritten)
+                                .sum());
         gauge(
                 MetricNames.ROCKSDB_FLUSH_BYTES_WRITTEN_TOTAL,
                 () ->
-                        allRocksDBStatistics()
+                        distinctStatisticsSources()
                                 .mapToLong(RocksDBStatistics::getFlushBytesWritten)
                                 .sum());
         gauge(
                 MetricNames.ROCKSDB_COMPACTION_BYTES_READ_TOTAL,
                 () ->
-                        allRocksDBStatistics()
+                        distinctStatisticsSources()
                                 .mapToLong(RocksDBStatistics::getCompactionBytesRead)
                                 .sum());
         gauge(
                 MetricNames.ROCKSDB_COMPACTION_BYTES_WRITTEN_TOTAL,
                 () ->
-                        allRocksDBStatistics()
+                        distinctStatisticsSources()
                                 .mapToLong(RocksDBStatistics::getCompactionBytesWritten)
                                 .sum());
 

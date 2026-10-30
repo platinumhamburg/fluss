@@ -17,17 +17,31 @@
 
 package org.apache.fluss.server.metrics.group;
 
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.Counter;
+import org.apache.fluss.metrics.Gauge;
 import org.apache.fluss.metrics.MeterView;
 import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.metrics.ThreadSafeSimpleCounter;
 import org.apache.fluss.metrics.groups.AbstractMetricGroup;
 import org.apache.fluss.metrics.registry.MetricRegistry;
 import org.apache.fluss.metrics.registry.NOPMetricRegistry;
+import org.apache.fluss.server.kv.rocksdb.RocksDBKv;
+import org.apache.fluss.server.kv.rocksdb.RocksDBKvBuilder;
+import org.apache.fluss.server.kv.rocksdb.RocksDBResourceContainer;
+import org.apache.fluss.server.kv.rocksdb.RocksDBStatistics;
+import org.apache.fluss.server.kv.rocksdb.RocksDBStatisticsRegistry;
 
+import io.github.fluss_contrib.rocksdb.HistogramType;
+import io.github.fluss_contrib.rocksdb.Statistics;
+import io.github.fluss_contrib.rocksdb.TickerType;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
+
+import java.io.File;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -38,6 +52,83 @@ import static org.mockito.Mockito.verify;
 
 /** Test for {@link TableMetricGroup}. */
 class TableMetricGroupTest {
+
+    @Test
+    void testSharedStatisticsAreCountedOnceButMemoryUsesEveryDb(@TempDir File directory)
+            throws Exception {
+        RocksDBStatisticsRegistry registry = new RocksDBStatisticsRegistry();
+        TableMetricGroup group =
+                new TableMetricGroup(
+                        NOPMetricRegistry.INSTANCE,
+                        TablePath.of("db", "table"),
+                        true,
+                        TestingMetricGroups.TABLET_SERVER_METRICS);
+        try (RocksDBKv first = createKv(new File(directory, "first"), registry);
+                RocksDBKv second = createKv(new File(directory, "second"), registry)) {
+            RocksDBStatistics firstStats =
+                    new RocksDBStatistics(
+                            first.getDb(),
+                            first.getStatistics(),
+                            first.getResourceGuard(),
+                            first.getDefaultColumnFamilyHandle(),
+                            first.getBlockCache());
+            RocksDBStatistics secondStats =
+                    new RocksDBStatistics(
+                            second.getDb(),
+                            second.getStatistics(),
+                            second.getResourceGuard(),
+                            second.getDefaultColumnFamilyHandle(),
+                            second.getBlockCache());
+            group.addBucketMetricGroup(null, new TableBucket(1, 0))
+                    .registerRocksDBStatistics(firstStats);
+            group.addBucketMetricGroup("partition", new TableBucket(1, 2L, 1))
+                    .registerRocksDBStatistics(secondStats);
+            first.put(new byte[] {1}, new byte[] {2});
+            second.put(new byte[] {3}, new byte[] {4, 5});
+            first.get(new byte[] {1});
+            second.get(new byte[] {3});
+
+            Statistics statistics = first.getStatistics();
+            assertThat(statistics).isSameAs(second.getStatistics());
+            assertThat(statistics.getTickerCount(TickerType.BYTES_WRITTEN)).isPositive();
+            assertThat(gaugeValue(group, MetricNames.ROCKSDB_BYTES_WRITTEN_TOTAL))
+                    .isEqualTo(statistics.getTickerCount(TickerType.BYTES_WRITTEN));
+            assertThat(gaugeValue(group, MetricNames.ROCKSDB_BYTES_READ_TOTAL))
+                    .isEqualTo(statistics.getTickerCount(TickerType.BYTES_READ));
+            assertThat(gaugeValue(group, MetricNames.ROCKSDB_GET_LATENCY_MICROS_MAX))
+                    .isEqualTo(
+                            Math.round(
+                                    statistics
+                                            .getHistogramData(HistogramType.DB_GET)
+                                            .getPercentile99()));
+            assertThat(gaugeValue(group, MetricNames.ROCKSDB_MEMTABLE_MEMORY_USAGE_TOTAL))
+                    .isEqualTo(
+                            firstStats.getMemTableMemoryUsage()
+                                    + secondStats.getMemTableMemoryUsage());
+
+            first.close();
+            assertThat(gaugeValue(group, MetricNames.ROCKSDB_BYTES_WRITTEN_TOTAL))
+                    .isEqualTo(statistics.getTickerCount(TickerType.BYTES_WRITTEN));
+            group.removeBucketMetricGroup(new TableBucket(1, 0));
+            second.put(new byte[] {6}, new byte[] {7});
+            assertThat(gaugeValue(group, MetricNames.ROCKSDB_BYTES_WRITTEN_TOTAL))
+                    .isEqualTo(statistics.getTickerCount(TickerType.BYTES_WRITTEN));
+        } finally {
+            group.close();
+        }
+    }
+
+    private RocksDBKv createKv(File directory, RocksDBStatisticsRegistry registry)
+            throws Exception {
+        RocksDBResourceContainer container =
+                new RocksDBResourceContainer(new Configuration(), directory, true);
+        container.useSharedStatistics(registry.acquire(1));
+        return new RocksDBKvBuilder(directory, container, container.getColumnOptions()).build();
+    }
+
+    private long gaugeValue(TableMetricGroup group, String name) {
+        return ((Number) ((Gauge<?>) group.getMetrics().get(name)).getValue()).longValue();
+    }
 
     @Test
     void testRemoteKvCopyRateMetric() {

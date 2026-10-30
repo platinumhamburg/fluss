@@ -73,6 +73,12 @@ public class RocksDBStatistics implements AutoCloseable {
         this.blockCache = blockCache;
     }
 
+    /** Returns the active native statistics identity for deduplicating shared table statistics. */
+    @Nullable
+    public Statistics getStatistics() {
+        return resourceGuard.isClosed() ? null : statistics;
+    }
+
     // ==================== Ticker-based Metrics ====================
 
     /**
@@ -440,7 +446,7 @@ public class RocksDBStatistics implements AutoCloseable {
 
     @Override
     public void close() {
-        // No resources to clean up, statistics are managed by TableMetricGroup
+        // The DB resource container owns the statistics reference.
         LOG.debug("RocksDB statistics accessor closed");
     }
 }

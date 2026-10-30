@@ -179,14 +179,14 @@ public class MetricNames {
     // --------------------------------------------------------------------------------------------
     // RocksDB metrics
     // --------------------------------------------------------------------------------------------
-    // Table-level RocksDB metrics (aggregated from all buckets of a table, Max aggregation)
-    /** Maximum write stall duration across all buckets of this table (Max aggregation). */
+    // Table-level native statistics and DB properties.
+    /** Cumulative table write stall time; the Max suffix is retained for reporter compatibility. */
     public static final String ROCKSDB_WRITE_STALL_MICROS_MAX = "rocksdbWriteStallMicrosMax";
 
-    /** Maximum get latency across all buckets of this table (Max aggregation). */
+    /** Table Get P99; the Max suffix is retained for reporter compatibility. */
     public static final String ROCKSDB_GET_LATENCY_MICROS_MAX = "rocksdbGetLatencyMicrosMax";
 
-    /** Maximum write latency across all buckets of this table (Max aggregation). */
+    /** Table Write P99; the Max suffix is retained for reporter compatibility. */
     public static final String ROCKSDB_WRITE_LATENCY_MICROS_MAX = "rocksdbWriteLatencyMicrosMax";
 
     /** Maximum number of L0 files across all buckets of this table (Max aggregation). */
@@ -198,7 +198,7 @@ public class MetricNames {
     /** Maximum compaction pending indicator across all buckets of this table (Max aggregation). */
     public static final String ROCKSDB_COMPACTION_PENDING_MAX = "rocksdbCompactionPendingMax";
 
-    /** Maximum compaction time across all buckets of this table (Max aggregation). */
+    /** Table compaction P99; the Max suffix is retained for reporter compatibility. */
     public static final String ROCKSDB_COMPACTION_TIME_MICROS_MAX =
             "rocksdbCompactionTimeMicrosMax";
 

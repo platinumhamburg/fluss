@@ -51,6 +51,7 @@ import org.apache.fluss.server.kv.rocksdb.RocksDBKv;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKvBuilder;
 import org.apache.fluss.server.kv.rocksdb.RocksDBResourceContainer;
 import org.apache.fluss.server.kv.rocksdb.RocksDBStatistics;
+import org.apache.fluss.server.kv.rocksdb.RocksDBStatisticsRegistry;
 import org.apache.fluss.server.kv.rowmerger.RowMerger;
 import org.apache.fluss.server.kv.scan.OpenScanResult;
 import org.apache.fluss.server.kv.scan.ScannerContext;
@@ -320,6 +321,7 @@ public final class KvTablet {
                 sharedRateLimiter,
                 null,
                 null,
+                null,
                 new KvFlushScheduler(serverConf),
                 true,
                 null,
@@ -345,6 +347,7 @@ public final class KvTablet {
             RateLimiter sharedRateLimiter,
             @Nullable Cache sharedBlockCache,
             @Nullable WriteBufferManager sharedWriteBufferManager,
+            RocksDBStatisticsRegistry statisticsRegistry,
             KvFlushScheduler kvFlushScheduler,
             @Nullable Runnable flushCompleteListener,
             AutoIncrementManager autoIncrementManager,
@@ -368,6 +371,7 @@ public final class KvTablet {
                 sharedRateLimiter,
                 sharedBlockCache,
                 sharedWriteBufferManager,
+                statisticsRegistry,
                 kvFlushScheduler,
                 false,
                 flushCompleteListener,
@@ -415,6 +419,7 @@ public final class KvTablet {
                 sharedRateLimiter,
                 sharedBlockCache,
                 null,
+                null,
                 kvFlushScheduler,
                 false,
                 flushCompleteListener,
@@ -440,6 +445,7 @@ public final class KvTablet {
             RateLimiter sharedRateLimiter,
             @Nullable Cache sharedBlockCache,
             @Nullable WriteBufferManager sharedWriteBufferManager,
+            @Nullable RocksDBStatisticsRegistry statisticsRegistry,
             KvFlushScheduler kvFlushScheduler,
             boolean closeFlushScheduler,
             @Nullable Runnable flushCompleteListener,
@@ -486,6 +492,8 @@ public final class KvTablet {
                         sharedRateLimiter,
                         sharedBlockCache,
                         sharedWriteBufferManager,
+                        statisticsRegistry,
+                        tableBucket.getTableId(),
                         compactionFilterFactory);
 
         // Create RocksDB statistics accessor (will be registered to TableMetricGroup by Replica)
@@ -566,6 +574,7 @@ public final class KvTablet {
                 sharedRateLimiter,
                 null,
                 null,
+                null,
                 new KvFlushScheduler(serverConf),
                 true,
                 null,
@@ -580,6 +589,8 @@ public final class KvTablet {
             RateLimiter sharedRateLimiter,
             @Nullable Cache sharedBlockCache,
             @Nullable WriteBufferManager sharedWriteBufferManager,
+            @Nullable RocksDBStatisticsRegistry statisticsRegistry,
+            long tableId,
             @Nullable
                     AbstractCompactionFilterFactory<? extends AbstractCompactionFilter<?>>
                             compactionFilterFactory)
@@ -595,6 +606,9 @@ public final class KvTablet {
                             sharedRateLimiter,
                             sharedBlockCache,
                             sharedWriteBufferManager);
+            if (statisticsRegistry != null) {
+                rocksDBResourceContainer.useSharedStatistics(statisticsRegistry.acquire(tableId));
+            }
             RocksDBKvBuilder rocksDBKvBuilder =
                     new RocksDBKvBuilder(
                                     kvDir,
