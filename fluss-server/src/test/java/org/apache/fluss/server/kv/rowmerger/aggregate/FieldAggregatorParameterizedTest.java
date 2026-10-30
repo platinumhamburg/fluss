@@ -29,6 +29,7 @@ import org.apache.fluss.row.Decimal;
 import org.apache.fluss.row.TimestampLtz;
 import org.apache.fluss.row.TimestampNtz;
 import org.apache.fluss.server.kv.rowmerger.AggregateRowMerger;
+import org.apache.fluss.server.kv.rowmerger.RowMerger;
 import org.apache.fluss.server.utils.RoaringBitmapUtils;
 import org.apache.fluss.types.DataType;
 import org.apache.fluss.types.DataTypeChecks;
@@ -38,6 +39,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.roaringbitmap.RoaringBitmap;
 import org.roaringbitmap.longlong.Roaring64Bitmap;
 
@@ -466,6 +468,29 @@ class FieldAggregatorParameterizedTest {
         // First value should always be val1
         BinaryValue merged = merger.merge(toBinaryValue(row1), toBinaryValue(row2));
         assertAggregatedValue(merged.row, 1, dataType, val1);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testFirstValueRetainsNull(boolean partialUpdate) {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("value", DataTypes.INT(), AggFunctions.FIRST_VALUE())
+                        .primaryKey("id")
+                        .build();
+        RowMerger merger = createMerger(schema, new TableConfig(new Configuration()));
+        if (partialUpdate) {
+            merger = merger.configureTargetColumns(new int[] {0, 1}, SCHEMA_ID, schema);
+        }
+
+        BinaryValue merged = null;
+        for (Integer value : new Integer[] {null, 10, 20, null}) {
+            BinaryRow row = compactedRow(schema.getRowType(), new Object[] {1, value});
+            merged = merger.merge(merged, toBinaryValue(row));
+            assertThat(merged.row.isNullAt(1)).isTrue();
+            merged = toBinaryValue(merged.row.copy());
+        }
     }
 
     static Stream<Arguments> firstValueTestData() {
