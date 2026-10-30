@@ -383,7 +383,7 @@ public final class KvTablet {
                         sharedRateLimiter,
                         sharedBlockCache,
                         sharedWriteBufferManager,
-                         statisticsRegistry,
+                        statisticsRegistry,
                         kvFlushScheduler,
                         false,
                         flushCompleteListener,
