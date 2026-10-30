@@ -179,7 +179,7 @@ public class MetricNames {
     // --------------------------------------------------------------------------------------------
     // RocksDB metrics
     // --------------------------------------------------------------------------------------------
-    // Table-level native statistics and DB properties.
+    // Table-level native statistics and RocksDB instance properties.
     /** Cumulative table write stall time; the Max suffix is retained for reporter compatibility. */
     public static final String ROCKSDB_WRITE_STALL_MICROS_MAX = "rocksdbWriteStallMicrosMax";
 

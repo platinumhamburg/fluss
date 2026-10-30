@@ -232,7 +232,10 @@ public class RocksDBResourceContainer implements AutoCloseable {
         return statistics;
     }
 
-    /** Borrows table statistics before opening the DB and releases them with this container. */
+    /**
+     * Borrows table statistics before opening the RocksDB instance and releases them with this
+     * container.
+     */
     public void useSharedStatistics(RocksDBStatisticsRegistry.Lease lease) {
         checkState(enableStatistics && statistics == null, "Statistics are already configured.");
         statistics = lease.getStatistics();

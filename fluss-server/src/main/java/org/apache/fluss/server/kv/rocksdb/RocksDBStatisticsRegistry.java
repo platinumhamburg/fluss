@@ -27,7 +27,10 @@ public final class RocksDBStatisticsRegistry {
 
     private final Map<Long, Entry> entries = new HashMap<>();
 
-    /** Acquires statistics that remain alive until the last table DB releases its lease. */
+    /**
+     * Acquires statistics that remain alive until the last RocksDB instance of the table releases
+     * its lease.
+     */
     public synchronized Lease acquire(long tableId) {
         Entry entry = entries.get(tableId);
         if (entry == null) {

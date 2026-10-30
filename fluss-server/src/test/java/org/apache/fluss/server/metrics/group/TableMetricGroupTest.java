@@ -33,6 +33,7 @@ import org.apache.fluss.server.kv.rocksdb.RocksDBKvBuilder;
 import org.apache.fluss.server.kv.rocksdb.RocksDBResourceContainer;
 import org.apache.fluss.server.kv.rocksdb.RocksDBStatistics;
 import org.apache.fluss.server.kv.rocksdb.RocksDBStatisticsRegistry;
+import org.apache.fluss.server.utils.ResourceGuard;
 
 import io.github.fluss_contrib.rocksdb.HistogramType;
 import io.github.fluss_contrib.rocksdb.Statistics;
@@ -42,6 +43,8 @@ import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
 
 import java.io.File;
+import java.io.IOException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -52,6 +55,75 @@ import static org.mockito.Mockito.verify;
 
 /** Test for {@link TableMetricGroup}. */
 class TableMetricGroupTest {
+
+    @Test
+    void testSharedStatisticsRemainAvailableWhenSelectedInstanceCloses(@TempDir File directory)
+            throws Exception {
+        RocksDBStatisticsRegistry registry = new RocksDBStatisticsRegistry();
+        TableMetricGroup group =
+                new TableMetricGroup(
+                        NOPMetricRegistry.INSTANCE,
+                        TablePath.of("db", "table"),
+                        true,
+                        TestingMetricGroups.TABLET_SERVER_METRICS);
+        AtomicBoolean closeFirstReader = new AtomicBoolean(true);
+        try (RocksDBKv first = createKv(new File(directory, "first"), registry);
+                RocksDBKv second = createKv(new File(directory, "second"), registry)) {
+            group.addBucketMetricGroup(null, new TableBucket(1, 0))
+                    .registerRocksDBStatistics(
+                            statisticsClosingOnFirstRead(first, closeFirstReader));
+            group.addBucketMetricGroup(null, new TableBucket(1, 1))
+                    .registerRocksDBStatistics(
+                            statisticsClosingOnFirstRead(second, closeFirstReader));
+            first.put(new byte[] {1}, new byte[] {2});
+            second.put(new byte[] {3}, new byte[] {4});
+            Statistics statistics = first.getStatistics();
+            long expected = statistics.getTickerCount(TickerType.BYTES_WRITTEN);
+            assertThat(expected).isPositive();
+
+            assertThat(gaugeValue(group, MetricNames.ROCKSDB_BYTES_WRITTEN_TOTAL))
+                    .isEqualTo(expected);
+            assertThat(closeFirstReader).isFalse();
+            assertThat(first.getResourceGuard().isClosed())
+                    .isNotEqualTo(second.getResourceGuard().isClosed());
+            assertThat(statistics.isOwningHandle()).isTrue();
+            assertThat(gaugeValue(group, MetricNames.ROCKSDB_BYTES_WRITTEN_TOTAL))
+                    .isEqualTo(expected);
+        } finally {
+            group.close();
+        }
+    }
+
+    private RocksDBStatistics statisticsClosingOnFirstRead(
+            RocksDBKv kv, AtomicBoolean closeFirstReader) {
+        ResourceGuard guard =
+                new ResourceGuard() {
+                    @Override
+                    public Lease acquireResource() throws IOException {
+                        // Close the selected RocksDB instance immediately before acquiring its
+                        // lease.
+                        if (closeFirstReader.compareAndSet(true, false)) {
+                            try {
+                                kv.close();
+                            } catch (Exception e) {
+                                throw new IOException(e);
+                            }
+                        }
+                        return kv.getResourceGuard().acquireResource();
+                    }
+
+                    @Override
+                    public boolean isClosed() {
+                        return kv.getResourceGuard().isClosed();
+                    }
+                };
+        return new RocksDBStatistics(
+                kv.getDb(),
+                kv.getStatistics(),
+                guard,
+                kv.getDefaultColumnFamilyHandle(),
+                kv.getBlockCache());
+    }
 
     @Test
     void testSharedStatisticsAreCountedOnceButMemoryUsesEveryDb(@TempDir File directory)

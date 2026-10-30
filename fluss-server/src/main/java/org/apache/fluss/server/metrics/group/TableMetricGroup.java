@@ -32,7 +32,9 @@ import org.apache.fluss.metrics.groups.MetricGroup;
 import org.apache.fluss.metrics.registry.MetricRegistry;
 import org.apache.fluss.server.kv.rocksdb.RocksDBStatistics;
 
+import io.github.fluss_contrib.rocksdb.HistogramType;
 import io.github.fluss_contrib.rocksdb.Statistics;
+import io.github.fluss_contrib.rocksdb.TickerType;
 
 import javax.annotation.Nullable;
 
@@ -41,6 +43,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.ToLongFunction;
+import java.util.stream.LongStream;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.metrics.utils.MetricGroupUtils.makeScope;
@@ -366,10 +370,29 @@ public class TableMetricGroup extends AbstractMetricGroup {
                 .filter(stats -> stats != null);
     }
 
-    private Stream<RocksDBStatistics> distinctStatisticsSources() {
+    private LongStream collectDistinctStatistics(ToLongFunction<Statistics> reader) {
         Set<Statistics> seen = new HashSet<>();
         return allRocksDBStatistics()
-                .filter(stats -> stats.getStatistics() != null && seen.add(stats.getStatistics()));
+                .mapToLong(
+                        source ->
+                                source.collectStatistics(
+                                        statistics -> {
+                                            if (seen.contains(statistics)) {
+                                                return 0L;
+                                            }
+                                            long value = reader.applyAsLong(statistics);
+                                            seen.add(statistics);
+                                            return value;
+                                        }));
+    }
+
+    private LongStream tickerValues(TickerType type) {
+        return collectDistinctStatistics(statistics -> statistics.getTickerCount(type));
+    }
+
+    private LongStream histogramValues(HistogramType type) {
+        return collectDistinctStatistics(
+                statistics -> Math.round(statistics.getHistogramData(type).getPercentile99()));
     }
 
     public TabletServerMetricGroup getServerMetricGroup() {
@@ -377,33 +400,23 @@ public class TableMetricGroup extends AbstractMetricGroup {
     }
 
     /**
-     * Registers native statistics once per shared object, and DB properties over all live buckets.
-     * The historical Max metric names are retained for reporter compatibility; shared histograms
-     * represent all samples of this table on this server, and stall time is cumulative across DBs.
+     * Registers native statistics once per shared object, and RocksDB instance properties over all
+     * live buckets. The historical Max metric names are retained for reporter compatibility; shared
+     * histograms represent all samples of this table on this server, and stall time is cumulative
+     * across RocksDB instances.
      *
      * <p>This method is called once during TableMetricGroup construction for KV tables.
      */
     private void registerRocksDBMetrics() {
         gauge(
                 MetricNames.ROCKSDB_WRITE_STALL_MICROS_MAX,
-                () ->
-                        distinctStatisticsSources()
-                                .mapToLong(RocksDBStatistics::getWriteStallMicros)
-                                .sum());
+                () -> tickerValues(TickerType.STALL_MICROS).sum());
         gauge(
                 MetricNames.ROCKSDB_GET_LATENCY_MICROS_MAX,
-                () ->
-                        distinctStatisticsSources()
-                                .mapToLong(RocksDBStatistics::getGetLatencyMicros)
-                                .max()
-                                .orElse(0L));
+                () -> histogramValues(HistogramType.DB_GET).max().orElse(0L));
         gauge(
                 MetricNames.ROCKSDB_WRITE_LATENCY_MICROS_MAX,
-                () ->
-                        distinctStatisticsSources()
-                                .mapToLong(RocksDBStatistics::getWriteLatencyMicros)
-                                .max()
-                                .orElse(0L));
+                () -> histogramValues(HistogramType.DB_WRITE).max().orElse(0L));
         gauge(
                 MetricNames.ROCKSDB_NUM_FILES_AT_LEVEL0_MAX,
                 () ->
@@ -427,38 +440,22 @@ public class TableMetricGroup extends AbstractMetricGroup {
                                 .orElse(0L));
         gauge(
                 MetricNames.ROCKSDB_COMPACTION_TIME_MICROS_MAX,
-                () ->
-                        distinctStatisticsSources()
-                                .mapToLong(RocksDBStatistics::getCompactionTimeMicros)
-                                .max()
-                                .orElse(0L));
+                () -> histogramValues(HistogramType.COMPACTION_TIME).max().orElse(0L));
         gauge(
                 MetricNames.ROCKSDB_BYTES_READ_TOTAL,
-                () -> distinctStatisticsSources().mapToLong(RocksDBStatistics::getBytesRead).sum());
+                () -> tickerValues(TickerType.BYTES_READ).sum());
         gauge(
                 MetricNames.ROCKSDB_BYTES_WRITTEN_TOTAL,
-                () ->
-                        distinctStatisticsSources()
-                                .mapToLong(RocksDBStatistics::getBytesWritten)
-                                .sum());
+                () -> tickerValues(TickerType.BYTES_WRITTEN).sum());
         gauge(
                 MetricNames.ROCKSDB_FLUSH_BYTES_WRITTEN_TOTAL,
-                () ->
-                        distinctStatisticsSources()
-                                .mapToLong(RocksDBStatistics::getFlushBytesWritten)
-                                .sum());
+                () -> tickerValues(TickerType.FLUSH_WRITE_BYTES).sum());
         gauge(
                 MetricNames.ROCKSDB_COMPACTION_BYTES_READ_TOTAL,
-                () ->
-                        distinctStatisticsSources()
-                                .mapToLong(RocksDBStatistics::getCompactionBytesRead)
-                                .sum());
+                () -> tickerValues(TickerType.COMPACT_READ_BYTES).sum());
         gauge(
                 MetricNames.ROCKSDB_COMPACTION_BYTES_WRITTEN_TOTAL,
-                () ->
-                        distinctStatisticsSources()
-                                .mapToLong(RocksDBStatistics::getCompactionBytesWritten)
-                                .sum());
+                () -> tickerValues(TickerType.COMPACT_WRITE_BYTES).sum());
 
         // Fine-grained memory metrics - track memory usage by component type
         gauge(
