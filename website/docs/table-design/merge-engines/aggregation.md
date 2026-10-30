@@ -593,11 +593,15 @@ TableDescriptor.builder()
 
 ### first_value
 
-Retrieves and retains the first value seen for a field.
+Retrieves and retains the first non-null value seen for a field.
 
 - **Supported Data Types**: All data types
-- **Behavior**: Keeps the first received value, ignores all subsequent values
-- **Null Handling**: Null values are retained if received first
+- **Behavior**: Keeps the first received non-null value, ignores all subsequent values
+- **Null Handling**: Null values are treated as unset until a non-null value is received
+
+This function has the same behavior as `first_value_ignore_nulls`. For example,
+`NULL -> 10 -> 20` produces `10`. In partial updates, omitting a field does not
+prevent a later update from supplying its first non-null value.
 
 **Example:**
 <Tabs>

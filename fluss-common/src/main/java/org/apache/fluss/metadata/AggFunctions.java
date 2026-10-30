@@ -134,11 +134,13 @@ public final class AggFunctions {
     }
 
     /**
-     * Creates a FIRST_VALUE aggregation function that retains the first value seen for a field.
+     * Creates a FIRST_VALUE aggregation function that retains the first non-null value seen for a
+     * field.
      *
      * <p>Supported data types: All data types
      *
-     * <p>Null handling: Null values are retained if received first
+     * <p>Null handling: Null values are treated as unset until a non-null value is received. This
+     * function has the same behavior as {@link #FIRST_VALUE_IGNORE_NULLS()}.
      *
      * @return a FIRST_VALUE aggregation function
      */

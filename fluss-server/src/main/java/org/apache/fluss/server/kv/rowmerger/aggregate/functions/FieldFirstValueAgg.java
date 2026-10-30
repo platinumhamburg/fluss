@@ -35,8 +35,11 @@ public class FieldFirstValueAgg extends FieldAggregator {
 
     @Override
     public Object agg(Object accumulator, Object inputField) {
-        // The row merger handles the first write, so the accumulator is an existing value,
-        // including when the first value is null.
-        return accumulator;
+        // If accumulator is not null, it's the first value, keep it
+        if (accumulator != null) {
+            return accumulator;
+        }
+        // Otherwise, return inputField (which becomes the first value)
+        return inputField;
     }
 }
