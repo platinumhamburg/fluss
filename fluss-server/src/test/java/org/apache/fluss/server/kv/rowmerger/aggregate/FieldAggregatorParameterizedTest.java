@@ -493,6 +493,31 @@ class FieldAggregatorParameterizedTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testFirstValueRetainsNonNullFirstWrite(boolean partialUpdate) {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("value", DataTypes.INT(), AggFunctions.FIRST_VALUE())
+                        .primaryKey("id")
+                        .build();
+        RowMerger merger = createMerger(schema, new TableConfig(new Configuration()));
+        if (partialUpdate) {
+            merger = merger.configureTargetColumns(new int[] {0, 1}, SCHEMA_ID, schema);
+        }
+
+        BinaryValue merged = null;
+        for (Integer value : new Integer[] {10, 20, null, 30}) {
+            BinaryRow row = compactedRow(schema.getRowType(), new Object[] {1, value});
+            merged = merger.merge(merged, toBinaryValue(row));
+            assertThat(merged.row.getInt(0)).isEqualTo(1);
+            assertThat(merged.row.isNullAt(1)).isFalse();
+            assertThat(merged.row.getInt(1)).isEqualTo(10);
+            merged = toBinaryValue(merged.row.copy());
+        }
+    }
+
     static Stream<Arguments> firstValueTestData() {
         return Stream.of(
                 Arguments.of("TINYINT", DataTypes.TINYINT(), (byte) 10, (byte) 20),
