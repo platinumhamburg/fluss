@@ -1028,6 +1028,8 @@ RocksDB metrics provide insights into the performance and health of the underlyi
 
 Each TabletServer shares one native Statistics object among all RocksDB instances of a table. Latency percentiles describe the combined samples, and write stall time is cumulative across these RocksDB instances. A low-volume slow bucket can be hidden by faster buckets in the combined P99. L0 file counts and pending indicators still use the maximum across live RocksDB instance properties. The shared statistics retain counters and histogram samples from closed RocksDB instances while any RocksDB instance of the table remains open. They are released after the last RocksDB instance closes; reopening then starts fresh statistics.
 
+Since Fluss 1.1, the latency P99 and cumulative write stall metrics use the names below. The four historical `...Max` names remain as **deprecated aliases** throughout Fluss 1.x and will be removed in Fluss 2.0. From 1.1, these aliases report the shared table statistics, not the maximum bucket values reported in 1.0. Existing dashboards retain their metric names, but alert thresholds and interpretations must be reviewed. A P99 reported by one TabletServer is not a cluster-wide table P99; taking the maximum or average across TabletServers does not produce that percentile.
+
 <table class="table table-bordered">
   <thead>
     <tr>
@@ -1042,18 +1044,18 @@ Each TabletServer shares one native Statistics object among all RocksDB instance
     <tr>
       <th rowspan="7"><strong>tabletserver</strong></th>
       <td rowspan="7">table</td>
-      <td>rocksdbWriteStallMicrosMax</td>
-      <td>Cumulative write stall time across all RocksDB instances of this table on this TabletServer (in microseconds), collected by shared Statistics. Concurrent stalls can overlap. The Max suffix is retained for compatibility.</td>
+      <td>rocksdbWriteStallMicrosTotal<br /><strong>Deprecated alias:</strong> rocksdbWriteStallMicrosMax</td>
+      <td>Cumulative write stall time across all RocksDB instances of this table on this TabletServer (in microseconds), collected by shared Statistics. Concurrent stalls can overlap.</td>
       <td>Gauge</td>
     </tr>
     <tr>
-      <td>rocksdbGetLatencyMicrosMax</td>
-      <td>P99 of the combined native DB_GET samples from all RocksDB instances of this table on this TabletServer (in microseconds). Samples accumulate since the shared Statistics object was created or reset. This is not the maximum bucket P99 or RPC latency. The Max suffix is retained for compatibility.</td>
+      <td>rocksdbGetLatencyMicrosP99<br /><strong>Deprecated alias:</strong> rocksdbGetLatencyMicrosMax</td>
+      <td>P99 of the combined native DB_GET samples from all RocksDB instances of this table on this TabletServer (in microseconds). Samples accumulate since the shared Statistics object was created or reset. This is not the maximum bucket P99 or RPC latency.</td>
       <td>Gauge</td>
     </tr>
     <tr>
-      <td>rocksdbWriteLatencyMicrosMax</td>
-      <td>P99 of the combined native DB_WRITE samples from all RocksDB instances of this table on this TabletServer (in microseconds), accumulated since shared Statistics creation or reset. This is not the maximum bucket P99. The Max suffix is retained for compatibility.</td>
+      <td>rocksdbWriteLatencyMicrosP99<br /><strong>Deprecated alias:</strong> rocksdbWriteLatencyMicrosMax</td>
+      <td>P99 of the combined native DB_WRITE samples from all RocksDB instances of this table on this TabletServer (in microseconds), accumulated since shared Statistics creation or reset. This is not the maximum bucket P99.</td>
       <td>Gauge</td>
     </tr>
     <tr>
@@ -1072,8 +1074,8 @@ Each TabletServer shares one native Statistics object among all RocksDB instance
       <td>Gauge</td>
     </tr>
     <tr>
-      <td>rocksdbCompactionTimeMicrosMax</td>
-      <td>P99 of the combined native COMPACTION_TIME samples from all RocksDB instances of this table on this TabletServer (in microseconds), accumulated since shared Statistics creation or reset. This is not the maximum bucket P99. The Max suffix is retained for compatibility.</td>
+      <td>rocksdbCompactionTimeMicrosP99<br /><strong>Deprecated alias:</strong> rocksdbCompactionTimeMicrosMax</td>
+      <td>P99 of the combined native COMPACTION_TIME samples from all RocksDB instances of this table on this TabletServer (in microseconds), accumulated since shared Statistics creation or reset. This is not the maximum bucket P99.</td>
       <td>Gauge</td>
     </tr>
   </tbody>

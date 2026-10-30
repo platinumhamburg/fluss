@@ -167,7 +167,7 @@ class TableMetricGroupTest {
                     .isEqualTo(statistics.getTickerCount(TickerType.BYTES_WRITTEN));
             assertThat(gaugeValue(group, MetricNames.ROCKSDB_BYTES_READ_TOTAL))
                     .isEqualTo(statistics.getTickerCount(TickerType.BYTES_READ));
-            assertThat(gaugeValue(group, MetricNames.ROCKSDB_GET_LATENCY_MICROS_MAX))
+            assertThat(gaugeValue(group, MetricNames.ROCKSDB_GET_LATENCY_MICROS_P99))
                     .isEqualTo(
                             Math.round(
                                     statistics
@@ -177,6 +177,29 @@ class TableMetricGroupTest {
                     .isEqualTo(
                             firstStats.getMemTableMemoryUsage()
                                     + secondStats.getMemTableMemoryUsage());
+
+            assertThat(gaugeValue(group, MetricNames.ROCKSDB_WRITE_STALL_MICROS_MAX))
+                    .isEqualTo(gaugeValue(group, MetricNames.ROCKSDB_WRITE_STALL_MICROS_TOTAL));
+            assertThat(gaugeValue(group, MetricNames.ROCKSDB_GET_LATENCY_MICROS_MAX))
+                    .isEqualTo(gaugeValue(group, MetricNames.ROCKSDB_GET_LATENCY_MICROS_P99));
+            assertThat(gaugeValue(group, MetricNames.ROCKSDB_WRITE_LATENCY_MICROS_MAX))
+                    .isEqualTo(gaugeValue(group, MetricNames.ROCKSDB_WRITE_LATENCY_MICROS_P99));
+            assertThat(gaugeValue(group, MetricNames.ROCKSDB_COMPACTION_TIME_MICROS_MAX))
+                    .isEqualTo(gaugeValue(group, MetricNames.ROCKSDB_COMPACTION_TIME_MICROS_P99));
+
+            // Reporters can track metric registrations by object identity.
+            assertThat(group.getMetrics().get(MetricNames.ROCKSDB_WRITE_STALL_MICROS_MAX))
+                    .isNotSameAs(
+                            group.getMetrics().get(MetricNames.ROCKSDB_WRITE_STALL_MICROS_TOTAL));
+            assertThat(group.getMetrics().get(MetricNames.ROCKSDB_GET_LATENCY_MICROS_MAX))
+                    .isNotSameAs(
+                            group.getMetrics().get(MetricNames.ROCKSDB_GET_LATENCY_MICROS_P99));
+            assertThat(group.getMetrics().get(MetricNames.ROCKSDB_WRITE_LATENCY_MICROS_MAX))
+                    .isNotSameAs(
+                            group.getMetrics().get(MetricNames.ROCKSDB_WRITE_LATENCY_MICROS_P99));
+            assertThat(group.getMetrics().get(MetricNames.ROCKSDB_COMPACTION_TIME_MICROS_MAX))
+                    .isNotSameAs(
+                            group.getMetrics().get(MetricNames.ROCKSDB_COMPACTION_TIME_MICROS_P99));
 
             first.close();
             assertThat(gaugeValue(group, MetricNames.ROCKSDB_BYTES_WRITTEN_TOTAL))

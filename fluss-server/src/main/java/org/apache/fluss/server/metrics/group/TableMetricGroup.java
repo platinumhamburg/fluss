@@ -22,6 +22,7 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.CharacterFilter;
 import org.apache.fluss.metrics.Counter;
 import org.apache.fluss.metrics.DescriptiveStatisticsHistogram;
+import org.apache.fluss.metrics.Gauge;
 import org.apache.fluss.metrics.Histogram;
 import org.apache.fluss.metrics.MeterView;
 import org.apache.fluss.metrics.MetricNames;
@@ -401,22 +402,21 @@ public class TableMetricGroup extends AbstractMetricGroup {
 
     /**
      * Registers native statistics once per shared object, and RocksDB instance properties over all
-     * live buckets. The historical Max metric names are retained for reporter compatibility; shared
-     * histograms represent all samples of this table on this server, and stall time is cumulative
-     * across RocksDB instances.
+     * live buckets. Shared histograms represent all samples of this table on this server, and stall
+     * time is cumulative across RocksDB instances.
      *
      * <p>This method is called once during TableMetricGroup construction for KV tables.
      */
     private void registerRocksDBMetrics() {
-        gauge(
-                MetricNames.ROCKSDB_WRITE_STALL_MICROS_MAX,
-                () -> tickerValues(TickerType.STALL_MICROS).sum());
-        gauge(
-                MetricNames.ROCKSDB_GET_LATENCY_MICROS_MAX,
-                () -> histogramValues(HistogramType.DB_GET).max().orElse(0L));
-        gauge(
-                MetricNames.ROCKSDB_WRITE_LATENCY_MICROS_MAX,
-                () -> histogramValues(HistogramType.DB_WRITE).max().orElse(0L));
+        Gauge<Long> writeStall = () -> tickerValues(TickerType.STALL_MICROS).sum();
+        gauge(MetricNames.ROCKSDB_WRITE_STALL_MICROS_TOTAL, writeStall);
+        gauge(MetricNames.ROCKSDB_WRITE_STALL_MICROS_MAX, writeStall::getValue);
+        Gauge<Long> getLatency = () -> histogramValues(HistogramType.DB_GET).max().orElse(0L);
+        gauge(MetricNames.ROCKSDB_GET_LATENCY_MICROS_P99, getLatency);
+        gauge(MetricNames.ROCKSDB_GET_LATENCY_MICROS_MAX, getLatency::getValue);
+        Gauge<Long> writeLatency = () -> histogramValues(HistogramType.DB_WRITE).max().orElse(0L);
+        gauge(MetricNames.ROCKSDB_WRITE_LATENCY_MICROS_P99, writeLatency);
+        gauge(MetricNames.ROCKSDB_WRITE_LATENCY_MICROS_MAX, writeLatency::getValue);
         gauge(
                 MetricNames.ROCKSDB_NUM_FILES_AT_LEVEL0_MAX,
                 () ->
@@ -438,9 +438,10 @@ public class TableMetricGroup extends AbstractMetricGroup {
                                 .mapToLong(RocksDBStatistics::getCompactionPending)
                                 .max()
                                 .orElse(0L));
-        gauge(
-                MetricNames.ROCKSDB_COMPACTION_TIME_MICROS_MAX,
-                () -> histogramValues(HistogramType.COMPACTION_TIME).max().orElse(0L));
+        Gauge<Long> compactionTime =
+                () -> histogramValues(HistogramType.COMPACTION_TIME).max().orElse(0L);
+        gauge(MetricNames.ROCKSDB_COMPACTION_TIME_MICROS_P99, compactionTime);
+        gauge(MetricNames.ROCKSDB_COMPACTION_TIME_MICROS_MAX, compactionTime::getValue);
         gauge(
                 MetricNames.ROCKSDB_BYTES_READ_TOTAL,
                 () -> tickerValues(TickerType.BYTES_READ).sum());
