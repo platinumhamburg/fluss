@@ -45,10 +45,11 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
-import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 
@@ -213,16 +214,67 @@ class FieldCollectionAggregatorTest {
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void testReversedCollect(boolean distinct) {
+    @MethodSource("collectModes")
+    void testReversedCollect(KvFormat format, boolean distinct) {
         FieldCollectAgg aggregator =
                 new FieldCollectAgg(DataTypes.ARRAY(DataTypes.INT()), distinct);
+        Schema schema = schema(DataTypes.ARRAY(DataTypes.INT()), AggFunctions.COLLECT(distinct));
         InternalArray result =
                 (InternalArray)
-                        aggregator.aggReversed(GenericArray.of(3, 4), GenericArray.of(1, 2));
+                        aggregator.aggReversed(
+                                value(schema, format, GenericArray.of(3, 4)).row.getArray(1),
+                                value(schema, format, GenericArray.of(1, 2)).row.getArray(1));
         assertThat(result.size()).isEqualTo(4);
         for (int i = 0; i < result.size(); i++) {
             assertThat(result.getInt(i)).isEqualTo(i + 1);
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(KvFormat.class)
+    void testCollectAcrossUpdates(KvFormat format) {
+        Schema schema = schema(DataTypes.ARRAY(DataTypes.STRING()), AggFunctions.COLLECT(false));
+        AggregateRowMerger merger = merger(schema, format);
+        BinaryValue result = null;
+        List<Object> expected = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            Object[] input = {
+                BinaryString.fromString("s" + i), null, BinaryString.fromString("long value " + i)
+            };
+            expected.addAll(Arrays.asList(input));
+            result = merger.merge(result, value(schema, format, new GenericArray(input)));
+            assertCollectedValues(result, DataTypes.STRING(), expected.toArray());
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(KvFormat.class)
+    void testCollectWithMixedArrayRepresentations(KvFormat format) {
+        Schema schema = schema(DataTypes.ARRAY(DataTypes.STRING()), AggFunctions.COLLECT(false));
+        FieldCollectAgg aggregator =
+                new FieldCollectAgg(DataTypes.ARRAY(DataTypes.STRING()), false);
+        GenericArray generic = GenericArray.of(BinaryString.fromString("a"), null);
+        InternalArray binary =
+                value(schema, format, GenericArray.of(BinaryString.fromString("b"), null))
+                        .row
+                        .getArray(1);
+        KvFormat otherFormat = format == KvFormat.COMPACTED ? KvFormat.INDEXED : KvFormat.COMPACTED;
+        InternalArray otherBinary = value(schema, otherFormat, generic).row.getArray(1);
+        for (InternalArray input : new InternalArray[] {generic, otherBinary}) {
+            assertCollectedValues(
+                    (InternalArray) aggregator.agg(binary, input),
+                    DataTypes.STRING(),
+                    BinaryString.fromString("b"),
+                    null,
+                    BinaryString.fromString("a"),
+                    null);
+            assertCollectedValues(
+                    (InternalArray) aggregator.agg(input, binary),
+                    DataTypes.STRING(),
+                    BinaryString.fromString("a"),
+                    null,
+                    BinaryString.fromString("b"),
+                    null);
         }
     }
 
@@ -357,7 +409,11 @@ class FieldCollectionAggregatorTest {
     private static void assertCollectedValues(
             BinaryValue value, DataType elementType, Object... expected) {
         assertThat(value.row.isNullAt(1)).isFalse();
-        InternalArray array = value.row.getArray(1);
+        assertCollectedValues(value.row.getArray(1), elementType, expected);
+    }
+
+    private static void assertCollectedValues(
+            InternalArray array, DataType elementType, Object... expected) {
         InternalArray.ElementGetter getter =
                 InternalArray.createDeepElementGetter(elementType, true);
         Object[] actual = new Object[array.size()];

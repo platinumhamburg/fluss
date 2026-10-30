@@ -22,9 +22,12 @@ package org.apache.fluss.server.kv.rowmerger.aggregate.functions;
  * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
  * additional information regarding copyright ownership. */
 
+import org.apache.fluss.row.BinaryArray;
 import org.apache.fluss.row.GenericArray;
 import org.apache.fluss.row.InternalArray;
+import org.apache.fluss.row.array.BinaryArraySplicer;
 import org.apache.fluss.types.ArrayType;
+import org.apache.fluss.types.DataType;
 import org.apache.fluss.utils.ByteArrayWrapper;
 
 import java.util.LinkedHashSet;
@@ -36,13 +39,17 @@ public class FieldCollectAgg extends FieldAggregator {
     private static final long serialVersionUID = 1L;
 
     private final boolean distinct;
+    private final DataType elementType;
+    private final boolean spliceable;
     private final InternalArray.ElementGetter elementGetter;
 
     /** Creates a collector for the given array type and duplicate handling. */
     public FieldCollectAgg(ArrayType dataType, boolean distinct) {
         super(dataType);
         this.distinct = distinct;
-        this.elementGetter = InternalArray.createElementGetter(dataType.getElementType());
+        this.elementType = dataType.getElementType();
+        this.spliceable = BinaryArraySplicer.supports(elementType);
+        this.elementGetter = InternalArray.createElementGetter(elementType);
     }
 
     @Override
@@ -67,6 +74,14 @@ public class FieldCollectAgg extends FieldAggregator {
             }
             if (accumulatorArray.size() == 0) {
                 return inputField;
+            }
+            if (spliceable && BinaryArraySplicer.canSplice(accumulatorArray, inputArray)) {
+                BinaryArray older = (BinaryArray) accumulatorArray;
+                BinaryArray newer = (BinaryArray) inputArray;
+                return new BinaryArraySplicer(elementType)
+                        .append(older, 0, older.size())
+                        .append(newer, 0, newer.size())
+                        .build();
             }
             Object[] result = new Object[expectedSize];
             int accumulatorSize = accumulatorArray.size();
