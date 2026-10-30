@@ -222,8 +222,8 @@ public class RocksDBKv implements AutoCloseable {
      *
      * <p>{@link RocksDB#multiGetAsList(List)} returns {@code null} both for a missing key and for a
      * key whose read failed (for example, a block checksum mismatch). Each {@code null} is
-     * therefore re-read with {@link RocksDB#get(byte[])}, which throws on read errors, so a missing key
-     * costs one extra point lookup.
+     * therefore re-read with {@link RocksDB#get(byte[])}, which throws on read errors, so a missing
+     * key costs one extra point lookup.
      *
      * @throws IOException if any key failed to be read from RocksDB
      */
