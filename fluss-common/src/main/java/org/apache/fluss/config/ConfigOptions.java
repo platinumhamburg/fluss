@@ -1278,23 +1278,38 @@ public class ConfigOptions {
                     .intType()
                     .defaultValue(3)
                     .withDescription(
-                            "The number of threads that the server uses for receiving requests "
-                                    + "from the network and sending responses to the network.");
+                            "The number of network threads per listener resource group for receiving "
+                                    + "requests and sending responses. When the server binds both the "
+                                    + "listener selected by internal.listener.name and external listeners, "
+                                    + "the internal listener uses a dedicated group and all external "
+                                    + "listeners share another group. Otherwise, all listeners share "
+                                    + "one group.");
 
     public static final ConfigOption<Integer> NETTY_SERVER_NUM_WORKER_THREADS =
             key("netty.server.num-worker-threads")
                     .intType()
                     .defaultValue(8)
                     .withDescription(
-                            "The number of threads that the server uses for processing requests, "
-                                    + "which may include disk and remote I/O.");
+                            "The number of worker threads per listener resource group for processing "
+                                    + "requests, which may include disk and remote I/O. When the server "
+                                    + "binds both the listener selected by internal.listener.name and "
+                                    + "external listeners, the internal listener uses a dedicated group "
+                                    + "and all external listeners share another group. Otherwise, all "
+                                    + "listeners share one group.");
 
     public static final ConfigOption<Integer> NETTY_SERVER_MAX_QUEUED_REQUESTS =
             key("netty.server.max-queued-requests")
                     .intType()
                     .defaultValue(500)
                     .withDescription(
-                            "The number of queued requests allowed for worker threads, before blocking the I/O threads.");
+                            "The queued-request backpressure threshold per listener resource group, "
+                                    + "divided among its worker threads. When a worker queue reaches its "
+                                    + "threshold, reads are paused on its associated connections. Queues "
+                                    + "are unbounded; this is not a hard limit on queued requests. When "
+                                    + "the server binds both the listener selected by internal.listener.name "
+                                    + "and external listeners, the internal listener uses a dedicated "
+                                    + "group and all external listeners share another group. Otherwise, "
+                                    + "all listeners share one group.");
 
     public static final ConfigOption<Integer> NETTY_SERVER_MAX_QUEUED_HISTORICAL_REQUESTS =
             key("netty.server.max-queued-historical-requests")
