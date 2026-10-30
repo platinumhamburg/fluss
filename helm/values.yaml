@@ -27,11 +27,22 @@ image:
   pullPolicy: IfNotPresent
   pullSecrets: []
 
+# Gives every resource a name unique to this release, and scopes the ZooKeeper
+# root path to the namespace and release, so several Fluss clusters can share
+# a namespace.
+# Off by default, an existing release must opt in deliberately.
+uniqueResourceNames: false
+
 # Fluss server configuration options
 configurationOverrides:
   default.bucket.number: 3
   default.replication.factor: 3
-  zookeeper.path.root: /fluss
+  # Follows uniqueResourceNames. The scoped root carries the namespace as well
+  # as the release, since release names are only unique within a namespace, in
+  # separate path segments so the two cannot run together. It is a sibling of
+  # /fluss rather than a child, because a release still on /fluss uses that as
+  # its ZooKeeper namespace and would contain it.
+  zookeeper.path.root: /fluss{{ if .Values.uniqueResourceNames }}-{{ .Release.Namespace }}/{{ .Release.Name }}{{ end }}
   zookeeper.address: zk-zookeeper.{{ .Release.Namespace }}.svc.cluster.local:2181
   remote.data.dir: /tmp/fluss/remote-data
   data.dir: /tmp/fluss/data
@@ -88,6 +99,7 @@ tablet:
   annotations: {}
   service:
     annotations: {}
+    publishNotReadyAddresses: true
   podAnnotations: {}
   podLabels: {}
   podDisruptionBudget:
@@ -134,6 +146,7 @@ coordinator:
   annotations: {}
   service:
     annotations: {}
+    publishNotReadyAddresses: true
   podAnnotations: {}
   podLabels: {}
   podDisruptionBudget:

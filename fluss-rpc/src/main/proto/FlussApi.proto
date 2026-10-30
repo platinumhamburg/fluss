@@ -259,7 +259,10 @@ message DescribeClusterRequest {
 
 message DescribeClusterResponse {
   optional PbServerNode coordinator_server = 1;
+  // Live tablet servers with addresses, racks and server tags.
   repeated PbServerNode tablet_servers = 2;
+  // Also includes offline servers with assigned replicas. Missing loads are not zero counts.
+  repeated PbTabletServerLoad tablet_server_loads = 3;
 }
 
 // produce log request and response
@@ -961,13 +964,6 @@ message GetClusterHealthResponse {
   required int32 num_leader_replicas = 3;
   required int32 active_leader_replicas = 4;
   required int32 status = 5; // PbClusterHealthStatus: GREEN=0, YELLOW=1, RED=2, UNKNOWN=3
-}
-
-message DescribeTabletServersRequest {
-}
-
-message DescribeTabletServersResponse {
-  repeated PbTabletServerLoad tablet_servers = 1;
 }
 
 

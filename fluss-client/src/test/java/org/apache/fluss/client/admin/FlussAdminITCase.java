@@ -2331,8 +2331,8 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         assertThat(zkClient.getServerTags().get().getServerTags())
                 .containsEntry(0, ServerTag.PERMANENT_OFFLINE)
                 .containsEntry(1, ServerTag.PERMANENT_OFFLINE);
-        // getServerNodes reports the same tags, and no tag for server 2
-        assertThat(serverTagsOf(admin.getServerNodes().get()))
+        // describeCluster reports the same tags, and no tag for server 2
+        assertThat(serverTagsOf(admin.describeCluster().get().getTabletServers().values()))
                 .containsOnly(
                         entry(0, ServerTag.PERMANENT_OFFLINE),
                         entry(1, ServerTag.PERMANENT_OFFLINE));
@@ -2355,7 +2355,8 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
         assertThat(serverTags)
                 .containsEntry(0, ServerTag.PERMANENT_OFFLINE)
                 .containsEntry(1, ServerTag.PERMANENT_OFFLINE);
-        assertThat(serverTagsOf(admin.getServerNodes().get())).isEqualTo(serverTags);
+        assertThat(serverTagsOf(admin.describeCluster().get().getTabletServers().values()))
+                .isEqualTo(serverTags);
 
         // 4.remove server tag for server 100
         admin.removeServerTag(Collections.singletonList(100), ServerTag.PERMANENT_OFFLINE).get();
@@ -2373,7 +2374,8 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
 
         admin.removeServerTag(Arrays.asList(0, 1), ServerTag.PERMANENT_OFFLINE).get();
         assertThat(zkClient.getServerTags()).isNotPresent();
-        assertThat(serverTagsOf(admin.getServerNodes().get())).isEmpty();
+        assertThat(serverTagsOf(admin.describeCluster().get().getTabletServers().values()))
+                .isEmpty();
 
         // restore after test, or else will influence other tests
         coordinatorContext.addLiveTabletServer(tmpServerInfo);
@@ -2392,14 +2394,14 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
                 .hasMessageContaining(
                         "Server tag PERMANENT_OFFLINE not exists for server 2, the current "
                                 + "server tag of this server is TEMPORARY_OFFLINE.");
-        assertThat(serverTagsOf(admin.getServerNodes().get()))
+        assertThat(serverTagsOf(admin.describeCluster().get().getTabletServers().values()))
                 .containsOnly(entry(2, ServerTag.TEMPORARY_OFFLINE));
         // clear server tag
         admin.removeServerTag(Collections.singletonList(2), ServerTag.TEMPORARY_OFFLINE).get();
     }
 
     /** Returns the server tags of the tagged server nodes by server id. */
-    private static Map<Integer, ServerTag> serverTagsOf(List<ServerNode> serverNodes) {
+    private static Map<Integer, ServerTag> serverTagsOf(Collection<ServerNode> serverNodes) {
         return serverNodes.stream()
                 .filter(node -> node.serverTag() != null)
                 .collect(Collectors.toMap(ServerNode::id, ServerNode::serverTag));

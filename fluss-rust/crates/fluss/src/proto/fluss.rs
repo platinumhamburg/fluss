@@ -320,8 +320,12 @@ pub struct DescribeClusterRequest {}
 pub struct DescribeClusterResponse {
     #[prost(message, optional, tag = "1")]
     pub coordinator_server: ::core::option::Option<PbServerNode>,
+    /// Live tablet servers with addresses, racks and server tags.
     #[prost(message, repeated, tag = "2")]
     pub tablet_servers: ::prost::alloc::vec::Vec<PbServerNode>,
+    /// Also includes offline servers with assigned replicas. Missing loads are not zero counts.
+    #[prost(message, repeated, tag = "3")]
+    pub tablet_server_loads: ::prost::alloc::vec::Vec<PbTabletServerLoad>,
 }
 /// produce log request and response
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1253,13 +1257,6 @@ pub struct GetClusterHealthResponse {
     /// PbClusterHealthStatus: GREEN=0, YELLOW=1, RED=2, UNKNOWN=3
     #[prost(int32, required, tag = "5")]
     pub status: i32,
-}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct DescribeTabletServersRequest {}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct DescribeTabletServersResponse {
-    #[prost(message, repeated, tag = "1")]
-    pub tablet_servers: ::prost::alloc::vec::Vec<PbTabletServerLoad>,
 }
 /// --------------- Inner classes ----------------
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

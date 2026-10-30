@@ -102,8 +102,6 @@ import org.apache.fluss.rpc.messages.DeleteProducerOffsetsRequest;
 import org.apache.fluss.rpc.messages.DeleteProducerOffsetsResponse;
 import org.apache.fluss.rpc.messages.DescribeClusterRequest;
 import org.apache.fluss.rpc.messages.DescribeClusterResponse;
-import org.apache.fluss.rpc.messages.DescribeTabletServersRequest;
-import org.apache.fluss.rpc.messages.DescribeTabletServersResponse;
 import org.apache.fluss.rpc.messages.DropAclsRequest;
 import org.apache.fluss.rpc.messages.DropAclsResponse;
 import org.apache.fluss.rpc.messages.DropDatabaseRequest;
@@ -216,6 +214,7 @@ import javax.annotation.Nullable;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -1851,11 +1850,24 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     @Override
     public CompletableFuture<DescribeClusterResponse> describeCluster(
             DescribeClusterRequest request) {
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.DESCRIBE, Resource.cluster());
+        }
         String listenerName = currentListenerName();
-        return CompletableFuture.completedFuture(
-                buildDescribeClusterResponse(
-                        metadataCache.getCoordinatorServer(listenerName),
-                        metadataCache.getAllAliveTabletServersWithTags(listenerName).values()));
+        AccessContextEvent<DescribeClusterResponse> event =
+                new AccessContextEvent<>(
+                        ctx -> {
+                            DescribeClusterResponse response =
+                                    buildDescribeClusterResponse(
+                                            metadataCache.getCoordinatorServer(listenerName),
+                                            metadataCache
+                                                    .getAllAliveTabletServersWithTags(listenerName)
+                                                    .values());
+                            response.addAllTabletServerLoads(computeTabletServerLoads(ctx));
+                            return response;
+                        });
+        eventManagerSupplier.get().put(event);
+        return event.getResultFuture();
     }
 
     @Override
@@ -1961,21 +1973,8 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
         return response;
     }
 
-    @Override
-    public CompletableFuture<DescribeTabletServersResponse> describeTabletServers(
-            DescribeTabletServersRequest request) {
-        if (authorizer != null) {
-            authorizer.authorize(currentSession(), OperationType.DESCRIBE, Resource.cluster());
-        }
-
-        AccessContextEvent<DescribeTabletServersResponse> event =
-                new AccessContextEvent<>(CoordinatorService::computeTabletServerLoads);
-        eventManagerSupplier.get().put(event);
-        return event.getResultFuture();
-    }
-
     @VisibleForTesting
-    static DescribeTabletServersResponse computeTabletServerLoads(CoordinatorContext ctx) {
+    static Collection<PbTabletServerLoad> computeTabletServerLoads(CoordinatorContext ctx) {
         // sorted by server id for a deterministic response order
         Map<Integer, PbTabletServerLoad> loads = new TreeMap<>();
         // report live and shutting-down servers even if they host no replicas, so that
@@ -1988,9 +1987,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
             countBucketReplicas(ctx, tb, loads);
         }
 
-        DescribeTabletServersResponse response = new DescribeTabletServersResponse();
-        response.addAllTabletServers(loads.values());
-        return response;
+        return loads.values();
     }
 
     private static void countBucketReplicas(

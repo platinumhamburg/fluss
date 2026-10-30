@@ -75,7 +75,7 @@ import org.apache.fluss.rpc.messages.DatabaseExistsResponse;
 import org.apache.fluss.rpc.messages.DeleteProducerOffsetsRequest;
 import org.apache.fluss.rpc.messages.DescribeBucketsRequest;
 import org.apache.fluss.rpc.messages.DescribeClusterConfigsRequest;
-import org.apache.fluss.rpc.messages.DescribeTabletServersRequest;
+import org.apache.fluss.rpc.messages.DescribeClusterRequest;
 import org.apache.fluss.rpc.messages.DropAclsRequest;
 import org.apache.fluss.rpc.messages.DropDatabaseRequest;
 import org.apache.fluss.rpc.messages.DropTableRequest;
@@ -144,8 +144,6 @@ import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeListOffset
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makePbPartitionSpec;
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeRegisterProducerOffsetsRequest;
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.toConfigEntries;
-import static org.apache.fluss.client.utils.MetadataUtils.fallbackIfUnsupported;
-import static org.apache.fluss.client.utils.MetadataUtils.sendDescribeClusterRequest;
 import static org.apache.fluss.client.utils.MetadataUtils.sendMetadataRequestAndRebuildCluster;
 import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.toAclBindings;
 import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.toPbAclBindingFilters;
@@ -212,15 +210,6 @@ public class FlussAdmin implements Admin {
 
     @Override
     public CompletableFuture<List<ServerNode>> getServerNodes() {
-        // Only the coordinator knows the server tags. A coordinator older than Fluss 1.1 does not
-        // support the describe cluster request, so fall back to the metadata request, which returns
-        // the same server nodes without tags.
-        return fallbackIfUnsupported(
-                () -> sendDescribeClusterRequest(retryableCoordinatorGateway),
-                this::getServerNodesFromMetadata);
-    }
-
-    private CompletableFuture<List<ServerNode>> getServerNodesFromMetadata() {
         CompletableFuture<List<ServerNode>> future = new CompletableFuture<>();
         CompletableFuture.runAsync(
                 () -> {
@@ -1211,9 +1200,10 @@ public class FlussAdmin implements Admin {
     }
 
     @Override
-    public CompletableFuture<List<TabletServerDescription>> describeTabletServers() {
-        return gateway.describeTabletServers(new DescribeTabletServersRequest())
-                .thenApply(ClientRpcMessageUtils::toTabletServerDescriptions);
+    public CompletableFuture<ClusterDescription> describeCluster() {
+        return retryableCoordinatorGateway
+                .describeCluster(new DescribeClusterRequest())
+                .thenApply(ClientRpcMessageUtils::toClusterDescription);
     }
 
     @VisibleForTesting
