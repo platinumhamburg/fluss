@@ -237,7 +237,7 @@ public class TabletServer extends ServerBase {
                             serverId);
             this.userMetrics = new UserMetrics(scheduler, metricRegistry, tabletServerMetricGroup);
 
-            this.zkClient = ZooKeeperUtils.startZookeeperClient(conf, this);
+            this.zkClient = createZooKeeperClient();
 
             this.lakeCatalogDynamicLoader =
                     new LakeCatalogDynamicLoader(conf, pluginManager, false);
@@ -362,7 +362,6 @@ public class TabletServer extends ServerBase {
 
             rpcServer.start();
 
-            registerTabletServerForInitialSession();
             ZooKeeperUtils.registerZookeeperClientReInitSessionListener(
                     zkClient,
                     this::rejectNewSession,
@@ -380,6 +379,7 @@ public class TabletServer extends ServerBase {
                             validateRegistrationAfterReconnect();
                         }
                     });
+            registerTabletServerForInitialSession();
         }
     }
 
@@ -407,6 +407,11 @@ public class TabletServer extends ServerBase {
     @Override
     protected CompletableFuture<Result> getTerminationFuture() {
         return terminationFuture;
+    }
+
+    @VisibleForTesting
+    ZooKeeperClient createZooKeeperClient() {
+        return ZooKeeperUtils.startZookeeperClient(conf, this);
     }
 
     private void registerTabletServerForInitialSession() throws Exception {
