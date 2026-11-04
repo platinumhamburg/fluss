@@ -380,7 +380,7 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         try {
             rebalanceManager.startup();
             rebalanceManagerInitialized = true;
-            bulkLoadManager.resumeRecoveredTransactions();
+            bulkLoadManager.resumeActiveTransactions();
             coordinatorEventManager.start();
         } catch (Exception e) {
             if (rebalanceManagerInitialized) {

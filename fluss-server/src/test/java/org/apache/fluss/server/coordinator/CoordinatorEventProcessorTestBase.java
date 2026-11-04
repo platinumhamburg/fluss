@@ -18,7 +18,6 @@
 package org.apache.fluss.server.coordinator;
 
 import org.apache.fluss.cluster.Endpoint;
-import org.apache.fluss.cluster.TabletServerInfo;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.DatabaseDescriptor;
@@ -28,10 +27,6 @@ import org.apache.fluss.rpc.messages.AdjustIsrResponse;
 import org.apache.fluss.server.coordinator.TestingControlledNotifyGateway.PendingNotify;
 import org.apache.fluss.server.coordinator.event.AccessContextEvent;
 import org.apache.fluss.server.coordinator.event.AdjustIsrReceivedEvent;
-import org.apache.fluss.metadata.Schema;
-import org.apache.fluss.metadata.TableDescriptor;
-import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.server.coordinator.lease.KvSnapshotLeaseManager;
 import org.apache.fluss.server.coordinator.remote.RemoteDirDynamicLoader;
 import org.apache.fluss.server.entity.AdjustIsrResultForBucket;
@@ -43,14 +38,12 @@ import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
 import org.apache.fluss.server.zk.data.CoordinatorAddress;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
-import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TabletServerRegistration;
 import org.apache.fluss.server.zk.data.ZkData.PartitionIdsZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableIdsZNode;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.clock.Clock;
-import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 import org.apache.fluss.utils.concurrent.FlussScheduler;
@@ -72,7 +65,6 @@ import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
-import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -80,48 +72,37 @@ import static org.apache.fluss.config.ConfigOptions.DEFAULT_LISTENER_NAME;
 import static org.apache.fluss.server.coordinator.CoordinatorTestUtils.makeSendLeaderAndStopRequestAlwaysSuccess;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getAdjustIsrResponseData;
 import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
-import static org.apache.fluss.server.coordinator.CoordinatorTestUtils.makeSendLeaderAndStopRequestFailContext;
-import static org.apache.fluss.server.utils.TableAssignmentUtils.generateAssignment;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitValue;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Shared fixture for {@link CoordinatorEventProcessor} tests. */
-abstract class CoordinatorEventProcessorTestBase {
-
-    static final int N_BUCKETS = 3;
-    static final int REPLICATION_FACTOR = 3;
-
-    static final TableDescriptor TEST_TABLE =
-            TableDescriptor.builder()
-                    .schema(
-                            Schema.newBuilder()
-                                    .column("a", DataTypes.INT())
-                                    .primaryKey("a")
-                                    .build())
-                    .distributedBy(3, "a")
-                    .property(ConfigOptions.TABLE_KV_STANDBY_REPLICA_ENABLED.key(), "true")
-                    .build()
-                    .withReplicationFactor(REPLICATION_FACTOR);
+/**
+ * The shared lifecycle harness for {@link CoordinatorEventProcessor} unit tests: a ZooKeeper test
+ * cluster, a coordinator event processor rebuilt per test, and the cleanup between tests.
+ *
+ * <p>Extracted from {@code CoordinatorEventProcessorTest} to deduplicate the harness and keep the
+ * test class within the checkstyle file-length limit.
+ */
+class CoordinatorEventProcessorTestBase {
 
     @RegisterExtension
     public static final AllCallbackWrapper<ZooKeeperExtension> ZOO_KEEPER_EXTENSION_WRAPPER =
             new AllCallbackWrapper<>(new ZooKeeperExtension());
 
-    static ZooKeeperClient zookeeperClient;
-    static MetadataManager metadataManager;
-    static ZkEpoch zkEpoch;
+    protected static ZooKeeperClient zookeeperClient;
+    protected static MetadataManager metadataManager;
+    protected static ZkEpoch zkEpoch;
 
-    CoordinatorEventProcessor eventProcessor;
-    final String defaultDatabase = "db";
-    TestCoordinatorChannelManager testCoordinatorChannelManager;
-    AutoPartitionManager autoPartitionManager;
-    LakeTableTieringManager lakeTableTieringManager;
-    CompletedSnapshotStoreManager completedSnapshotStoreManager;
-    CoordinatorMetadataCache serverMetadataCache;
-    ReplicaCapacityController replicaCapacityController;
-    KvSnapshotLeaseManager kvSnapshotLeaseManager;
-    Scheduler scheduler;
-    String remoteDataDir;
+    protected CoordinatorEventProcessor eventProcessor;
+    protected final String defaultDatabase = "db";
+    protected TestCoordinatorChannelManager testCoordinatorChannelManager;
+    protected AutoPartitionManager autoPartitionManager;
+    protected LakeTableTieringManager lakeTableTieringManager;
+    protected CompletedSnapshotStoreManager completedSnapshotStoreManager;
+    protected CoordinatorMetadataCache serverMetadataCache;
+    protected ReplicaCapacityController replicaCapacityController;
+    protected KvSnapshotLeaseManager kvSnapshotLeaseManager;
+    protected Scheduler scheduler;
+    protected String remoteDataDir;
 
     @BeforeAll
     static void baseBeforeAll() throws Exception {
@@ -226,7 +207,8 @@ abstract class CoordinatorEventProcessorTestBase {
                 metadataManager,
                 kvSnapshotLeaseManager,
                 scheduler,
-                clock);
+                clock,
+                new java.util.concurrent.Semaphore(conf.get(ConfigOptions.BULKLOAD_MAX_ACTIVE_TRANSACTIONS)));
     }
 
     /** Verifies the elected leader and ISR in memory and ZooKeeper. */
@@ -350,70 +332,5 @@ abstract class CoordinatorEventProcessorTestBase {
         }
         throw new AssertionError(
                 "No pending NotifyLeaderAndIsr response for server " + responseServerId);
-    }
-
-    void initCoordinatorChannel() throws Exception {
-        makeSendLeaderAndStopRequestAlwaysSuccess(
-                testCoordinatorChannelManager,
-                Arrays.stream(zookeeperClient.getSortedTabletServerList())
-                        .boxed()
-                        .collect(Collectors.toSet()),
-                Collections.emptySet());
-    }
-
-    <T> T fromCtx(Function<CoordinatorContext, T> retrieveFunction) throws Exception {
-        AccessContextEvent<T> event = new AccessContextEvent<>(retrieveFunction);
-        eventProcessor.getCoordinatorEventManager().put(event);
-        return event.getResultFuture().get(30, TimeUnit.SECONDS);
-    }
-
-    long createTable(TablePath tablePath, TabletServerInfo[] servers) {
-        TableAssignment tableAssignment =
-                generateAssignment(N_BUCKETS, REPLICATION_FACTOR, servers);
-        return metadataManager.createTable(
-                tablePath, remoteDataDir, TEST_TABLE, tableAssignment, false);
-    }
-
-    static class PartitionIdName {
-        final long partitionId;
-        final String partitionName;
-
-        PartitionIdName(long partitionId, String partitionName) {
-            this.partitionId = partitionId;
-            this.partitionName = partitionName;
-        }
-    }
-
-    void verifyIsr(TableBucket tb, int expectedLeader, List<Integer> expectedIsr) throws Exception {
-        LeaderAndIsr leaderAndIsr =
-                waitValue(
-                        () -> fromCtx((ctx) -> ctx.getBucketLeaderAndIsr(tb)),
-                        Duration.ofMinutes(1),
-                        "leader not elected");
-        LeaderAndIsr newLeaderAndIsrOfZk = zookeeperClient.getLeaderAndIsr(tb).get();
-        assertThat(leaderAndIsr.leader())
-                .isEqualTo(newLeaderAndIsrOfZk.leader())
-                .isEqualTo(expectedLeader);
-        assertThat(leaderAndIsr.isr())
-                .isEqualTo(newLeaderAndIsrOfZk.isr())
-                .hasSameElementsAs(expectedIsr);
-    }
-
-    void initCoordinatorChannel(int failedServer) throws Exception {
-        makeSendLeaderAndStopRequestFailContext(
-                testCoordinatorChannelManager,
-                Arrays.stream(zookeeperClient.getSortedTabletServerList())
-                        .boxed()
-                        .collect(Collectors.toSet()),
-                Collections.singleton(failedServer));
-    }
-
-    void initCoordinatorChannel(Set<ApiKeys> ignoreApiKeys) throws Exception {
-        makeSendLeaderAndStopRequestAlwaysSuccess(
-                testCoordinatorChannelManager,
-                Arrays.stream(zookeeperClient.getSortedTabletServerList())
-                        .boxed()
-                        .collect(Collectors.toSet()),
-                ignoreApiKeys);
     }
 }
