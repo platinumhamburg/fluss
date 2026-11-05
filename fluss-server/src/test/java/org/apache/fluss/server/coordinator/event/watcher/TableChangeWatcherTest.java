@@ -28,9 +28,11 @@ import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePartition;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.server.coordinator.CoordinatorContext;
 import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.coordinator.TableLifecycleThrottler;
+import org.apache.fluss.server.coordinator.event.AccessContextEvent;
 import org.apache.fluss.server.coordinator.event.CoordinatorEvent;
 import org.apache.fluss.server.coordinator.event.CreatePartitionEvent;
 import org.apache.fluss.server.coordinator.event.CreateTableEvent;
@@ -41,12 +43,17 @@ import org.apache.fluss.server.coordinator.event.TableRegistrationChangeEvent;
 import org.apache.fluss.server.coordinator.event.TestingEventManager;
 import org.apache.fluss.server.entity.TablePropertyChanges;
 import org.apache.fluss.server.zk.NOPErrorHandler;
+import org.apache.fluss.server.zk.ZkEpoch;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
+import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TableRegistration;
+import org.apache.fluss.server.zk.data.ZkData;
 import org.apache.fluss.server.zk.data.ZkVersion;
+import org.apache.fluss.server.zk.data.bulkload.BulkLoadDataState;
+import org.apache.fluss.shaded.curator5.org.apache.curator.framework.recipes.cache.ChildData;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
 import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.clock.SystemClock;
@@ -61,6 +68,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.stream.Collectors;
 
 import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
 import static org.apache.fluss.server.utils.TableAssignmentUtils.generateAssignment;
@@ -89,6 +97,88 @@ class TableChangeWatcherTest {
     private TableLifecycleThrottler lifecycleThrottler;
     private TableChangeWatcher tableChangeWatcher;
     private static MetadataManager metadataManager;
+
+    private static List<CoordinatorEvent> lifecycleEvents(TestingEventManager manager) {
+        return manager.getEvents().stream()
+                .filter(event -> !(event instanceof AccessContextEvent))
+                .collect(Collectors.toList());
+    }
+
+    private static void applyMetadataChanges(
+            TestingEventManager manager, CoordinatorContext context) {
+        for (CoordinatorEvent event : manager.getEvents()) {
+            if (event instanceof AccessContextEvent && manager.getEvents().remove(event)) {
+                ((AccessContextEvent<?>) event).getAccessFunction().apply(context);
+            }
+        }
+    }
+
+    @Test
+    void testRegistrationChangesInvalidateTableAndPartitionSnapshots() throws Exception {
+        CoordinatorContext context = new CoordinatorContext(ZkEpoch.INITIAL_EPOCH);
+        TablePath table = TablePath.of(DEFAULT_DB, "cached_registration");
+        String tablePath = ZkData.TableZNode.path(table);
+        String partitionPath = ZkData.PartitionZNode.path(table, "p0");
+        try {
+            zookeeperClient
+                    .getCuratorClient()
+                    .create()
+                    .creatingParentsIfNeeded()
+                    .forPath(
+                            tablePath,
+                            ZkData.TableZNode.encode(
+                                    TableRegistration.newTable(720L, remoteDataDir, TEST_TABLE)));
+            zookeeperClient
+                    .getCuratorClient()
+                    .create()
+                    .creatingParentsIfNeeded()
+                    .forPath(
+                            partitionPath,
+                            ZkData.PartitionZNode.encode(
+                                    new PartitionRegistration(720L, 721L, remoteDataDir, 3)));
+            for (int round = 0; round < 2; round++) {
+                for (String path : new String[] {tablePath, partitionPath}) {
+                    ZooKeeperClient.DataWithStat read = zookeeperClient.getDataWithStat(path);
+                    context.cacheTargetMetadata(
+                            new ChildData(path, read.getStat(), read.getData()));
+                }
+                if (round == 1) {
+                    // Creation was already observed for both targets. Now change their data only.
+                    zookeeperClient
+                            .getCuratorClient()
+                            .setData()
+                            .forPath(
+                                    tablePath,
+                                    ZkData.TableZNode.encode(
+                                            TableRegistration.newTable(
+                                                            720L, remoteDataDir, TEST_TABLE)
+                                                    .withDataState(
+                                                            BulkLoadDataState.LOADING,
+                                                            "550e8400-e29b-41d4-a716-446655440000")));
+                    zookeeperClient
+                            .getCuratorClient()
+                            .setData()
+                            .forPath(
+                                    partitionPath,
+                                    ZkData.PartitionZNode.encode(
+                                            new PartitionRegistration(720L, 721L, remoteDataDir, 3)
+                                                    .withDataState(
+                                                            BulkLoadDataState.LOADING,
+                                                            "550e8400-e29b-41d4-a716-446655440000")));
+                }
+                retry(
+                        Duration.ofSeconds(10),
+                        () -> {
+                            applyMetadataChanges(eventManager, context);
+                            assertThat(context.getTargetMetadata(tablePath)).isNull();
+                            assertThat(context.getTargetMetadata(partitionPath)).isNull();
+                        });
+            }
+        } finally {
+            // This fixture owns LOADING registrations; ordinary DDL deliberately rejects them.
+            zookeeperClient.deleteTable(table);
+        }
+    }
 
     @BeforeAll
     static void beforeAll() {
@@ -170,7 +260,7 @@ class TableChangeWatcherTest {
         retry(
                 Duration.ofMinutes(1),
                 () ->
-                        assertThat(eventManager.getEvents())
+                        assertThat(lifecycleEvents(eventManager))
                                 .containsExactlyInAnyOrderElementsOf(expectedEvents));
 
         // drop tables, collect drop table events
@@ -189,7 +279,9 @@ class TableChangeWatcherTest {
         // as it appears so the next pending drop is admitted.
         for (CoordinatorEvent event : expectedTableEvents) {
             DropTableEvent drop = (DropTableEvent) event;
-            retry(Duration.ofMinutes(1), () -> assertThat(eventManager.getEvents()).contains(drop));
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> assertThat(lifecycleEvents(eventManager)).contains(drop));
             lifecycleThrottler.onTableDropCompleted(drop.getTableId());
         }
 
@@ -199,7 +291,7 @@ class TableChangeWatcherTest {
         retry(
                 Duration.ofMinutes(1),
                 () ->
-                        assertThat(eventManager.getEvents())
+                        assertThat(lifecycleEvents(eventManager))
                                 .containsExactlyInAnyOrderElementsOf(allEvents));
     }
 
@@ -291,7 +383,7 @@ class TableChangeWatcherTest {
         retry(
                 Duration.ofMinutes(1),
                 () ->
-                        assertThat(eventManager.getEvents())
+                        assertThat(lifecycleEvents(eventManager))
                                 .containsExactlyInAnyOrderElementsOf(expectedEvents));
 
         metadataManager.dropTable(tablePath, false);
@@ -309,7 +401,7 @@ class TableChangeWatcherTest {
                 () -> {
                     lifecycleThrottler.onPartitionDropCompleted(new TablePartition(tableId, 1L));
                     lifecycleThrottler.onPartitionDropCompleted(new TablePartition(tableId, 2L));
-                    assertThat(eventManager.getEvents())
+                    assertThat(lifecycleEvents(eventManager))
                             .containsExactlyInAnyOrderElementsOf(expectedEvents);
                 });
     }
@@ -351,7 +443,7 @@ class TableChangeWatcherTest {
         retry(
                 Duration.ofMinutes(1),
                 () ->
-                        assertThat(eventManager.getEvents())
+                        assertThat(lifecycleEvents(eventManager))
                                 .containsExactlyInAnyOrderElementsOf(expectedEvents));
 
         // alter schema.
@@ -387,7 +479,7 @@ class TableChangeWatcherTest {
         retry(
                 Duration.ofMinutes(1),
                 () ->
-                        assertThat(eventManager.getEvents())
+                        assertThat(lifecycleEvents(eventManager))
                                 .containsExactlyInAnyOrderElementsOf(allEvents));
     }
 
@@ -427,7 +519,7 @@ class TableChangeWatcherTest {
         retry(
                 Duration.ofMinutes(1),
                 () ->
-                        assertThat(eventManager.getEvents())
+                        assertThat(lifecycleEvents(eventManager))
                                 .containsExactlyInAnyOrderElementsOf(expectedEvents));
 
         // alter table properties (custom property)
@@ -457,7 +549,7 @@ class TableChangeWatcherTest {
         retry(
                 Duration.ofMinutes(1),
                 () ->
-                        assertThat(eventManager.getEvents())
+                        assertThat(lifecycleEvents(eventManager))
                                 .containsExactlyInAnyOrderElementsOf(expectedEvents));
     }
 
@@ -512,7 +604,7 @@ class TableChangeWatcherTest {
         }
 
         // Verify that the watcher has not processed any events
-        assertThat(eventManager.getEvents()).isEmpty();
+        assertThat(lifecycleEvents(eventManager)).isEmpty();
 
         // Start a new watcher. CuratorCache initial sync fires NODE_CREATED for
         // existing nodes with full data - the same code path as when the async
@@ -528,7 +620,7 @@ class TableChangeWatcherTest {
         retry(
                 Duration.ofMinutes(1),
                 () ->
-                        assertThat(newEventManager.getEvents())
+                        assertThat(lifecycleEvents(newEventManager))
                                 .containsExactlyInAnyOrderElementsOf(expectedEvents));
         newWatcher.stop();
         newThrottler.close();
