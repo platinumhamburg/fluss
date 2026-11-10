@@ -46,7 +46,7 @@ import org.apache.fluss.server.log.remote.LogSegmentFiles;
 import org.apache.fluss.server.log.remote.RemoteLogTablet;
 import org.apache.fluss.server.log.remote.RemoteLogTestBase;
 import org.apache.fluss.server.replica.Replica;
-import org.apache.fluss.server.tablet.TabletServerAccessGate;
+import org.apache.fluss.server.tablet.SnapshotRestoreAccessGate;
 import org.apache.fluss.server.tablet.TabletService;
 import org.apache.fluss.server.tablet.consumer.group.ConsumerOffsetTableConfig;
 import org.apache.fluss.utils.FlussPaths;
@@ -316,7 +316,8 @@ class RemoteLogFetcherTest extends RemoteLogTestBase {
                         scannerManager,
                         testCoordinatorGateway,
                         "CLIENT",
-                        ConsumerOffsetTableConfig.from(conf));
+                        ConsumerOffsetTableConfig.from(conf),
+                            new SnapshotRestoreAccessGate());
         try (RpcServer server =
                 RpcServer.create(
                         conf,

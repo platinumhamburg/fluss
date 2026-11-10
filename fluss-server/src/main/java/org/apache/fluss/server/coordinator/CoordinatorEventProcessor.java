@@ -124,12 +124,10 @@ import org.apache.fluss.server.entity.NotifyLeaderAndIsrResultForBucket;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotStore;
 import org.apache.fluss.server.metadata.CoordinatorMetadataCache;
-import org.apache.fluss.server.metadata.RegisteredTabletServer;
 import org.apache.fluss.server.metadata.ServerInfo;
 import org.apache.fluss.server.metrics.group.CoordinatorMetricGroup;
 import org.apache.fluss.server.utils.ServerRpcMessageUtils;
 import org.apache.fluss.server.zk.ZooKeeperClient;
-import org.apache.fluss.server.zk.ZooKeeperClient.DataWithStat;
 import org.apache.fluss.server.zk.ZooKeeperClient.VersionedData;
 import org.apache.fluss.server.zk.data.BucketAssignment;
 import org.apache.fluss.server.zk.data.CoordinatorAddress;
@@ -142,7 +140,6 @@ import org.apache.fluss.server.zk.data.ServerTags;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.server.zk.data.TabletServerRegistration;
-import org.apache.fluss.server.zk.data.ZkData;
 import org.apache.fluss.server.zk.data.ZkData.PartitionIdsZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableIdsZNode;
 import org.apache.fluss.server.zk.data.lake.LakeTableHelper;
@@ -221,6 +218,7 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
     // Tracks the exact assignment last confirmed in ZooKeeper for an active rebalance bucket. A
     // write attempt invalidates the entry before it starts.
     private final Map<TableBucket, List<Integer>> assignmentPersistenceByBucket = new HashMap<>();
+    private final BulkLoadManager bulkLoadManager;
     private ScheduledFuture<?> offlineLeaderRetryTask;
 
     public CoordinatorEventProcessor(
@@ -237,7 +235,8 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
             MetadataManager metadataManager,
             KvSnapshotLeaseManager kvSnapshotLeaseManager,
             Scheduler scheduler,
-            Clock clock) {
+            Clock clock,
+            java.util.concurrent.Semaphore bulkLoadCapacity) {
         this.zooKeeperClient = zooKeeperClient;
         this.serverMetadataCache = serverMetadataCache;
         this.coordinatorChannelManager = coordinatorChannelManager;
@@ -324,7 +323,8 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
                         coordinatorChannelManager,
                         ioExecutor,
                         coordinatorEventManager,
-                        completedSnapshotStoreManager);
+                        completedSnapshotStoreManager,
+                        bulkLoadCapacity);
     }
 
     public CoordinatorEventManager getCoordinatorEventManager() {
@@ -393,17 +393,13 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
             throw new FlussRuntimeException("Fail to start Coordinator event processor.", e);
         }
 
-        // start the event manager which will then process the event
-        coordinatorEventManager.start();
-
-        // start rebalance manager.
-        rebalanceManager.startup();
     }
 
     public void shutdown() {
         clearOfflineLeaderRetryTask();
         // close the event manager
         coordinatorEventManager.close();
+        bulkLoadManager.close();
         rebalanceManager.close();
         onShutdown();
         assignmentPersistenceByBucket.clear();
@@ -486,10 +482,6 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
 
         // init tablet server channels
         coordinatorChannelManager.startup(internalServerNodes);
-        coordinatorContext.clearBoundTabletServerRegistrations();
-        for (ServerInfo server : tabletServerInfos) {
-            bindTabletServerRegistration(server);
-        }
 
         // load server tags.
         zooKeeperClient
@@ -515,6 +507,7 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
                         .collect(Collectors.toList());
         Map<TablePath, Map<String, PartitionRegistration>> tablePathMap =
                 zooKeeperClient.getPartitionNameAndRegistrationsForTables(partitionedTablePathList);
+        List<BulkLoadHandle> bulkLoads = new ArrayList<>();
         for (TablePath tablePath : tablePathSet) {
             TableInfo tableInfo = tablePath2TableInfoMap.get(tablePath);
             TableRegistration registration = registrations.get(tablePath);
@@ -525,10 +518,7 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
             if (registration.bulkLoadId != null) {
                 bulkLoads.add(
                         new BulkLoadHandle(
-                                PhysicalTablePath.of(tablePath),
-                                registration.tableId,
-                                null,
-                                registration.bulkLoadId));
+                                tablePath, registration.tableId, registration.bulkLoadId));
             }
             coordinatorContext.putTablePath(tableInfo.getTableId(), tablePath);
             coordinatorContext.putTableInfo(tableInfo);
@@ -541,7 +531,13 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
                 if (partitions != null) {
                     for (Map.Entry<String, PartitionRegistration> partition :
                             partitions.entrySet()) {
-                        long partitionId = partition.getValue().getPartitionId();
+                        PartitionRegistration partitionRegistration = partition.getValue();
+                        if (partitionRegistration.getTableId() == tableInfo.getTableId()
+                                && partitionRegistration.getBulkLoadId() != null) {
+                            bulkLoads.add(new BulkLoadHandle(tablePath, tableInfo.getTableId(),
+                                    partitionRegistration.getBulkLoadId()));
+                        }
+                        long partitionId = partitionRegistration.getPartitionId();
                         // put partition info to coordinator context
                         PartitionInfo partitionInfo =
                                 new PartitionInfo(
@@ -635,21 +631,26 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         Map<Long, TableAssignment> tableId2tableAssignmentMap =
                 zooKeeperClient.getTablesAssignments(tableIds);
         for (Long tableId : tableIds) {
-            TableAssignment assignment = tableId2tableAssignmentMap.get(tableId);
-            if (assignment == null) {
-                throw new IllegalStateException(
-                        "Incomplete startup assignment for table " + tableId + ".");
-            }
-            boolean deleted = !coordinatorContext.containsTableId(tableId);
-            loadAssignment(tableId, assignment, null);
-            if (deleted) {
+            // if table id not in current coordinator context,
+            // we'll consider it as deleted
+            if (!coordinatorContext.containsTableId(tableId)) {
                 deletedTables.add(tableId);
+            }
+            TableAssignment assignment = tableId2tableAssignmentMap.get(tableId);
+            if (assignment != null) {
+                loadAssignment(tableId, assignment, null);
+            } else {
+                LOG.warn(
+                        "Can't get the assignment for table {} with id {}.",
+                        coordinatorContext.getTablePathById(tableId),
+                        tableId);
             }
         }
         coordinatorContext.queueTableDeletion(deletedTables);
     }
 
     private void loadPartitionAssignment() throws Exception {
+        // load all assignment
         List<Long> partitionAssignmentNodes =
                 zooKeeperClient.getChildren(PartitionIdsZNode.path()).stream()
                         .map(Long::parseLong)
@@ -660,15 +661,15 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         for (Long partitionId : partitionAssignmentNodes) {
             PartitionAssignment assignment = partitionId2partitionAssignmentMap.get(partitionId);
             if (assignment == null) {
-                throw new IllegalStateException(
-                        "Incomplete startup assignment for partition " + partitionId + ".");
+                LOG.warn("Can't get the assignment for table partition {}.", partitionId);
+                continue;
             }
             long tableId = assignment.getTableId();
-            boolean deleted = !coordinatorContext.containsPartitionId(partitionId);
-            loadAssignment(tableId, assignment, partitionId);
-            if (deleted) {
+            // partition id doesn't exist in coordinator context, consider it as deleted
+            if (!coordinatorContext.containsPartitionId(partitionId)) {
                 deletedPartitions.add(new TablePartition(tableId, partitionId));
             }
+            loadAssignment(tableId, assignment, partitionId);
         }
         coordinatorContext.queuePartitionDeletion(deletedPartitions);
     }
@@ -1243,10 +1244,6 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         }
 
         coordinatorContext.queueTableDeletion(Collections.singleton(tableId));
-        // An earlier state transition may have failed while building its fenced v1 batch. The
-        // authoritative drop event starts a new transition and must not inherit those unsent
-        // requests.
-        coordinatorRequestBatch.discardIncompleteBatch();
         tableManager.onDeleteTable(tableId);
         if (dropTableEvent.isAutoPartitionTable()) {
             autoPartitionManager.removeAutoPartitionTable(tableId);
@@ -1301,7 +1298,6 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         }
 
         coordinatorContext.queuePartitionDeletion(Collections.singleton(tablePartition));
-        coordinatorRequestBatch.discardIncompleteBatch();
         tableManager.onDeletePartition(tableId, dropPartitionEvent.getPartitionId());
         autoPartitionManager.removePartition(tableId, dropPartitionEvent.getPartitionName());
 
@@ -1363,11 +1359,10 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         // get the server that receives the response
         int serverId = notifyLeaderAndIsrResponseReceivedEvent.getResponseServerId();
         Set<TableBucketReplica> offlineReplicas = new HashSet<>();
+        List<TableBucket> succeededBuckets = new ArrayList<>();
         // get all the results for each bucket
         List<NotifyLeaderAndIsrResultForBucket> notifyLeaderAndIsrResultForBuckets =
                 notifyLeaderAndIsrResponseReceivedEvent.getNotifyLeaderAndIsrResultForBuckets();
-        Map<TableBucket, Long> pendingLeaderActivationIds =
-                notifyLeaderAndIsrResponseReceivedEvent.getPendingLeaderActivationIds();
         for (NotifyLeaderAndIsrResultForBucket notifyLeaderAndIsrResultForBucket :
                 notifyLeaderAndIsrResultForBuckets) {
             TableBucket tableBucket = notifyLeaderAndIsrResultForBucket.getTableBucket();
@@ -1468,40 +1463,6 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         coordinatorContext.removeLiveCoordinator(coordinatorServerId);
     }
 
-    /**
-     * Binds the current registration after gateway installation during startup or on the
-     * Coordinator event thread. This does not confirm an RPC connection to the owning session.
-     */
-    private void bindTabletServerRegistration(ServerInfo server) {
-        int serverId = server.id();
-        coordinatorContext.unbindTabletServerRegistration(serverId);
-        Optional<DataWithStat> observed;
-        try {
-            observed = zooKeeperClient.getDataWithStatIfExists(ZkData.ServerIdZNode.path(serverId));
-        } catch (Exception failure) {
-            throw new FlussRuntimeException(
-                    "Failed to bind the ready TabletServer registration.", failure);
-        }
-        if (!observed.isPresent()) {
-            return;
-        }
-        DataWithStat data = observed.get();
-        RegisteredTabletServer current =
-                new RegisteredTabletServer(
-                        serverId,
-                        ZkData.ServerIdZNode.decode(data.getData()),
-                        ZkData.ServerIdZNode.path(serverId),
-                        data.getStat().getVersion(),
-                        data.getStat().getEphemeralOwner());
-        ServerInfo currentLive = coordinatorContext.getLiveTabletServers().get(serverId);
-        if (currentLive == null
-                || !currentLive.equals(server)
-                || !current.matchesLive(currentLive)) {
-            return;
-        }
-        coordinatorContext.bindTabletServerRegistration(current);
-    }
-
     private void processNewTabletServer(NewTabletServerEvent newTabletServerEvent) {
         // NOTE: we won't need to detect bounced tablet servers like Kafka as we won't
         // miss the event of tablet server un-register and register again since we can
@@ -1532,7 +1493,6 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         coordinatorContext.addLiveTabletServer(serverInfo);
         ServerNode serverNode = serverInfo.nodeOrThrow(internalListenerName);
         coordinatorChannelManager.addTabletServer(serverNode);
-        bindTabletServerRegistration(serverInfo);
 
         // Update the Coordinator metadata cache to include the newly registered TabletServer.
         serverMetadataCache.updateMetadata(
@@ -1581,7 +1541,6 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         LOG.info("Tablet server failure callback for {}.", tabletServerId);
         coordinatorContext.removeOfflineBucketInServer(tabletServerId);
 
-        coordinatorContext.unbindTabletServerRegistration(tabletServerId);
         coordinatorContext.removeLiveTabletServer(tabletServerId);
         coordinatorContext.shuttingDownTabletServers().remove(tabletServerId);
         coordinatorChannelManager.removeTabletServer(tabletServerId);
@@ -1833,11 +1792,6 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
             return;
         }
 
-        if (!validateNoBulkLoadForReassignment(tableBucket)) {
-            rebalanceManager.finishRebalanceTask(tableBucket, RebalanceStatus.FAILED);
-            return;
-        }
-
         List<Integer> newReplicas = planForBucket.getNewReplicas();
         ReplicaReassignment reassignment =
                 ReplicaReassignment.build(planForBucket.getOriginReplicas(), newReplicas);
@@ -1879,41 +1833,6 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
                             + "reconciliation.",
                     tableBucket,
                     e);
-        }
-    }
-
-    private boolean validateNoBulkLoadForReassignment(TableBucket tableBucket) {
-        PhysicalTablePath physicalTablePath;
-        if (tableBucket.getPartitionId() == null) {
-            TablePath tablePath = coordinatorContext.getTablePathById(tableBucket.getTableId());
-            if (tablePath == null) {
-                LOG.warn(
-                        "Rejecting reassignment for {} because its physical table path is unknown.",
-                        tableBucket);
-                return false;
-            }
-            physicalTablePath = PhysicalTablePath.of(tablePath);
-        } else {
-            Optional<PhysicalTablePath> partitionPath =
-                    coordinatorContext.getPhysicalTablePath(tableBucket.getPartitionId());
-            if (!partitionPath.isPresent()) {
-                LOG.warn(
-                        "Rejecting reassignment for {} because its physical partition path is unknown.",
-                        tableBucket);
-                return false;
-            }
-            physicalTablePath = partitionPath.get();
-        }
-        try {
-            metadataManager.validateNoBulkLoad(
-                    physicalTablePath, tableBucket.getTableId(), tableBucket.getPartitionId());
-            return true;
-        } catch (RuntimeException failure) {
-            LOG.warn(
-                    "Rejecting reassignment for {} because BulkLoad metadata is active or unreadable.",
-                    tableBucket,
-                    failure);
-            return false;
         }
     }
 
@@ -2620,20 +2539,6 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         // commit the kv snapshot asynchronously
         TableBucket tb = event.getTableBucket();
         TablePath tablePath = coordinatorContext.getTablePathById(tb.getTableId());
-        final String registrationPath;
-        final int registrationVersion;
-        final int coordinatorZkVersion;
-        final int leaderAndIsrZkVersion;
-        try {
-            registrationPath = getTableOrPartitionRegistrationPath(tb, tablePath);
-            registrationVersion =
-                    zooKeeperClient.getDataWithStat(registrationPath).getStat().getVersion();
-            coordinatorZkVersion = coordinatorContext.getCoordinatorZkVersion();
-            leaderAndIsrZkVersion = readLeaderAndIsrZkVersion(event);
-        } catch (Exception e) {
-            callback.completeExceptionally(e);
-            return;
-        }
         ioExecutor.execute(
                 () -> {
                     try {
@@ -2644,12 +2549,7 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
                                 completedSnapshotStoreManager.getOrCreateCompletedSnapshotStore(
                                         tablePath, tb);
                         // this involves IO operation (ZK), so we do it in ioExecutor
-                        completedSnapshotStore.add(
-                                completedSnapshot,
-                                registrationPath,
-                                registrationVersion,
-                                coordinatorZkVersion,
-                                leaderAndIsrZkVersion);
+                        completedSnapshotStore.add(completedSnapshot);
                         coordinatorEventManager.put(
                                 new NotifyKvSnapshotOffsetEvent(
                                         tb, completedSnapshot.getLogOffset()));
@@ -2713,24 +2613,11 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         TableBucket tb = event.getTableBucket();
         try {
             validateFencedEvent(event);
-            String registrationPath =
-                    getTableOrPartitionRegistrationPath(
-                            tb, coordinatorContext.getTablePathById(tb.getTableId()));
-            int registrationVersion =
-                    zooKeeperClient.getDataWithStat(registrationPath).getStat().getVersion();
-            int leaderAndIsrZkVersion = readLeaderAndIsrZkVersion(event);
-            // do commit remote log manifest snapshot path to zk.
-            RemoteLogManifestHandle manifestHandle =
-                    new RemoteLogManifestHandle(
-                            manifestData.getRemoteLogManifestPath(),
-                            manifestData.getRemoteLogEndOffset());
             zooKeeperClient.upsertRemoteLogManifestHandle(
                     tb,
-                    manifestHandle,
-                    registrationPath,
-                    registrationVersion,
-                    coordinatorContext.getCoordinatorZkVersion(),
-                    leaderAndIsrZkVersion);
+                    new RemoteLogManifestHandle(
+                            manifestData.getRemoteLogManifestPath(),
+                            manifestData.getRemoteLogEndOffset()));
         } catch (Exception e) {
             LOG.error(
                     "Error when commit remote log manifest, the leader need to revert the commit.",
@@ -2757,20 +2644,6 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
         coordinatorRequestBatch.sendNotifyRemoteLogOffsetsRequest(
                 coordinatorContext.getCoordinatorEpoch());
         return response;
-    }
-
-    private String getTableOrPartitionRegistrationPath(
-            TableBucket tableBucket, TablePath tablePath) {
-        if (tableBucket.getPartitionId() == null) {
-            return ZkData.TableZNode.path(tablePath);
-        } else {
-            String partitionName =
-                    coordinatorContext.getPartitionName(tableBucket.getPartitionId());
-            if (partitionName == null) {
-                throw new UnknownTableOrBucketException("Unknown partition " + tableBucket);
-            }
-            return ZkData.PartitionZNode.path(tablePath, partitionName);
-        }
     }
 
     private <T> void processAccessContext(AccessContextEvent<T> event) {
@@ -3061,27 +2934,6 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
                 throw new UnknownTableOrBucketException("Unknown table id " + tb.getTableId());
             }
         }
-    }
-
-    private int readLeaderAndIsrZkVersion(FencedCoordinatorEvent event) throws Exception {
-        TableBucket tableBucket = event.getTableBucket();
-        ZooKeeperClient.DataWithStat persisted =
-                zooKeeperClient.getDataWithStat(ZkData.LeaderAndIsrZNode.path(tableBucket));
-        LeaderAndIsr persistedLeaderAndIsr = ZkData.LeaderAndIsrZNode.decode(persisted.getData());
-        LeaderAndIsr current =
-                coordinatorContext
-                        .getBucketLeaderAndIsr(tableBucket)
-                        .orElseThrow(
-                                () ->
-                                        new UnknownTableOrBucketException(
-                                                "Unknown table or bucket " + tableBucket));
-        if (persistedLeaderAndIsr.leader() != current.leader()
-                || persistedLeaderAndIsr.leaderEpoch() != current.leaderEpoch()
-                || persistedLeaderAndIsr.leaderEpoch() != event.getBucketLeaderEpoch()) {
-            throw new FencedLeaderEpochException(
-                    "The persisted leader identity changed for " + tableBucket + '.');
-        }
-        return persisted.getStat().getVersion();
     }
 
     /** Update metadata cache for all remote tablet servers when coordinator startup. */

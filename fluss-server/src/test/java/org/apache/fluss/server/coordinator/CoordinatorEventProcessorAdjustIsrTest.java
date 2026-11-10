@@ -400,7 +400,8 @@ class CoordinatorEventProcessorAdjustIsrTest extends CoordinatorEventProcessorTe
                 metadataManager,
                 kvSnapshotLeaseManager,
                 scheduler,
-                SystemClock.getInstance());
+                SystemClock.getInstance(),
+                new java.util.concurrent.Semaphore(conf.get(ConfigOptions.BULKLOAD_MAX_ACTIVE_TRANSACTIONS)));
     }
 
     private static final class TestingAdjustIsrZooKeeperClient extends ZooKeeperClient {

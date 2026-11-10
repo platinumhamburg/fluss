@@ -193,7 +193,6 @@ public class TableManager {
 
     /** Invoked with a table to be deleted. */
     public void onDeleteTable(long tableId) {
-        discardIncompleteStateMachineBatches();
         Set<TableBucket> tableBuckets = coordinatorContext.getAllBucketsForTable(tableId);
         tableBucketStateMachine.handleStateChange(tableBuckets, BucketState.OfflineBucket);
         tableBucketStateMachine.handleStateChange(tableBuckets, BucketState.NonExistentBucket);
@@ -202,7 +201,6 @@ public class TableManager {
 
     /** Invoked with partitions of a table to be deleted. */
     public void onDeletePartition(long tableId, long partitionId) {
-        discardIncompleteStateMachineBatches();
         Set<TableBucket> deleteBuckets =
                 coordinatorContext.getAllBucketsForPartition(tableId, partitionId);
         tableBucketStateMachine.handleStateChange(deleteBuckets, BucketState.OfflineBucket);
@@ -301,11 +299,6 @@ public class TableManager {
             replicaStateMachine.handleStateChanges(replicas, ReplicaState.OfflineReplica);
             replicaStateMachine.handleStateChanges(replicas, ReplicaState.ReplicaDeletionStarted);
         }
-    }
-
-    private void discardIncompleteStateMachineBatches() {
-        tableBucketStateMachine.discardIncompleteBatch();
-        replicaStateMachine.discardIncompleteBatch();
     }
 
     private void updateObservedKvLeaderReplicaCount() {
