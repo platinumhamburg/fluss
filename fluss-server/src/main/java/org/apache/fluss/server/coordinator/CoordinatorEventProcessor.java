@@ -41,8 +41,8 @@ import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.exception.TabletServerNotAvailableException;
 import org.apache.fluss.exception.UnknownServerException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
-import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.BulkLoadHandle;
+import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.SchemaInfo;
@@ -128,7 +128,6 @@ import org.apache.fluss.server.metadata.ServerInfo;
 import org.apache.fluss.server.metrics.group.CoordinatorMetricGroup;
 import org.apache.fluss.server.utils.ServerRpcMessageUtils;
 import org.apache.fluss.server.zk.ZooKeeperClient;
-import org.apache.fluss.server.zk.ZooKeeperClient.VersionedData;
 import org.apache.fluss.server.zk.data.BucketAssignment;
 import org.apache.fluss.server.zk.data.CoordinatorAddress;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
@@ -392,7 +391,6 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
             }
             throw new FlussRuntimeException("Fail to start Coordinator event processor.", e);
         }
-
     }
 
     public void shutdown() {
@@ -534,8 +532,11 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
                         PartitionRegistration partitionRegistration = partition.getValue();
                         if (partitionRegistration.getTableId() == tableInfo.getTableId()
                                 && partitionRegistration.getBulkLoadId() != null) {
-                            bulkLoads.add(new BulkLoadHandle(tablePath, tableInfo.getTableId(),
-                                    partitionRegistration.getBulkLoadId()));
+                            bulkLoads.add(
+                                    new BulkLoadHandle(
+                                            tablePath,
+                                            tableInfo.getTableId(),
+                                            partitionRegistration.getBulkLoadId()));
                         }
                         long partitionId = partitionRegistration.getPartitionId();
                         // put partition info to coordinator context

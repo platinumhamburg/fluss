@@ -317,7 +317,7 @@ class RemoteLogFetcherTest extends RemoteLogTestBase {
                         testCoordinatorGateway,
                         "CLIENT",
                         ConsumerOffsetTableConfig.from(conf),
-                            new SnapshotRestoreAccessGate());
+                        new SnapshotRestoreAccessGate());
         try (RpcServer server =
                 RpcServer.create(
                         conf,

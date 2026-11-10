@@ -450,6 +450,7 @@ class CoordinatorEventProcessorTest extends CoordinatorEventProcessorTestBase {
                 ZOO_KEEPER_EXTENSION_WRAPPER
                         .getCustomExtension()
                         .createZooKeeperClient(NOPErrorHandler.INSTANCE);
+        assertThat(client.getCuratorClient().blockUntilConnected(30, TimeUnit.SECONDS)).isTrue();
         int newlyServerId = 3;
         TabletServerRegistration tabletServerRegistration =
                 new TabletServerRegistration(
@@ -2751,6 +2752,7 @@ class CoordinatorEventProcessorTest extends CoordinatorEventProcessorTestBase {
         }
         return count;
     }
+
     @Test
     void testStartupAcceptsLakeMetadataWithoutTableAssignment() throws Exception {
         eventProcessor.shutdown();
@@ -2766,5 +2768,4 @@ class CoordinatorEventProcessorTest extends CoordinatorEventProcessorTestBase {
         boolean tableRegistered = fromCtx(ctx -> ctx.containsTableId(tableId));
         assertThat(tableRegistered).isFalse();
     }
-
 }

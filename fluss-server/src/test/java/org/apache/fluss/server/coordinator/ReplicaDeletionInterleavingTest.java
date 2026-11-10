@@ -47,8 +47,8 @@ import org.apache.fluss.server.zk.data.PartitionAssignment;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TabletServerRegistration;
 import org.apache.fluss.server.zk.data.ZkData.ServerIdZNode;
-import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.server.zk.data.ZkData.TabletServerSessionFenceZNode;
+import org.apache.fluss.utils.FlussPaths;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;

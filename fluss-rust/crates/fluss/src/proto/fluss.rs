@@ -542,6 +542,9 @@ pub struct NotifyLeaderAndIsrResponse {
     pub notify_buckets_leader_resp: ::prost::alloc::vec::Vec<
         PbNotifyLeaderAndIsrRespForBucket,
     >,
+    /// Registered server session for Snapshot restoration; absent for ordinary role changes.
+    #[prost(int64, optional, tag = "2")]
+    pub server_session_id: ::core::option::Option<i64>,
 }
 /// stop bucket replica request
 #[derive(Clone, PartialEq, ::prost::Message)]

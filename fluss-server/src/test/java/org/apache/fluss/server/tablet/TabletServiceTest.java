@@ -278,7 +278,8 @@ class TabletServiceTest extends ReplicaTestBase {
                         scannerManager,
                         testCoordinatorGateway,
                         "CLIENT",
-                        ConsumerOffsetTableConfig.from(conf));
+                        ConsumerOffsetTableConfig.from(conf),
+                        new SnapshotRestoreAccessGate());
         service.setCurrentSession(
                 new Session(
                         (short) 0,

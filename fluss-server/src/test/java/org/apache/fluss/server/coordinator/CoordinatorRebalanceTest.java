@@ -106,7 +106,37 @@ class CoordinatorRebalanceTest extends CoordinatorEventProcessorTestBase {
         if (Arrays.stream(zookeeperClient.getSortedTabletServerList()).noneMatch(id -> id == 2)) {
             registerTabletServer(2);
         }
-        ZOO_KEEPER_EXTENSION_WRAPPER.getCustomExtension().cleanupPath(ZkData.ServerIdZNode.path(3));
+        removeTabletServer(3);
+    }
+
+    @Test
+    void testReassignmentCompletesWithBulkLoadOwner() throws Exception {
+        registerTabletServer(3);
+        initCoordinatorChannel();
+        long tableId = createTableWithReplicas(Arrays.asList(0, 1, 3), 1);
+        TablePath path = TablePath.of(defaultDatabase, "rebalance");
+        zookeeperClient.updateTable(
+                path,
+                zookeeperClient
+                        .getTable(path)
+                        .get()
+                        .withBulkLoadId("550e8400-e29b-41d4-a716-446655440000"));
+        try {
+            TableBucket bucket = new TableBucket(tableId, 0);
+            RebalancePlanForBucket plan =
+                    new RebalancePlanForBucket(
+                            bucket, 0, 0, Arrays.asList(0, 1, 3), Arrays.asList(0, 1, 2));
+            registerRebalance(
+                    "bulkload-owner-reassignment", Collections.singletonMap(bucket, plan));
+            adjustRebalanceIsr(bucket, Arrays.asList(0, 1, 2, 3));
+            retry(
+                    Duration.ofMinutes(1),
+                    () -> assertThat(rebalanceStatus(bucket)).isEqualTo(RebalanceStatus.COMPLETED));
+            verifyIsr(bucket, 0, Arrays.asList(0, 1, 2));
+        } finally {
+            zookeeperClient.updateTable(
+                    path, zookeeperClient.getTable(path).get().withBulkLoadId(null));
+        }
     }
 
     @Test
@@ -171,7 +201,7 @@ class CoordinatorRebalanceTest extends CoordinatorEventProcessorTestBase {
         adjustRebalanceIsr(tableBucket, Arrays.asList(0, 1, 2, 3));
         assertThat(eventProcessor.getRebalanceManager().hasInProgressRebalance()).isTrue();
 
-        ZOO_KEEPER_EXTENSION_WRAPPER.getCustomExtension().cleanupPath(ZkData.ServerIdZNode.path(2));
+        removeTabletServer(2);
         retryVerifyContext(ctx -> assertThat(ctx.liveTabletServerSet()).doesNotContain(2));
         drainPendingNotifyTriggers(pendingResponses);
         fromCtx(ctx -> null);
@@ -453,9 +483,7 @@ class CoordinatorRebalanceTest extends CoordinatorEventProcessorTestBase {
         String failedId = "failed-before-restart";
         registerRebalance(failedId, plan);
         if (targetUnavailable) {
-            ZOO_KEEPER_EXTENSION_WRAPPER
-                    .getCustomExtension()
-                    .cleanupPath(ZkData.ServerIdZNode.path(3));
+            removeTabletServer(3);
             retryVerifyContext(ctx -> assertThat(ctx.liveTabletServerSet()).doesNotContain(3));
         }
         RebalanceExecutionKey key = eventProcessor.getRebalanceManager().getExecutionKey(bucket);
@@ -1197,6 +1225,21 @@ class CoordinatorRebalanceTest extends CoordinatorEventProcessorTestBase {
             verifyIsr(new TableBucket(tableId, bucket), replicas.get(0), replicas);
         }
         return tableId;
+    }
+
+    private void removeTabletServer(int serverId) throws Exception {
+        long sessionId =
+                zookeeperClient
+                        .getCuratorClient()
+                        .getZookeeperClient()
+                        .getZooKeeper()
+                        .getSessionId();
+        ZOO_KEEPER_EXTENSION_WRAPPER
+                .getCustomExtension()
+                .cleanupPath(ZkData.ServerIdZNode.path(serverId));
+        ZOO_KEEPER_EXTENSION_WRAPPER
+                .getCustomExtension()
+                .cleanupPath(ZkData.TabletServerSessionFenceZNode.path(serverId, sessionId));
     }
 
     private void registerRebalance(String id, Map<TableBucket, RebalancePlanForBucket> plans)

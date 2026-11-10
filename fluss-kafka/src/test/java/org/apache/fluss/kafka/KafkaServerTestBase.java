@@ -62,7 +62,7 @@ public class KafkaServerTestBase extends ReplicaTestBase {
                 testCoordinatorGateway,
                 "INTERNAL",
                 ConsumerOffsetTableConfig.from(conf),
-                            new SnapshotRestoreAccessGate());
+                new SnapshotRestoreAccessGate());
     }
 
     @AfterEach

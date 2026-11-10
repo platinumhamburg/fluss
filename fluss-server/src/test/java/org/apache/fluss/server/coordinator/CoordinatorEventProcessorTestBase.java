@@ -208,7 +208,8 @@ class CoordinatorEventProcessorTestBase {
                 kvSnapshotLeaseManager,
                 scheduler,
                 clock,
-                new java.util.concurrent.Semaphore(conf.get(ConfigOptions.BULKLOAD_MAX_ACTIVE_TRANSACTIONS)));
+                new java.util.concurrent.Semaphore(
+                        conf.get(ConfigOptions.BULKLOAD_MAX_ACTIVE_TRANSACTIONS)));
     }
 
     /** Verifies the elected leader and ISR in memory and ZooKeeper. */
