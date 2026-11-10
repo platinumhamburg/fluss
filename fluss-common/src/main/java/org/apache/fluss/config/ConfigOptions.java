@@ -1968,6 +1968,18 @@ public class ConfigOptions {
                             "Local directory that is used by client for"
                                     + " storing the data files (like kv snapshot, log segment files) to read temporarily");
 
+    public static final ConfigOption<List<String>> CLIENT_BULK_LOAD_LOCAL_DIRS =
+            key("client.bulk-load.local.dirs")
+                    .stringType()
+                    .asList()
+                    .defaultValues(System.getProperty("java.io.tmpdir") + "/fluss")
+                    .withDescription(
+                            "One or more local root directories that the BulkLoad client uses to build"
+                                    + " per-bucket state (each bucket's RocksDB, checkpoint and staging files)."
+                                    + " Separate multiple directories with a comma or the system path separator."
+                                    + " A bucket writer picks its root via floorMod(bucketId, number-of-directories)"
+                                    + " and creates a unique attempt child below it, deleting only that child on close.");
+
     public static final ConfigOption<Integer> REMOTE_FILE_DOWNLOAD_THREAD_NUM =
             key("client.remote-file.download-thread-num")
                     .intType()
