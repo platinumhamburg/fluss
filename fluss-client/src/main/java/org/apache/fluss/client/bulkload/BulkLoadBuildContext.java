@@ -30,6 +30,7 @@ import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.rpc.messages.BeginBulkLoadResponse;
 import org.apache.fluss.rpc.messages.PbBulkLoadTargetInfo;
+import org.apache.fluss.rpc.messages.PbTableInfo;
 
 import javax.annotation.Nullable;
 
@@ -116,15 +117,19 @@ public final class BulkLoadBuildContext implements Serializable {
             this.handle = handle;
             path = BulkLoadMessageUtils.toPhysicalTablePath(info.getTarget());
             partitionId = info.hasPartitionId() ? info.getPartitionId() : null;
+            PbTableInfo frozenTable = info.getTableInfo();
             tableInfo =
                     TableInfo.of(
                             path.getTablePath(),
-                            handle.getTableId(),
-                            info.getSchemaId(),
-                            TableDescriptor.fromJsonBytes(info.getTableJson()),
-                            info.hasRemoteDataDir() ? info.getRemoteDataDir() : null,
-                            info.getCreatedTime(),
-                            info.getModifiedTime());
+                            frozenTable.getTableId(),
+                            frozenTable.getSchemaId(),
+                            TableDescriptor.fromJsonBytes(frozenTable.getTableJson()),
+                            frozenTable.hasRemoteDataDir() ? frozenTable.getRemoteDataDir() : null,
+                            frozenTable.getCreatedTime(),
+                            frozenTable.getModifiedTime(),
+                            frozenTable.hasBucketCountEpoch()
+                                    ? frozenTable.getBucketCountEpoch()
+                                    : 0L);
             snapshotIds = info.getSnapshotIds().clone();
             DataLakeFormat lakeFormat = tableInfo.getTableConfig().getDataLakeFormat().orElse(null);
             bucketKeyEncoder =
