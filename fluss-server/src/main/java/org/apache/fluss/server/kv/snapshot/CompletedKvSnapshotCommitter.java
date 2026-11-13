@@ -17,8 +17,24 @@
 
 package org.apache.fluss.server.kv.snapshot;
 
+import javax.annotation.Nullable;
+
 /** An interface for reporting a {@link CompletedSnapshot}. */
 public interface CompletedKvSnapshotCommitter {
+
+    /** Commits using the selected snapshot captured during synchronous preparation. */
+    default void commitKvSnapshot(
+            CompletedSnapshot snapshot,
+            int coordinatorEpoch,
+            int bucketLeaderEpoch,
+            @Nullable Long expectedRecoverySnapshotId)
+            throws Exception {
+        if (expectedRecoverySnapshotId != null) {
+            throw new UnsupportedOperationException(
+                    "Recovery snapshot identities are not supported.");
+        }
+        commitKvSnapshot(snapshot, coordinatorEpoch, bucketLeaderEpoch);
+    }
 
     /**
      * Commit the completed kv snapshot for a bucket.

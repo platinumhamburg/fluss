@@ -42,6 +42,7 @@ import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.replica.ReplicaManager;
 import org.apache.fluss.server.testutils.ServerTestTags;
+import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.utils.FlussPaths;
@@ -84,6 +85,31 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link RemoteLogManager}. */
 class RemoteLogManagerTest extends RemoteLogTestBase {
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testKvRemoteExpiryDoesNotCrossRecoveryBoundary(boolean partitionTable) throws Exception {
+        TableBucket bucket = makeTableBucket(partitionTable, true);
+        makeKvTableAsLeader(bucket, DATA1_TABLE_PATH_PK, INITIAL_LEADER_EPOCH, partitionTable);
+        LogTablet log = replicaManager.getReplicaOrException(bucket).getLogTablet();
+        addMultiSegmentsToLogTablet(log, 5, false);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        RemoteLogTablet remote = remoteLogManager.remoteLogTablet(bucket);
+        assertThat(remote.allRemoteLogSegments()).hasSize(4);
+        manualClock.advanceTime(Duration.ofDays(8));
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        assertThat(remote.allRemoteLogSegments()).hasSize(4);
+        assertThat(log.getMinRetainOffset()).isZero();
+        zkClient.registerTableBucketSnapshot(bucket, new BucketSnapshot(7, 20, "file:/durable"));
+        log.updateMinRetainOffset(20);
+        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
+        assertThat(remote.allRemoteLogSegments())
+                .hasSize(2)
+                .allSatisfy(
+                        segment ->
+                                assertThat(segment.remoteLogStartOffset())
+                                        .isGreaterThanOrEqualTo(20));
+    }
 
     @BeforeEach
     public void setup() throws Exception {
@@ -524,7 +550,8 @@ class RemoteLogManagerTest extends RemoteLogTestBase {
                                 INITIAL_COORDINATOR_EPOCH,
                                 INITIAL_BUCKET_EPOCH + 1),
                         3,
-                        0L));
+                        0L,
+                        null));
 
         CompletableFuture<Map<TableBucket, FetchLogResultForBucket>> fetchFuture =
                 new CompletableFuture<>();

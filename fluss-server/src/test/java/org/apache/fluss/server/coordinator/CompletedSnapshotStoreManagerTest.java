@@ -22,7 +22,11 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotHandle;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotHandleStore;
+import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotStore;
+import org.apache.fluss.server.kv.snapshot.KvFileHandle;
+import org.apache.fluss.server.kv.snapshot.KvFileHandleAndLocalPath;
+import org.apache.fluss.server.kv.snapshot.KvSnapshotHandle;
 import org.apache.fluss.server.kv.snapshot.TestingCompletedSnapshotHandle;
 import org.apache.fluss.server.kv.snapshot.ZooKeeperCompletedSnapshotHandleStore;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
@@ -30,6 +34,7 @@ import org.apache.fluss.server.testutils.KvTestUtils;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
+import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
 
 import org.junit.jupiter.api.AfterAll;
@@ -46,7 +51,9 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -54,8 +61,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -94,6 +105,136 @@ class CompletedSnapshotStoreManagerTest {
     @AfterAll
     static void afterAll() {
         ioExecutor.shutdownNow();
+    }
+
+    @Test
+    void testSelectedSharedFilesSurviveConcurrentVersionlessRetention() throws Exception {
+        TableBucket bucket = new TableBucket(1, 0);
+        Path sst = tempDir.resolve("000001.sst");
+        Files.write(sst, new byte[] {1, 2, 3});
+        KvFileHandle handle = new KvFileHandle(sst.toUri().toString(), 3);
+        List<KvFileHandleAndLocalPath> shared =
+                Collections.singletonList(KvFileHandleAndLocalPath.of(handle, "000001.sst"));
+        CompletedSnapshot older = sharedSnapshot(bucket, 18, shared);
+        CompletedSnapshot selected = sharedSnapshot(bucket, 17, shared);
+        CompletedSnapshotStoreManager manager =
+                new CompletedSnapshotStoreManager(
+                        1,
+                        org.apache.fluss.utils.concurrent.Executors.directExecutor(),
+                        zookeeperClient,
+                        ZooKeeperCompletedSnapshotHandleStore::new,
+                        TestingMetricGroups.COORDINATOR_METRICS,
+                        snapshot -> false);
+        CompletedSnapshotStore store =
+                manager.getOrCreateCompletedSnapshotStore(DATA1_TABLE_PATH, bucket);
+        store.add(older);
+        Path metadata = Paths.get(selected.getMetadataFilePath().toUri());
+        Files.createDirectories(metadata.getParent());
+        Files.write(metadata, CompletedSnapshotJsonSerde.toJson(selected));
+        CountDownLatch published = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        CountDownLatch retaining = new CountDownLatch(1);
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> selection =
+                    workers.submit(
+                            () -> {
+                                try {
+                                    manager.selectRecoverySnapshot(
+                                            bucket,
+                                            () -> {
+                                                zookeeperClient
+                                                        .getCuratorClient()
+                                                        .transaction()
+                                                        .forOperations(
+                                                                zookeeperClient
+                                                                        .getCuratorClient()
+                                                                        .transactionOp()
+                                                                        .create()
+                                                                        .forPath(
+                                                                                org.apache.fluss
+                                                                                        .server.zk
+                                                                                        .data.ZkData
+                                                                                        .BucketSnapshotIdZNode
+                                                                                        .path(
+                                                                                                bucket,
+                                                                                                17),
+                                                                                org.apache.fluss
+                                                                                        .server.zk
+                                                                                        .data.ZkData
+                                                                                        .BucketSnapshotIdZNode
+                                                                                        .encode(
+                                                                                                new BucketSnapshot(
+                                                                                                        17,
+                                                                                                        0,
+                                                                                                        selected.getMetadataFilePath()
+                                                                                                                .toString()))),
+                                                                zookeeperClient
+                                                                        .getCuratorClient()
+                                                                        .transactionOp()
+                                                                        .create()
+                                                                        .forPath(
+                                                                                org.apache.fluss
+                                                                                        .server.zk
+                                                                                        .data.ZkData
+                                                                                        .RecoverySnapshotZNode
+                                                                                        .path(
+                                                                                                bucket),
+                                                                                new org.apache.fluss
+                                                                                                .server
+                                                                                                .zk
+                                                                                                .data
+                                                                                                .RecoverySnapshot(
+                                                                                                17)
+                                                                                        .toJson()));
+                                                published.countDown();
+                                                resume.await();
+                                            });
+                                } catch (Exception e) {
+                                    throw new CompletionException(e);
+                                }
+                            });
+            assertThat(published.await(10, TimeUnit.SECONDS)).isTrue();
+            Future<?> retention =
+                    workers.submit(
+                            () -> {
+                                retaining.countDown();
+                                try {
+                                    store.add(
+                                            KvTestUtils.mockCompletedSnapshot(tempDir, bucket, 20));
+                                } catch (Exception e) {
+                                    throw new CompletionException(e);
+                                }
+                            });
+            assertThat(retaining.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(retention).isNotDone();
+            resume.countDown();
+            selection.get(10, TimeUnit.SECONDS);
+            retention.get(10, TimeUnit.SECONDS);
+            assertThat(Files.exists(sst)).isTrue();
+            assertThat(zookeeperClient.getTableBucketSnapshot(bucket, 18)).isEmpty();
+            assertThat(zookeeperClient.getTableBucketLatestSnapshot(bucket).get().getSnapshotId())
+                    .isEqualTo(17);
+            store.add(KvTestUtils.mockCompletedSnapshot(tempDir, bucket, 21), 17L);
+            assertThat(Files.exists(sst)).isFalse();
+            assertThat(zookeeperClient.getTableBucketLatestSnapshot(bucket).get().getSnapshotId())
+                    .isEqualTo(21);
+        } finally {
+            resume.countDown();
+            workers.shutdownNow();
+        }
+    }
+
+    private CompletedSnapshot sharedSnapshot(
+            TableBucket bucket, long id, List<KvFileHandleAndLocalPath> shared) {
+        return new CompletedSnapshot(
+                bucket,
+                id,
+                new FsPath(tempDir.resolve("snapshot-" + id).toUri()),
+                KvSnapshotHandle.create(shared, Collections.emptyList(), 3),
+                0,
+                null,
+                null);
     }
 
     @ParameterizedTest

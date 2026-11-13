@@ -17,13 +17,19 @@
 
 package org.apache.fluss.server.kv.snapshot;
 
+import org.apache.fluss.exception.InvalidBulkLoadSnapshotException;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketSnapshot;
+import org.apache.fluss.server.zk.data.RecoverySnapshot;
+import org.apache.fluss.server.zk.data.ZkData;
+import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.data.Stat;
 import org.apache.fluss.utils.types.Tuple2;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.util.Comparator;
 import java.util.List;
@@ -58,7 +64,7 @@ public class ZooKeeperCompletedSnapshotHandleStore implements CompletedSnapshotH
      * but store the snapshot path in ZooKeeper. This level of indirection makes sure that data in
      * ZooKeeper is small.
      *
-     * <p>The operation will fail if there is already a node under the given path.
+     * <p>An existing matching reference is accepted without rewriting it.
      *
      * @throws Exception If a ZooKeeper or snapshot handle operation fails
      */
@@ -66,22 +72,47 @@ public class ZooKeeperCompletedSnapshotHandleStore implements CompletedSnapshotH
     public void add(
             TableBucket tableBucket, long snapshotId, CompletedSnapshotHandle snapshotHandle)
             throws Exception {
+        add(tableBucket, snapshotId, snapshotHandle, null);
+    }
+
+    @Override
+    public void add(
+            TableBucket tableBucket,
+            long snapshotId,
+            CompletedSnapshotHandle snapshotHandle,
+            @Nullable Long expectedRecoverySnapshotId)
+            throws Exception {
         checkNotNull(snapshotHandle, "completed snapshot handle");
 
-        boolean success = false;
+        BucketSnapshot expected =
+                new BucketSnapshot(
+                        snapshotId,
+                        snapshotHandle.getLogOffset(),
+                        snapshotHandle.getMetadataFilePath().toString());
         try {
-            client.registerTableBucketSnapshot(
-                    tableBucket,
-                    new BucketSnapshot(
-                            snapshotId,
-                            snapshotHandle.getLogOffset(),
-                            snapshotHandle.getMetadataFilePath().toString()));
-            success = true;
-        } finally {
-            if (!success) {
-                // Cleanup the snapshot metadata handle if it was not written to zookeeper
-                snapshotHandle.discard();
+            client.registerTableBucketSnapshot(tableBucket, expected, expectedRecoverySnapshotId);
+        } catch (
+                org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.KeeperException
+                                .NodeExistsException
+                        e) {
+            if (!client.getTableBucketSnapshot(tableBucket, snapshotId)
+                    .filter(expected::equals)
+                    .isPresent()) {
+                throw e;
             }
+            client.registerTableBucketSnapshot(tableBucket, expected, expectedRecoverySnapshotId);
+        } catch (InvalidBulkLoadSnapshotException
+                | org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.KeeperException
+                                .BadVersionException
+                        e) {
+            try {
+                if (!client.getTableBucketSnapshot(tableBucket, snapshotId).isPresent()) {
+                    snapshotHandle.discard();
+                }
+            } catch (Exception cleanup) {
+                e.addSuppressed(cleanup);
+            }
+            throw e;
         }
     }
 
@@ -92,6 +123,38 @@ public class ZooKeeperCompletedSnapshotHandleStore implements CompletedSnapshotH
         // removing it. May be handle it like https://issues.apache.org/jira/browse/FLINK-6612
         checkNotNull(tableBucket, "Table bucket");
         client.deleteTableBucketSnapshot(tableBucket, snapshotId);
+    }
+
+    @Override
+    public SnapshotRetention beginRetention(TableBucket bucket) throws Exception {
+        Stat physical = new Stat();
+        client.getCuratorClient()
+                .getData()
+                .storingStatIn(physical)
+                .forPath(ZkData.BucketIdZNode.path(bucket));
+        Optional<ZooKeeperClient.VersionedData<RecoverySnapshot>> head =
+                client.getRecoverySnapshot(bucket);
+        Optional<CompletedSnapshotHandle> selected =
+                head.isPresent()
+                        ? Optional.of(
+                                get(bucket, head.get().data().snapshotId)
+                                        .orElseThrow(
+                                                () ->
+                                                        new IllegalStateException(
+                                                                "Selected snapshot reference is missing.")))
+                        : Optional.empty();
+        return new SnapshotRetention() {
+            @Override
+            public Optional<CompletedSnapshotHandle> getRecoverySnapshot() {
+                return selected;
+            }
+
+            @Override
+            public void remove(long snapshotId) throws Exception {
+                client.deleteTableBucketSnapshot(
+                        bucket, snapshotId, head.orElse(null), physical.getVersion());
+            }
+        };
     }
 
     @Override

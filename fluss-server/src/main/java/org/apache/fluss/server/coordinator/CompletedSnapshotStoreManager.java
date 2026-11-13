@@ -19,6 +19,8 @@ package org.apache.fluss.server.coordinator;
 
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.exception.ApiException;
+import org.apache.fluss.exception.FlussRuntimeException;
+import org.apache.fluss.exception.InvalidBulkLoadSnapshotException;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.MetricNames;
@@ -32,6 +34,8 @@ import org.apache.fluss.server.kv.snapshot.SharedKvFileRegistry;
 import org.apache.fluss.server.kv.snapshot.ZooKeeperCompletedSnapshotHandleStore;
 import org.apache.fluss.server.metrics.group.CoordinatorMetricGroup;
 import org.apache.fluss.server.zk.ZooKeeperClient;
+import org.apache.fluss.server.zk.data.RecoverySnapshot;
+import org.apache.fluss.utils.function.RunnableWithException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -45,9 +49,11 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
@@ -102,7 +108,20 @@ public class CompletedSnapshotStoreManager {
         this.zooKeeperClient = zooKeeperClient;
         this.bucketCompletedSnapshotStores = new ConcurrentHashMap<>();
         this.ioExecutor = ioExecutor;
-        this.snapshotInUseChecker = snapshotInUseChecker;
+        this.snapshotInUseChecker =
+                snapshot -> {
+                    if (snapshotInUseChecker.isInUse(snapshot)) {
+                        return true;
+                    }
+                    try {
+                        return zooKeeperClient.isRecoverySnapshotInUse(
+                                snapshot.getTableBucket(), snapshot.getSnapshotID());
+                    } catch (Exception e) {
+                        throw new FlussRuntimeException(
+                                "Cannot determine whether a selected recovery snapshot is still in use.",
+                                e);
+                    }
+                };
         this.makeZookeeperCompletedSnapshotHandleStore = makeZookeeperCompletedSnapshotHandleStore;
         this.coordinatorMetricGroup = coordinatorMetricGroup;
 
@@ -163,6 +182,30 @@ public class CompletedSnapshotStoreManager {
                 });
     }
 
+    /** Keeps explicit source selection atomic with this bucket's cache creation and retention. */
+    public void selectRecoverySnapshot(TableBucket bucket, RunnableWithException persist)
+            throws Exception {
+        AtomicReference<Exception> failure = new AtomicReference<>();
+        bucketCompletedSnapshotStores.compute(
+                bucket,
+                (ignored, existing) -> {
+                    CompletedSnapshotStore store = existing;
+                    try {
+                        if (store == null) {
+                            persist.run();
+                        } else {
+                            store.selectRecoverySnapshot(bucket, persist);
+                        }
+                    } catch (Exception e) {
+                        failure.set(e);
+                    }
+                    return store;
+                });
+        if (failure.get() != null) {
+            throw failure.get();
+        }
+    }
+
     public void removeCompletedSnapshotStoreByTableBuckets(Set<TableBucket> tableBuckets) {
         for (TableBucket tableBucket : tableBuckets) {
             bucketCompletedSnapshotStores.remove(tableBucket);
@@ -177,6 +220,24 @@ public class CompletedSnapshotStoreManager {
         // Get all there is first.
         List<CompletedSnapshotHandle> initialSnapshots =
                 completedSnapshotHandleStore.getAllCompletedSnapshotHandles(tableBucket);
+
+        if (zooKeeperClient.getRecoverySnapshot(tableBucket).isPresent()) {
+            CompletedSnapshotHandle recovery =
+                    completedSnapshotHandleStore
+                            .getLatestCompletedSnapshotHandle(tableBucket)
+                            .orElseThrow(
+                                    () ->
+                                            new org.apache.fluss.exception
+                                                    .InvalidBulkLoadSnapshotException(
+                                                    "Selected recovery snapshot is missing."));
+            boolean listed =
+                    initialSnapshots.stream()
+                            .anyMatch(handle -> handle.getSnapshotId() == recovery.getSnapshotId());
+            if (!listed) {
+                initialSnapshots = new ArrayList<>(initialSnapshots);
+                initialSnapshots.add(recovery);
+            }
+        }
 
         final int numberOfInitialSnapshots = initialSnapshots.size();
 
@@ -197,6 +258,10 @@ public class CompletedSnapshotStoreManager {
             } catch (Exception e) {
                 if (CompletedSnapshot.isSnapshotDataNotExists(
                         e, snapshotStateHandle.getMetadataFilePath())) {
+                    if (zooKeeperClient.isRecoverySnapshotInUse(
+                            tableBucket, snapshotStateHandle.getSnapshotId())) {
+                        throw e;
+                    }
                     LOG.error(
                             "Metadata not found for snapshot {} of table bucket {}, maybe snapshot already removed or broken.",
                             snapshotStateHandle.getSnapshotId(),
@@ -218,6 +283,18 @@ public class CompletedSnapshotStoreManager {
                     throw e;
                 }
             }
+        }
+
+        Optional<ZooKeeperClient.VersionedData<RecoverySnapshot>> imported =
+                zooKeeperClient.getRecoverySnapshot(tableBucket);
+        if (imported.isPresent()
+                && retrievedSnapshots.stream()
+                        .noneMatch(
+                                snapshot ->
+                                        imported.get().data().snapshotId
+                                                == snapshot.getSnapshotID())) {
+            throw new InvalidBulkLoadSnapshotException(
+                    "Selected recovery snapshot could not be loaded.");
         }
 
         // register all the files to shared kv file registry

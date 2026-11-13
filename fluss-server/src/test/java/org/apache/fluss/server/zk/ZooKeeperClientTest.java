@@ -99,6 +99,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.cluster.rebalance.RebalanceStatus.COMPLETED;
@@ -901,10 +902,13 @@ class ZooKeeperClientTest {
         zookeeperClient.registerTableBucketSnapshot(tableBucket, latestSnapshot);
 
         ZooKeeperClient raceTestingClient = spy(zookeeperClient);
+        AtomicBoolean removed = new AtomicBoolean();
         doAnswer(
                         invocation -> {
-                            zookeeperClient.deleteTableBucketSnapshot(
-                                    tableBucket, latestSnapshot.getSnapshotId());
+                            if (removed.compareAndSet(false, true)) {
+                                zookeeperClient.deleteTableBucketSnapshot(
+                                        tableBucket, latestSnapshot.getSnapshotId());
+                            }
                             return invocation.callRealMethod();
                         })
                 .when(raceTestingClient)

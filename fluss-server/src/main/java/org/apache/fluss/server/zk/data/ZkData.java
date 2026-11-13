@@ -567,6 +567,13 @@ public final class ZkData {
         }
     }
 
+    /** Persistent recovery source of a physical bucket, independent of transaction retention. */
+    public static final class RecoverySnapshotZNode {
+        public static String path(TableBucket tableBucket) {
+            return BucketIdZNode.path(tableBucket) + "/recovery_snapshot";
+        }
+    }
+
     /**
      * The znode for the snapshots of a bucket of a table or partition.
      *

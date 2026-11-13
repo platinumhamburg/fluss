@@ -26,6 +26,8 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.server.SequenceIDCounter;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketSnapshot;
+import org.apache.fluss.server.zk.data.RecoverySnapshot;
+import org.apache.fluss.server.zk.data.ZkData;
 import org.apache.fluss.utils.CloseableRegistry;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.FlussPaths;
@@ -34,9 +36,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
 import java.io.IOException;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.Executor;
 import java.util.function.Consumer;
@@ -83,6 +87,7 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
     private volatile long logOffsetOfLatestSnapshot;
 
     private volatile long snapshotSize;
+    private volatile @Nullable Long recoverySnapshotId;
 
     @VisibleForTesting
     KvTabletSnapshotTarget(
@@ -156,6 +161,21 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
         this.snapshotsCleaner = new SnapshotsCleaner();
     }
 
+    /** Binds a newly created target to the reference used to load its KV instance. */
+    public void bindRecoverySnapshotId(@Nullable Long snapshotId) {
+        this.recoverySnapshotId = snapshotId;
+    }
+
+    public @Nullable Long getRecoverySnapshotId() {
+        return recoverySnapshotId;
+    }
+
+    private synchronized void acceptRecoverySnapshotId(Long expected, long snapshotId) {
+        if (Objects.equals(recoverySnapshotId, expected)) {
+            recoverySnapshotId = snapshotId;
+        }
+    }
+
     @Override
     public long currentSnapshotId() {
         try {
@@ -169,6 +189,12 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
     @Override
     public Optional<PeriodicSnapshotManager.SnapshotRunnable> initSnapshot() throws Exception {
         TabletState tabletState = tabletStateSupplier.get();
+        tabletState =
+                new TabletState(
+                        tabletState.getFlushedLogOffset(),
+                        tabletState.getRowCount(),
+                        tabletState.getAutoIncIDRanges(),
+                        recoverySnapshotId);
         long logOffset = tabletState.getFlushedLogOffset();
         if (logOffset <= logOffsetOfLatestSnapshot) {
             LOG.debug(
@@ -225,7 +251,13 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
         try {
             // commit the completed snapshot
             completedKvSnapshotCommitter.commitKvSnapshot(
-                    completedSnapshot, coordinatorEpoch, bucketLeaderEpoch);
+                    completedSnapshot,
+                    coordinatorEpoch,
+                    bucketLeaderEpoch,
+                    tabletState.getRecoverySnapshotId());
+            if (tabletState.getRecoverySnapshotId() != null) {
+                acceptRecoverySnapshotId(tabletState.getRecoverySnapshotId(), snapshotId);
+            }
             // update local state after successful commit
             updateStateOnCommitSuccess(snapshotId, snapshotResult);
         } catch (Exception e) {
@@ -276,11 +308,40 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
             logOffsetOfLatestSnapshot = flushedLogOffset;
             snapshotSize = snapshotResult.getSnapshotSize();
             // update LogTablet to notify the lowest offset that should be retained
-            updateMinRetainOffset.accept(flushedLogOffset);
+            updateWalRetention(flushedLogOffset);
         } finally {
             // notify the snapshot complete (must run last to preserve the ordering contract above,
             // and run in finally to guarantee internal SST bookkeeping is always cleaned up).
             rocksIncrementalSnapshot.notifySnapshotComplete(snapshotId);
+        }
+    }
+
+    private void updateWalRetention(long flushedLogOffset) {
+        try {
+            zooKeeperClient
+                    .getCuratorClient()
+                    .sync()
+                    .forPath(ZkData.BucketIdZNode.path(tableBucket));
+            Optional<ZooKeeperClient.VersionedData<RecoverySnapshot>> selected =
+                    zooKeeperClient.getRecoverySnapshot(tableBucket);
+            long retainOffset = flushedLogOffset;
+            if (selected.isPresent()) {
+                BucketSnapshot source =
+                        zooKeeperClient
+                                .getTableBucketSnapshot(
+                                        tableBucket, selected.get().data().snapshotId)
+                                .orElseThrow(
+                                        () ->
+                                                new IllegalStateException(
+                                                        "Selected recovery snapshot is missing."));
+                retainOffset = Math.min(retainOffset, source.getLogOffset());
+            }
+            updateMinRetainOffset.accept(retainOffset);
+        } catch (Exception e) {
+            LOG.warn(
+                    "Cannot establish the durable WAL retention boundary for {}; keeping existing logs.",
+                    tableBucket,
+                    e);
         }
     }
 
@@ -310,6 +371,18 @@ public class KvTabletSnapshotTarget implements PeriodicSnapshotManager.SnapshotT
             Optional<BucketSnapshot> zkSnapshot =
                     zooKeeperClient.getTableBucketSnapshot(tableBucket, snapshotId);
             if (zkSnapshot.isPresent()) {
+                Long expected = snapshotResult.getTabletState().getRecoverySnapshotId();
+                if (expected != null) {
+                    Optional<ZooKeeperClient.VersionedData<RecoverySnapshot>> head =
+                            zooKeeperClient.getRecoverySnapshot(tableBucket);
+                    if (!head.isPresent() || head.get().data().snapshotId != snapshotId) {
+                        // Keep registered files, but do not attach a newer selection to old KV.
+                        throw new FlussRuntimeException(
+                                "Cannot confirm snapshot advancement for its original KV context.",
+                                t);
+                    }
+                    acceptRecoverySnapshotId(expected, snapshotId);
+                }
                 // Snapshot exists in ZK, indicating the commit was actually successful,
                 // just response was lost
                 LOG.warn(

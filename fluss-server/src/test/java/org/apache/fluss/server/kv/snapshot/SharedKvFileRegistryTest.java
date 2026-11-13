@@ -19,6 +19,8 @@ package org.apache.fluss.server.kv.snapshot;
 
 import org.junit.jupiter.api.Test;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
@@ -27,6 +29,22 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for {@link org.apache.fluss.server.kv.snapshot.SharedKvFileRegistry}. */
 class SharedKvFileRegistryTest {
+
+    @Test
+    void testEarlierAllocatedRecoverySourceProtectsSharedFile(
+            @org.junit.jupiter.api.io.TempDir Path directory) throws Exception {
+        Path sst = directory.resolve("000001.sst");
+        Files.write(sst, new byte[] {1, 2, 3});
+        KvFileHandle handle = new KvFileHandle(sst.toUri().toString(), 3);
+        SharedKvFileRegistry registry = new SharedKvFileRegistry();
+        SharedKvFileRegistryKey key = SharedKvFileRegistryKey.fromKvFileHandle(handle);
+        registry.registerReference(key, handle, 18);
+        registry.registerReference(key, handle, 17);
+        registry.unregisterUnusedKvFile(20, Collections.singleton(17L));
+        assertThat(Files.exists(sst)).isTrue();
+        registry.unregisterUnusedKvFile(20, Collections.emptySet());
+        assertThat(Files.exists(sst)).isFalse();
+    }
 
     @Test
     void testRegistryNormal() throws Exception {

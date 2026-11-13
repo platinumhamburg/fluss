@@ -141,7 +141,7 @@ public class SharedKvFileRegistry implements AutoCloseable {
      * <ol>
      *   <li>Its {@code lastUsedSnapshotID < lowestSnapshotID} (not used by any retained snapshot)
      *   <li>No snapshot in {@code stillInUseSnapshotIds} falls within the file's referencing range
-     *       [{@code createdBySnapshotID}, {@code lastUsedSnapshotID}]
+     *       [{@code firstUsedSnapshotID}, {@code lastUsedSnapshotID}]
      * </ol>
      *
      * @param lowestSnapshotID the effective lowest snapshot ID from retained (non-leased) snapshots
@@ -180,14 +180,14 @@ public class SharedKvFileRegistry implements AutoCloseable {
     /**
      * Check if a KV file entry is referenced by any still-in-use (leased) snapshot. A file is
      * referenced by a snapshot if the snapshot ID falls within the file's usage range [{@code
-     * createdBySnapshotID}, {@code lastUsedSnapshotID}].
+     * firstUsedSnapshotID}, {@code lastUsedSnapshotID}].
      *
-     * <p>Note: {@code createdBySnapshotID} serves as the first snapshot ID that uses this file
+     * <p>Note: {@code firstUsedSnapshotID} serves as the first snapshot ID that uses this file
      * (i.e., firstUsedSnapshotID), while {@code lastUsedSnapshotID} is the last.
      */
     private boolean isReferencedByStillInUse(SharedKvEntry entry, Set<Long> stillInUseSnapshotIds) {
         for (Long snapshotId : stillInUseSnapshotIds) {
-            if (snapshotId >= entry.createdBySnapshotID && snapshotId <= entry.lastUsedSnapshotID) {
+            if (snapshotId >= entry.firstUsedSnapshotID && snapshotId <= entry.lastUsedSnapshotID) {
                 return true;
             }
         }
@@ -253,11 +253,10 @@ public class SharedKvFileRegistry implements AutoCloseable {
     private static final class SharedKvEntry {
 
         /**
-         * The snapshot ID that first created/registered this KV file. This effectively serves as
-         * {@code firstUsedSnapshotID} — the lower bound of the snapshot range referencing this
-         * file.
+         * The lowest snapshot ID referencing this KV file. Snapshot registration can complete in a
+         * different order from allocation.
          */
-        private final long createdBySnapshotID;
+        private long firstUsedSnapshotID;
 
         /**
          * The snapshot ID that last referenced this KV file — the upper bound of the snapshot range
@@ -269,19 +268,20 @@ public class SharedKvFileRegistry implements AutoCloseable {
 
         SharedKvEntry(KvFileHandle kvFileHandle, long snapshotID) {
             this.kvFileHandle = kvFileHandle;
-            this.createdBySnapshotID = snapshotID;
+            this.firstUsedSnapshotID = snapshotID;
             this.lastUsedSnapshotID = snapshotID;
         }
 
         private void advanceLastUsingSnapshotID(long snapshotID) {
+            firstUsedSnapshotID = Math.min(snapshotID, firstUsedSnapshotID);
             lastUsedSnapshotID = Math.max(snapshotID, lastUsedSnapshotID);
         }
 
         @Override
         public String toString() {
             return "SharedKvEntry{"
-                    + "createdBySnapshotID="
-                    + createdBySnapshotID
+                    + "firstUsedSnapshotID="
+                    + firstUsedSnapshotID
                     + ", lastUsedSnapshotID="
                     + lastUsedSnapshotID
                     + ", kvFileHandle="

@@ -829,6 +829,9 @@ public class ServerRpcMessageUtils {
         if (notifyLeaderAndIsrData.getBucketCountEpoch() != null) {
             reqForBucket.setBucketCountEpoch(notifyLeaderAndIsrData.getBucketCountEpoch());
         }
+        if (notifyLeaderAndIsrData.getRecoverySnapshotId() != null) {
+            reqForBucket.setRecoverySnapshotId(notifyLeaderAndIsrData.getRecoverySnapshotId());
+        }
 
         return reqForBucket;
     }
@@ -869,6 +872,9 @@ public class ServerRpcMessageUtils {
                             reqForBucket.hasBucketCount() ? reqForBucket.getBucketCount() : null,
                             reqForBucket.hasBucketCountEpoch()
                                     ? reqForBucket.getBucketCountEpoch()
+                                    : null,
+                            reqForBucket.hasRecoverySnapshotId()
+                                    ? reqForBucket.getRecoverySnapshotId()
                                     : null));
         }
         return notifyLeaderAndIsrDataList;
@@ -892,6 +898,9 @@ public class ServerRpcMessageUtils {
             }
             if (bucketResult.failed()) {
                 respForBucket.setError(bucketResult.getErrorCode(), bucketResult.getErrorMessage());
+            }
+            if (bucketResult.getRecoveredSnapshotId() != null) {
+                respForBucket.setRecoveredSnapshotId(bucketResult.getRecoveredSnapshotId());
             }
             respForBuckets.add(respForBucket);
         }

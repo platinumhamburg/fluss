@@ -19,6 +19,8 @@ package org.apache.fluss.server.kv.snapshot;
 
 import org.apache.fluss.metadata.TableBucket;
 
+import javax.annotation.Nullable;
+
 import java.util.List;
 import java.util.Optional;
 
@@ -27,6 +29,44 @@ import java.util.Optional;
  * Zookeeper, Kubernetes, etc.).
  */
 public interface CompletedSnapshotHandleStore {
+
+    /** Captures the recovery source and the checks authorizing one retention pass. */
+    default SnapshotRetention beginRetention(TableBucket bucket) throws Exception {
+        return new SnapshotRetention() {
+            @Override
+            public Optional<CompletedSnapshotHandle> getRecoverySnapshot() {
+                return Optional.empty();
+            }
+
+            @Override
+            public void remove(long snapshotId) throws Exception {
+                CompletedSnapshotHandleStore.this.remove(bucket, snapshotId);
+            }
+        };
+    }
+
+    /** A fixed recovery selection used throughout one shared-file retention pass. */
+    interface SnapshotRetention {
+        /** Returns the source whose files must be registered before reclamation. */
+        Optional<CompletedSnapshotHandle> getRecoverySnapshot();
+
+        /** Deletes a candidate only while the captured selection remains unchanged. */
+        void remove(long snapshotId) throws Exception;
+    }
+
+    /** Registers a snapshot using the selected snapshot captured by its KV context. */
+    default void add(
+            TableBucket bucket,
+            long snapshotId,
+            CompletedSnapshotHandle handle,
+            @Nullable Long expectedRecoverySnapshotId)
+            throws Exception {
+        if (expectedRecoverySnapshotId != null) {
+            throw new UnsupportedOperationException(
+                    "Recovery snapshot identities are not supported.");
+        }
+        add(bucket, snapshotId, handle);
+    }
 
     /**
      * Persist the snapshot handle to coordination system(e.g. Zookeeper, Kubernetes, etc.).

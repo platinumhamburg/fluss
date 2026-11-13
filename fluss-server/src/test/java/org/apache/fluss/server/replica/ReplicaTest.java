@@ -260,7 +260,8 @@ final class ReplicaTest extends ReplicaTestBase {
                                 INITIAL_COORDINATOR_EPOCH,
                                 followerLeaderEpoch),
                         3,
-                        0L));
+                        0L,
+                        null));
 
         assertThat(logReplica.isLeader()).isFalse();
         assertThat(localLogSizeGauge.getValue()).isEqualTo(localLogSize);
@@ -1322,7 +1323,8 @@ final class ReplicaTest extends ReplicaTestBase {
                                 // we also use the leader epoch as bucket epoch
                                 leaderEpoch),
                         3,
-                        0L));
+                        0L,
+                        null));
     }
 
     private void makeLeaderReplica(
@@ -1342,7 +1344,8 @@ final class ReplicaTest extends ReplicaTestBase {
                                 // we also use the leader epoch as bucket epoch
                                 leaderEpoch),
                         3,
-                        0L));
+                        0L,
+                        null));
     }
 
     private static LogRecords fetchRecords(Replica replica) throws IOException {

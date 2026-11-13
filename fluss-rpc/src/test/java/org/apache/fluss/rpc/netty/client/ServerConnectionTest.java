@@ -37,6 +37,7 @@ import org.apache.fluss.rpc.messages.AlterTableRequest;
 import org.apache.fluss.rpc.messages.ApiMessage;
 import org.apache.fluss.rpc.messages.ApiVersionsRequest;
 import org.apache.fluss.rpc.messages.ApiVersionsResponse;
+import org.apache.fluss.rpc.messages.CommitKvSnapshotRequest;
 import org.apache.fluss.rpc.messages.GetTableSchemaRequest;
 import org.apache.fluss.rpc.messages.ListDatabasesRequest;
 import org.apache.fluss.rpc.messages.LookupRequest;
@@ -318,6 +319,43 @@ public class ServerConnectionTest {
                     .isInstanceOf(UnsupportedVersionException.class)
                     .hasMessageContaining("requires ALTER_TABLE version 1 or newer")
                     .hasMessageContaining("negotiated version 0");
+        } finally {
+            connection.close().get();
+        }
+    }
+
+    @Test
+    void testBulkLoadRecoveryCannotDowngradeToOrdinaryRoleNotification() throws Exception {
+        ServerConnection connection =
+                new ServerConnection(
+                        bootstrap,
+                        serverNode,
+                        TestingClientMetricGroup.newInstance(),
+                        clientAuthenticator,
+                        (con, ignore) -> {});
+        try {
+            org.apache.fluss.rpc.messages.NotifyLeaderAndIsrRequest request =
+                    new org.apache.fluss.rpc.messages.NotifyLeaderAndIsrRequest()
+                            .setCoordinatorEpoch(1);
+            connection.validateVersionCompatibility(
+                    ApiKeys.NOTIFY_LEADER_AND_ISR, (short) 0, request);
+            request.addNotifyBucketsLeaderReq().setRecoverySnapshotId(7);
+            assertThatThrownBy(
+                            () ->
+                                    connection.validateVersionCompatibility(
+                                            ApiKeys.NOTIFY_LEADER_AND_ISR, (short) 0, request))
+                    .isInstanceOf(UnsupportedVersionException.class);
+            connection.validateVersionCompatibility(
+                    ApiKeys.NOTIFY_LEADER_AND_ISR, (short) 1, request);
+            CommitKvSnapshotRequest commit = new CommitKvSnapshotRequest();
+            connection.validateVersionCompatibility(ApiKeys.COMMIT_KV_SNAPSHOT, (short) 0, commit);
+            commit.setExpectedRecoverySnapshotId(0);
+            assertThatThrownBy(
+                            () ->
+                                    connection.validateVersionCompatibility(
+                                            ApiKeys.COMMIT_KV_SNAPSHOT, (short) 0, commit))
+                    .isInstanceOf(UnsupportedVersionException.class);
+            connection.validateVersionCompatibility(ApiKeys.COMMIT_KV_SNAPSHOT, (short) 1, commit);
         } finally {
             connection.close().get();
         }
