@@ -36,9 +36,7 @@ import org.apache.fluss.config.cluster.AlterConfig;
 import org.apache.fluss.config.cluster.ConfigEntry;
 import org.apache.fluss.exception.ConsumerGroupOwnerNotAvailableException;
 import org.apache.fluss.exception.FlussRuntimeException;
-import org.apache.fluss.exception.InvalidServerTypeException;
 import org.apache.fluss.exception.LeaderNotAvailableException;
-import org.apache.fluss.exception.NotCoordinatorLeaderException;
 import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.exception.RetriableException;
 import org.apache.fluss.metadata.BucketInfo;
@@ -159,6 +157,7 @@ import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeListOffset
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makePbPartitionSpec;
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeRegisterProducerOffsetsRequest;
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.toConfigEntries;
+import static org.apache.fluss.client.utils.ClientUtils.withSafeCoordinatorRetries;
 import static org.apache.fluss.client.utils.MetadataUtils.sendMetadataRequestAndRebuildCluster;
 import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.toAclBindings;
 import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.toPbAclBindingFilters;
@@ -201,22 +200,7 @@ public class FlussAdmin implements Admin {
         AdminGateway rawGateway =
                 GatewayClientProxy.createGatewayProxy(
                         metadataUpdater::getCoordinatorServer, client, AdminGateway.class);
-        // Refresh metadata for recoverable failures, but don't retry generic network errors because
-        // a non-idempotent write may already have succeeded. NotCoordinatorLeaderException is safe
-        // to retry because the standby rejects the request before invoking the coordinator API,
-        // and InvalidServerTypeException is raised during the handshake before sending the request.
-        this.gateway =
-                RetryableGatewayClientProxy.createRetryableGatewayProxy(
-                        rawGateway,
-                        metadataUpdater::refreshClusterUntilAvailable,
-                        refreshExecutor,
-                        cause ->
-                                cause instanceof NotCoordinatorLeaderException
-                                        || cause instanceof RetriableException,
-                        cause ->
-                                cause instanceof NotCoordinatorLeaderException
-                                        || cause instanceof InvalidServerTypeException,
-                        AdminGateway.class);
+        this.gateway = withSafeCoordinatorRetries(rawGateway, metadataUpdater, refreshExecutor);
         AdminGateway rawReadOnlyGateway =
                 GatewayClientProxy.createGatewayProxy(
                         metadataUpdater::getRandomTabletServer, client, AdminGateway.class);

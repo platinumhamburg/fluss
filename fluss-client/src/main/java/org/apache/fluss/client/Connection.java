@@ -19,6 +19,7 @@ package org.apache.fluss.client;
 
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.client.admin.Admin;
+import org.apache.fluss.client.bulkload.BulkLoadClient;
 import org.apache.fluss.client.table.MultiTable;
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.config.Configuration;
@@ -55,6 +56,11 @@ public interface Connection extends AutoCloseable {
 
     /** Retrieve a new Admin client to administer a Fluss cluster. */
     Admin getAdmin();
+
+    /** Retrieves the BulkLoad client for this connection. */
+    default BulkLoadClient getBulkLoadClient() {
+        throw new UnsupportedOperationException("This connection does not support BulkLoad.");
+    }
 
     /** Retrieve a new Table client to operate data in table. */
     Table getTable(TablePath tablePath);
