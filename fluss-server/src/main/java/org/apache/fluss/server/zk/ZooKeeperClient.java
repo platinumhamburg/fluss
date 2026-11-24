@@ -24,6 +24,8 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.ConfigurationUtils;
 import org.apache.fluss.config.FlussConfigUtils;
 import org.apache.fluss.exception.BulkLoadConflictException;
+import org.apache.fluss.exception.BulkLoadIncompleteException;
+import org.apache.fluss.exception.BulkLoadNotFoundException;
 import org.apache.fluss.exception.CoordinatorEpochFencedException;
 import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.InvalidRequestException;
@@ -203,6 +205,8 @@ public class ZooKeeperClient implements AutoCloseable {
 
     private final CuratorFramework zkClient;
     private final ZooKeeperOp zkOp;
+    private final BulkLoadOwnership bulkLoadOwnership;
+    private final BulkLoadMetadataReclaimer bulkLoadMetadataReclaimer;
     private final ZkSequenceIDCounter tableIdCounter;
     private final ZkSequenceIDCounter partitionIdCounter;
     private final ZkSequenceIDCounter writerIdCounter;
@@ -218,6 +222,9 @@ public class ZooKeeperClient implements AutoCloseable {
         this.curatorFrameworkWrapper = curatorFrameworkWrapper;
         this.zkClient = curatorFrameworkWrapper.asCuratorFramework();
         this.zkOp = new ZooKeeperOp(zkClient);
+        this.bulkLoadOwnership = new BulkLoadOwnership(this, zkClient, zkOp);
+        this.bulkLoadMetadataReclaimer =
+                new BulkLoadMetadataReclaimer(this, zkClient, zkOp, bulkLoadOwnership);
         this.tableIdCounter = new ZkSequenceIDCounter(zkClient, TableSequenceIdZNode.path());
         this.partitionIdCounter =
                 new ZkSequenceIDCounter(zkClient, PartitionSequenceIdZNode.path());
@@ -251,7 +258,7 @@ public class ZooKeeperClient implements AutoCloseable {
         }
     }
 
-    private <T> Optional<VersionedData<T>> getVersionedData(String path, Function<byte[], T> decode)
+    <T> Optional<VersionedData<T>> getVersionedData(String path, Function<byte[], T> decode)
             throws Exception {
         Stat stat = new Stat();
         return getDataWithStat(path, stat)
@@ -1416,6 +1423,18 @@ public class ZooKeeperClient implements AutoCloseable {
     // --------------------------------------------------------------------------------------------
     // BulkLoad
     // --------------------------------------------------------------------------------------------
+    /** Atomically fixes the targets and acquires all ownership for a new transaction. */
+    public void beginBulkLoad(
+            BulkLoadTransaction transaction,
+            List<BulkLoadTarget> targets,
+            int tableZkVersion,
+            Map<Long, Integer> partitionZkVersions,
+            int epochVersion)
+            throws Exception {
+        bulkLoadOwnership.begin(
+                transaction, targets, tableZkVersion, partitionZkVersions, epochVersion);
+    }
+
     /** Reads the BulkLoad transaction and its ZooKeeper version together. */
     public Optional<VersionedData<BulkLoadTransaction>> getBulkLoadTransaction(
             long tableId, String bulkLoadId) throws Exception {
@@ -1433,6 +1452,137 @@ public class ZooKeeperClient implements AutoCloseable {
         return getVersionedData(
                 BulkLoadTargetZNode.path(transaction.tableId, transaction.bulkLoadId, partitionId),
                 BulkLoadTargetZNode::decode);
+    }
+
+    /** Reads the fixed targets in physical partition ID order. */
+    public List<VersionedData<BulkLoadTarget>> getBulkLoadTargets(BulkLoadTransaction transaction)
+            throws Exception {
+        Optional<VersionedData<BulkLoadTarget>> table = getBulkLoadTarget(transaction, null);
+        if (table.isPresent()) {
+            return Collections.singletonList(table.get());
+        }
+        List<Long> partitionIds =
+                getChildren(
+                                BulkLoadTargetZNode.partitions(
+                                        transaction.tableId, transaction.bulkLoadId))
+                        .stream()
+                        .map(Long::parseLong)
+                        .sorted()
+                        .collect(Collectors.toList());
+        List<VersionedData<BulkLoadTarget>> targets = new ArrayList<>();
+        for (long partitionId : partitionIds) {
+            getBulkLoadTarget(transaction, partitionId).ifPresent(targets::add);
+        }
+        return targets;
+    }
+
+    /** Lists running transactions that own at least one of the selected physical targets. */
+    public List<BulkLoadTransaction> listBulkLoads(long tableId, List<Long> partitionIds)
+            throws Exception {
+        return bulkLoadOwnership.list(tableId, partitionIds);
+    }
+
+    /** Marks targets whose original physical partition was dropped. */
+    public VersionedData<BulkLoadTransaction> withdrawDroppedBulkLoadTargets(
+            VersionedData<BulkLoadTransaction> transaction, int epochVersion) throws Exception {
+        BulkLoadTransaction txn = transaction.data();
+        if (txn.state != BulkLoadTransaction.RUNNING) {
+            return transaction;
+        }
+        String txnPath = BulkLoadTransactionZNode.path(txn.tableId, txn.bulkLoadId);
+        for (VersionedData<BulkLoadTarget> target : getBulkLoadTargets(txn)) {
+            BulkLoadTarget value = target.data();
+            if (value.partitionId == null || value.withdrawn) {
+                continue;
+            }
+            Optional<PartitionRegistration> partition =
+                    getPartition(txn.tablePath, value.partitionName);
+            if (partition.isPresent() && partition.get().getPartitionId() == value.partitionId) {
+                continue;
+            }
+            String path = BulkLoadTargetZNode.path(txn.tableId, txn.bulkLoadId, value.partitionId);
+            List<CuratorOp> ops =
+                    Arrays.asList(
+                            zkOp.checkOp(txnPath, transaction.zkVersion()),
+                            zkOp.updateOp(
+                                    path,
+                                    BulkLoadTargetZNode.encode(value.withdraw()),
+                                    target.zkVersion()));
+            try {
+                writeBulkLoadMetadata(wrapRequestsWithEpochCheck(ops, epochVersion), epochVersion);
+            } catch (KeeperException.BadVersionException | KeeperException.NoNodeException e) {
+                VersionedData<BulkLoadTransaction> current =
+                        getBulkLoadTransaction(txn.tableId, txn.bulkLoadId)
+                                .orElseThrow(
+                                        () ->
+                                                new BulkLoadNotFoundException(
+                                                        "BulkLoad result was reclaimed."));
+                if (current.data().state != BulkLoadTransaction.RUNNING) {
+                    return current;
+                }
+                if (!getBulkLoadTarget(txn, value.partitionId)
+                        .map(updated -> updated.data().withdrawn)
+                        .orElse(false)) {
+                    throw e;
+                }
+            }
+        }
+        return transaction;
+    }
+
+    /** Verifies completion on commit and sets the first terminal result with one root CAS. */
+    public BulkLoadTransaction finishBulkLoad(
+            VersionedData<BulkLoadTransaction> transaction,
+            int state,
+            long now,
+            @Nullable String abortMessage,
+            int epochVersion)
+            throws Exception {
+        BulkLoadTransaction txn = transaction.data();
+        checkState(txn.state == BulkLoadTransaction.RUNNING, "BulkLoad is already terminal.");
+        checkState(state == BulkLoadTransaction.COMMITTED || state == BulkLoadTransaction.ABORTED);
+        if (state == BulkLoadTransaction.COMMITTED) {
+            for (VersionedData<BulkLoadTarget> target : getBulkLoadTargets(txn)) {
+                BulkLoadTarget value = target.data();
+                for (int id = 0; !value.withdrawn && id < value.bucketCount; id++) {
+                    TableBucket bucket = new TableBucket(txn.tableId, value.partitionId, id);
+                    if (!getBulkLoadBucket(txn, bucket)
+                            .filter(record -> record.state == BulkLoadBucket.COMMITTED)
+                            .isPresent()) {
+                        throw new BulkLoadIncompleteException(
+                                "BulkLoad transaction is incomplete.");
+                    }
+                }
+            }
+        }
+        BulkLoadTransaction result = txn.finish(state, now, abortMessage);
+        // Bucket commits and target withdrawals are monotonic while the root remains RUNNING.
+        CuratorOp update =
+                zkOp.updateOp(
+                        BulkLoadTransactionZNode.path(txn.tableId, txn.bulkLoadId),
+                        BulkLoadTransactionZNode.encode(result),
+                        transaction.zkVersion());
+        writeBulkLoadMetadata(wrapRequestWithEpochCheck(update, epochVersion), epochVersion);
+        return result;
+    }
+
+    /** Reclaims expired results and remnants of deleted physical tables. */
+    public void maintainBulkLoads(long now, long retentionMillis, int epochVersion)
+            throws Exception {
+        bulkLoadMetadataReclaimer.maintain(now, retentionMillis, epochVersion);
+    }
+
+    /** Reclaims metadata addressed by the already deleted physical table's ID. */
+    public void dropBulkLoadsForTable(long tableId, int epochVersion) throws Exception {
+        bulkLoadMetadataReclaimer.dropTable(tableId, epochVersion);
+    }
+
+    /** Lists buckets with allocation records for the given physical target. */
+    public List<Integer> getBulkLoadBucketIds(
+            BulkLoadTransaction transaction, @Nullable Long partitionId) throws Exception {
+        return getChildren(BulkLoadBucketZNode.root(transaction, partitionId)).stream()
+                .map(Integer::parseInt)
+                .collect(Collectors.toList());
     }
 
     /** Reads the bucket allocation or the result of its completed commit. */
@@ -1564,7 +1714,7 @@ public class ZooKeeperClient implements AutoCloseable {
         }
     }
 
-    private void writeBulkLoadMetadata(List<CuratorOp> fencedOperations, int epochVersion)
+    void writeBulkLoadMetadata(List<CuratorOp> fencedOperations, int epochVersion)
             throws Exception {
         try {
             zkClient.transaction().forOperations(fencedOperations);
@@ -1576,7 +1726,7 @@ public class ZooKeeperClient implements AutoCloseable {
         }
     }
 
-    private static boolean failedMultiOperation(KeeperException e, int index) {
+    static boolean failedMultiOperation(KeeperException e, int index) {
         List<OpResult> results = e.getResults();
         return results != null
                 && index < results.size()

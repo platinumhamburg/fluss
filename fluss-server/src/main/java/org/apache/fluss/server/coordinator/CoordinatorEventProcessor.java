@@ -164,6 +164,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.server.coordinator.statemachine.BucketState.OfflineBucket;
@@ -216,6 +217,9 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
     // write attempt invalidates the entry before it starts.
     private final Map<TableBucket, List<Integer>> assignmentPersistenceByBucket = new HashMap<>();
     private ScheduledFuture<?> offlineLeaderRetryTask;
+    private final long bulkLoadResultRetentionMs;
+    private final AtomicBoolean bulkLoadCleanupRunning = new AtomicBoolean();
+    private ScheduledFuture<?> bulkLoadCleanupTask;
 
     public CoordinatorEventProcessor(
             ZooKeeperClient zooKeeperClient,
@@ -306,6 +310,8 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
                             offlineLeaderRetryDelayMs));
         }
         this.scheduler = scheduler;
+        this.bulkLoadResultRetentionMs =
+                conf.get(ConfigOptions.COORDINATOR_BULKLOAD_RESULT_RETENTION).toMillis();
         this.zkRetryDelayMs = conf.get(ConfigOptions.ZOOKEEPER_RETRY_WAIT).toMillis();
         this.ioExecutor = ioExecutor;
         this.lakeTableHelper = new LakeTableHelper(zooKeeperClient);
@@ -558,9 +564,36 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
 
         // start rebalance manager.
         rebalanceManager.startup();
+        bulkLoadCleanupTask =
+                scheduler.schedule(
+                        "expire-bulk-load-results",
+                        this::expireBulkLoadResults,
+                        0,
+                        Duration.ofMinutes(1).toMillis());
+    }
+
+    private void expireBulkLoadResults() {
+        if (bulkLoadCleanupRunning.compareAndSet(false, true)) {
+            ioExecutor.execute(
+                    () -> {
+                        try {
+                            zooKeeperClient.maintainBulkLoads(
+                                    System.currentTimeMillis(),
+                                    bulkLoadResultRetentionMs,
+                                    coordinatorContext.getCoordinatorZkVersion());
+                        } catch (Exception e) {
+                            LOG.warn("Failed to clean up BulkLoad transaction metadata.", e);
+                        } finally {
+                            bulkLoadCleanupRunning.set(false);
+                        }
+                    });
+        }
     }
 
     public void shutdown() {
+        if (bulkLoadCleanupTask != null) {
+            bulkLoadCleanupTask.cancel(false);
+        }
         clearOfflineLeaderRetryTask();
         // Cancel periodic event producers before stopping the event loop.
         rebalanceManager.stopTimeoutChecker();
@@ -1384,6 +1417,18 @@ public class CoordinatorEventProcessor implements EventProcessor, RebalanceExecu
             Set<TableBucket> deleteTableBuckets = coordinatorContext.getAllBucketsForTable(tableId);
             completedSnapshotStoreManager.removeCompletedSnapshotStoreByTableBuckets(
                     deleteTableBuckets);
+            ioExecutor.execute(
+                    () -> {
+                        try {
+                            zooKeeperClient.dropBulkLoadsForTable(
+                                    tableId, coordinatorContext.getCoordinatorZkVersion());
+                        } catch (Exception e) {
+                            LOG.warn(
+                                    "Failed to remove BulkLoad metadata for dropped table {}.",
+                                    tableId,
+                                    e);
+                        }
+                    });
         }
 
         coordinatorContext.queueTableDeletion(Collections.singleton(tableId));

@@ -68,6 +68,8 @@ import org.apache.fluss.metadata.TablePartition;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
+import org.apache.fluss.rpc.messages.AbortBulkLoadRequest;
+import org.apache.fluss.rpc.messages.AbortBulkLoadResponse;
 import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseRequest;
 import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseResponse;
 import org.apache.fluss.rpc.messages.AddServerTagByRackRequest;
@@ -84,10 +86,14 @@ import org.apache.fluss.rpc.messages.AlterDatabaseRequest;
 import org.apache.fluss.rpc.messages.AlterDatabaseResponse;
 import org.apache.fluss.rpc.messages.AlterTableRequest;
 import org.apache.fluss.rpc.messages.AlterTableResponse;
+import org.apache.fluss.rpc.messages.BeginBulkLoadRequest;
+import org.apache.fluss.rpc.messages.BeginBulkLoadResponse;
 import org.apache.fluss.rpc.messages.CancelRebalanceRequest;
 import org.apache.fluss.rpc.messages.CancelRebalanceResponse;
 import org.apache.fluss.rpc.messages.CommitBulkLoadBucketSnapshotRequest;
 import org.apache.fluss.rpc.messages.CommitBulkLoadBucketSnapshotResponse;
+import org.apache.fluss.rpc.messages.CommitBulkLoadRequest;
+import org.apache.fluss.rpc.messages.CommitBulkLoadResponse;
 import org.apache.fluss.rpc.messages.CommitKvSnapshotRequest;
 import org.apache.fluss.rpc.messages.CommitKvSnapshotResponse;
 import org.apache.fluss.rpc.messages.CommitLakeTableSnapshotRequest;
@@ -120,12 +126,16 @@ import org.apache.fluss.rpc.messages.DropPartitionRequest;
 import org.apache.fluss.rpc.messages.DropPartitionResponse;
 import org.apache.fluss.rpc.messages.DropTableRequest;
 import org.apache.fluss.rpc.messages.DropTableResponse;
+import org.apache.fluss.rpc.messages.GetBulkLoadInfoRequest;
+import org.apache.fluss.rpc.messages.GetBulkLoadInfoResponse;
 import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
 import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
 import org.apache.fluss.rpc.messages.GetProducerOffsetsRequest;
 import org.apache.fluss.rpc.messages.GetProducerOffsetsResponse;
 import org.apache.fluss.rpc.messages.LakeTieringHeartbeatRequest;
 import org.apache.fluss.rpc.messages.LakeTieringHeartbeatResponse;
+import org.apache.fluss.rpc.messages.ListInProgressBulkLoadsRequest;
+import org.apache.fluss.rpc.messages.ListInProgressBulkLoadsResponse;
 import org.apache.fluss.rpc.messages.ListKvSnapshotsRequest;
 import org.apache.fluss.rpc.messages.ListKvSnapshotsResponse;
 import org.apache.fluss.rpc.messages.ListRebalanceProgressRequest;
@@ -292,6 +302,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                                     ConfigOptions.TABLE_DATALAKE_ENABLED.key(),
                                     ConfigOptions.TABLE_DATALAKE_DATABASE_NAME.key(),
                                     ConfigOptions.TABLE_DATALAKE_TABLE_NAME.key())));
+    private final int bulkLoadMaxTargets;
     private final int defaultBucketNumber;
     private final Supplier<CoordinatorEventProcessor> coordinatorEventProcessorSupplier;
     private final int defaultReplicationFactor;
@@ -337,6 +348,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 authorizer,
                 dynamicConfigManager,
                 ioExecutor);
+        this.bulkLoadMaxTargets = conf.get(ConfigOptions.COORDINATOR_BULKLOAD_MAX_TARGETS);
         this.defaultBucketNumber = conf.getInt(ConfigOptions.DEFAULT_BUCKET_NUMBER);
         this.coordinatorEventProcessorSupplier = coordinatorEventProcessorSupplier;
         this.defaultReplicationFactor = conf.getInt(ConfigOptions.DEFAULT_REPLICATION_FACTOR);
@@ -372,10 +384,75 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     }
 
     @Override
+    public CompletableFuture<BeginBulkLoadResponse> beginBulkLoad(BeginBulkLoadRequest request) {
+        TablePath path = toTablePath(request.getTablePath());
+        path.validate();
+        authorizeTable(OperationType.WRITE, path);
+        return submitBulkLoadOperation(
+                manager ->
+                        CompletableFuture.completedFuture(
+                                manager.begin(path, request, bulkLoadMaxTargets)));
+    }
+
+    @Override
+    public CompletableFuture<GetBulkLoadInfoResponse> getBulkLoadInfo(
+            GetBulkLoadInfoRequest request) {
+        PbBulkLoadHandle handle = request.getHandle();
+        authorizeBulkLoad(OperationType.DESCRIBE, handle.getTableId());
+        return submitBulkLoadOperation(
+                manager ->
+                        CompletableFuture.completedFuture(
+                                manager.info(handle.getTableId(), handle.getBulkLoadId())));
+    }
+
+    @Override
+    public CompletableFuture<ListInProgressBulkLoadsResponse> listInProgressBulkLoads(
+            ListInProgressBulkLoadsRequest request) {
+        TablePath path = toTablePath(request.getTablePath());
+        path.validate();
+        authorizeTable(OperationType.DESCRIBE, path);
+        return submitBulkLoadOperation(
+                manager ->
+                        CompletableFuture.completedFuture(
+                                manager.list(path, request.getPartitionNamesList())));
+    }
+
+    @Override
+    public CompletableFuture<CommitBulkLoadResponse> commitBulkLoad(CommitBulkLoadRequest request) {
+        PbBulkLoadHandle handle = request.getHandle();
+        authorizeBulkLoad(OperationType.WRITE, handle.getTableId());
+        return submitBulkLoadOperation(
+                manager ->
+                        CompletableFuture.completedFuture(
+                                new CommitBulkLoadResponse()
+                                        .setStatus(
+                                                manager.commit(
+                                                        handle.getTableId(),
+                                                        handle.getBulkLoadId()))));
+    }
+
+    @Override
+    public CompletableFuture<AbortBulkLoadResponse> abortBulkLoad(AbortBulkLoadRequest request) {
+        PbBulkLoadHandle handle = request.getHandle();
+        authorizeBulkLoad(OperationType.WRITE, handle.getTableId());
+        return submitBulkLoadOperation(
+                manager ->
+                        CompletableFuture.completedFuture(
+                                new AbortBulkLoadResponse()
+                                        .setStatus(
+                                                manager.abort(
+                                                        handle.getTableId(),
+                                                        handle.getBulkLoadId(),
+                                                        request.hasAbortMessage()
+                                                                ? request.getAbortMessage()
+                                                                : null))));
+    }
+
+    @Override
     public CompletableFuture<AllocateBulkLoadBucketSnapshotResponse> allocateBulkLoadBucketSnapshot(
             AllocateBulkLoadBucketSnapshotRequest request) {
         PbBulkLoadHandle handle = request.getHandle();
-        authorizeBulkLoad(handle.getTableId());
+        authorizeBulkLoad(OperationType.WRITE, handle.getTableId());
         return submitBulkLoadOperation(
                 manager -> {
                     TableBucket bucket =
@@ -397,7 +474,7 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
     public CompletableFuture<CommitBulkLoadBucketSnapshotResponse> commitBulkLoadBucketSnapshot(
             CommitBulkLoadBucketSnapshotRequest request) {
         PbBulkLoadHandle handle = request.getHandle();
-        authorizeBulkLoad(handle.getTableId());
+        authorizeBulkLoad(OperationType.WRITE, handle.getTableId());
         return submitBulkLoadOperation(
                         manager -> {
                             TableBucket bucket =
@@ -418,9 +495,9 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 .thenApply(ignored -> new CommitBulkLoadBucketSnapshotResponse());
     }
 
-    private void authorizeBulkLoad(long tableId) {
+    private void authorizeBulkLoad(OperationType operation, long tableId) {
         try {
-            authorizeTable(OperationType.WRITE, tableId);
+            authorizeTable(operation, tableId);
         } catch (UnknownTableOrBucketException e) {
             throw new BulkLoadNotFoundException("The original BulkLoad table no longer exists.");
         }

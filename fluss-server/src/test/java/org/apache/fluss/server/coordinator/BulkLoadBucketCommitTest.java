@@ -20,7 +20,10 @@ package org.apache.fluss.server.coordinator;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.BulkLoadConflictException;
+import org.apache.fluss.exception.BulkLoadIncompleteException;
 import org.apache.fluss.exception.BulkLoadNotFoundException;
+import org.apache.fluss.exception.BulkLoadStateException;
+import org.apache.fluss.exception.BulkLoadTargetWithdrawnException;
 import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.InvalidBulkLoadSnapshotException;
 import org.apache.fluss.exception.NetworkException;
@@ -40,16 +43,28 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.KvRecord;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
+import org.apache.fluss.rpc.messages.AbortBulkLoadRequest;
 import org.apache.fluss.rpc.messages.AcquireKvSnapshotLeaseRequest;
 import org.apache.fluss.rpc.messages.AdjustIsrResponse;
 import org.apache.fluss.rpc.messages.AllocateBulkLoadBucketSnapshotRequest;
 import org.apache.fluss.rpc.messages.AllocateBulkLoadBucketSnapshotResponse;
+import org.apache.fluss.rpc.messages.AlterTableRequest;
+import org.apache.fluss.rpc.messages.BeginBulkLoadRequest;
+import org.apache.fluss.rpc.messages.BeginBulkLoadResponse;
 import org.apache.fluss.rpc.messages.CommitBulkLoadBucketSnapshotRequest;
+import org.apache.fluss.rpc.messages.CommitBulkLoadRequest;
 import org.apache.fluss.rpc.messages.CommitKvSnapshotResponse;
 import org.apache.fluss.rpc.messages.DropKvSnapshotLeaseRequest;
+import org.apache.fluss.rpc.messages.GetBulkLoadInfoRequest;
+import org.apache.fluss.rpc.messages.GetBulkLoadInfoResponse;
+import org.apache.fluss.rpc.messages.ListInProgressBulkLoadsRequest;
 import org.apache.fluss.rpc.messages.LookupRequest;
 import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrRequest;
+import org.apache.fluss.rpc.messages.PbAddColumn;
 import org.apache.fluss.rpc.messages.PbBulkLoadHandle;
+import org.apache.fluss.rpc.messages.PbBulkLoadStatus;
+import org.apache.fluss.rpc.messages.PbBulkLoadTargetInfo;
+import org.apache.fluss.rpc.messages.PbBulkLoadTargetProgress;
 import org.apache.fluss.rpc.messages.PbNotifyLeaderAndIsrRespForBucket;
 import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
 import org.apache.fluss.rpc.messages.PutKvRequest;
@@ -81,6 +96,7 @@ import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
 import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
+import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.ZkData.BulkLoadTargetZNode;
 import org.apache.fluss.server.zk.data.ZkData.BulkLoadTransactionZNode;
 import org.apache.fluss.server.zk.data.ZkData.LeaderAndIsrZNode;
@@ -101,6 +117,8 @@ import org.apache.fluss.types.DataTypes;
 import org.apache.fluss.utils.FlussPaths;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.FlussScheduler;
+import org.apache.fluss.utils.json.DataTypeJsonSerde;
+import org.apache.fluss.utils.json.JsonSerdeUtils;
 import org.apache.fluss.utils.types.Tuple2;
 
 import io.github.fluss_contrib.rocksdb.Checkpoint;
@@ -123,6 +141,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -143,6 +162,8 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_DESCRIPTOR_PK;
 import static org.apache.fluss.server.testutils.KvTestUtils.assertLookupResponse;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createPartition;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.createTable;
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newAlterTableRequest;
+import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newDropPartitionRequest;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newLookupRequest;
 import static org.apache.fluss.server.testutils.RpcMessageTestUtils.newPutKvRequest;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getAdjustIsrResponseData;
@@ -155,7 +176,7 @@ import static org.apache.fluss.testutils.common.CommonTestUtils.retry;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** Exercises the Coordinator commit against a prepared allocation and real ZooKeeper state. */
+/** Exercises BulkLoad Coordinator RPCs and bucket publication against real ZooKeeper state. */
 class BulkLoadBucketCommitTest {
     @RegisterExtension
     static final AllCallbackWrapper<ZooKeeperExtension> ZK =
@@ -392,7 +413,6 @@ class BulkLoadBucketCommitTest {
         client = cluster.getZooKeeperClient();
         Replica replica = cluster.waitAndGetLeaderReplica(bucket);
         remoteDataDir = replica.getRemoteDataDir();
-        seedRunningTarget(replica.getTableInfo());
         expectedLeaderEpoch = replica.getLeaderEpoch() + 1;
         leader = cluster.newTabletServerClientForNode(replica.getLeaderId());
         coordinator = cluster.newCoordinatorClient();
@@ -405,7 +425,10 @@ class BulkLoadBucketCommitTest {
                 cluster.getCoordinatorServer()
                         .getCoordinatorEventProcessor()
                         .completedSnapshotStoreManager();
-        PbBulkLoadHandle handle = new PbBulkLoadHandle().setTableId(tableId).setBulkLoadId(LOAD_ID);
+        PbBulkLoadHandle handle =
+                (partitionName == null ? begin(LOAD_ID) : begin(LOAD_ID, partitionName))
+                        .getStatus()
+                        .getHandle();
         allocateRequest =
                 new AllocateBulkLoadBucketSnapshotRequest().setHandle(handle).setBucketId(0);
         commitRequest = new CommitBulkLoadBucketSnapshotRequest().setHandle(handle).setBucketId(0);
@@ -437,6 +460,200 @@ class BulkLoadBucketCommitTest {
 
     private void commit() throws Exception {
         coordinator.commitBulkLoadBucketSnapshot(commitRequest).get(30, TimeUnit.SECONDS);
+    }
+
+    private BeginBulkLoadResponse begin(String id, String... partitions) throws Exception {
+        BeginBulkLoadRequest request =
+                new BeginBulkLoadRequest()
+                        .setBulkLoadId(id)
+                        .addAllPartitionNames(Arrays.asList(partitions));
+        request.setTablePath()
+                .setDatabaseName(TABLE.getDatabaseName())
+                .setTableName(TABLE.getTableName());
+        return coordinator.beginBulkLoad(request).get(30, TimeUnit.SECONDS);
+    }
+
+    private GetBulkLoadInfoResponse info(PbBulkLoadHandle handle) throws Exception {
+        return coordinator
+                .getBulkLoadInfo(new GetBulkLoadInfoRequest().setHandle(handle))
+                .get(30, TimeUnit.SECONDS);
+    }
+
+    private List<PbBulkLoadStatus> list(String... partitions) throws Exception {
+        ListInProgressBulkLoadsRequest request =
+                new ListInProgressBulkLoadsRequest()
+                        .addAllPartitionNames(Arrays.asList(partitions));
+        request.setTablePath()
+                .setDatabaseName(TABLE.getDatabaseName())
+                .setTableName(TABLE.getTableName());
+        return coordinator
+                .listInProgressBulkLoads(request)
+                .get(30, TimeUnit.SECONDS)
+                .getTransactionsList();
+    }
+
+    private PbBulkLoadStatus finish(PbBulkLoadHandle handle) throws Exception {
+        return coordinator
+                .commitBulkLoad(new CommitBulkLoadRequest().setHandle(handle))
+                .get(30, TimeUnit.SECONDS)
+                .getStatus();
+    }
+
+    private PbBulkLoadStatus abort(PbBulkLoadHandle handle, String message) throws Exception {
+        return coordinator
+                .abortBulkLoad(
+                        new AbortBulkLoadRequest().setHandle(handle).setAbortMessage(message))
+                .get(30, TimeUnit.SECONDS)
+                .getStatus();
+    }
+
+    @Test
+    void testAbortKeepsPublishedBucketAndRetentionKeepsItsSuccessorOwner() throws Exception {
+        start(DATA1_TABLE_DESCRIPTOR_PK.withBucketCount(2), null);
+        PbBulkLoadHandle handle = allocateRequest.getHandle();
+        allocate();
+        Tuple2<byte[], byte[]> imported =
+                uploadCheckpoint(genKvRecords(new Object[] {1, "imported"}));
+        commit();
+        AllocateBulkLoadBucketSnapshotRequest pending =
+                new AllocateBulkLoadBucketSnapshotRequest().setHandle(handle).setBucketId(1);
+        coordinator.allocateBulkLoadBucketSnapshot(pending).get(30, TimeUnit.SECONDS);
+        assertThatThrownBy(() -> finish(handle))
+                .hasRootCauseInstanceOf(BulkLoadIncompleteException.class);
+        assertThat(list())
+                .extracting(status -> status.getHandle().getBulkLoadId())
+                .containsExactly(LOAD_ID);
+
+        PbBulkLoadStatus aborted = abort(handle, "cancelled");
+        assertThat(aborted.getState()).isEqualTo(BulkLoadTransaction.ABORTED);
+        assertThat(aborted.getAbortMessage()).isEqualTo("cancelled");
+        assertThat(aborted.hasFinishedTime()).isTrue();
+        PbBulkLoadStatus replayedAbort = abort(handle, "different reason");
+        assertThat(replayedAbort.getAbortMessage()).isEqualTo("cancelled");
+        assertThat(replayedAbort.getFinishedTime()).isEqualTo(aborted.getFinishedTime());
+        assertThat(begin(LOAD_ID).getStatus().getState()).isEqualTo(BulkLoadTransaction.ABORTED);
+        GetBulkLoadInfoResponse result = info(handle);
+        assertThat(result.getStatus().getState()).isEqualTo(BulkLoadTransaction.ABORTED);
+        PbBulkLoadTargetProgress target = result.getTargetAt(0);
+        assertThat(target.getAllocatedBucketCount()).isEqualTo(2);
+        assertThat(target.getCommittedBucketCount()).isEqualTo(1);
+        assertThatThrownBy(() -> finish(handle))
+                .hasRootCauseInstanceOf(BulkLoadStateException.class);
+        assertThatThrownBy(
+                        () ->
+                                coordinator
+                                        .commitBulkLoadBucketSnapshot(
+                                                new CommitBulkLoadBucketSnapshotRequest()
+                                                        .setHandle(handle)
+                                                        .setBucketId(1))
+                                        .get(30, TimeUnit.SECONDS))
+                .hasRootCauseInstanceOf(BulkLoadStateException.class);
+        assertThat(list()).isEmpty();
+        assertThat(begin("successor").getStatus().getState())
+                .isEqualTo(BulkLoadTransaction.RUNNING);
+
+        int epoch = client.getCurrentEpoch().getCoordinatorEpochZkVersion();
+        long retentionMillis = Duration.ofHours(1).toMillis();
+        client.maintainBulkLoads(
+                aborted.getFinishedTime() + retentionMillis - 1, retentionMillis, epoch);
+        assertThat(info(handle).getStatus().getState()).isEqualTo(BulkLoadTransaction.ABORTED);
+        client.maintainBulkLoads(
+                aborted.getFinishedTime() + retentionMillis, retentionMillis, epoch);
+        assertThatThrownBy(() -> info(handle))
+                .hasRootCauseInstanceOf(BulkLoadNotFoundException.class);
+        assertThat(list())
+                .extracting(status -> status.getHandle().getBulkLoadId())
+                .containsExactly("successor");
+        assertThatThrownBy(() -> begin("overlapping"))
+                .hasRootCauseInstanceOf(BulkLoadConflictException.class);
+        assertThat(client.getSelectedRecoverySnapshotId(bucket)).contains(snapshotId);
+        assertThat(client.getTableBucketSnapshot(bucket, snapshotId)).isPresent();
+        restartTabletServer();
+        retry(Duration.ofSeconds(30), () -> assertLookupRow(imported, 2));
+    }
+
+    @Test
+    void testPartitionOwnershipAndHistoricalBuildContext() throws Exception {
+        start(partitionedDescriptor(), "p1");
+        PbBulkLoadHandle handle = allocateRequest.getHandle();
+        BeginBulkLoadResponse first = begin(LOAD_ID, "p1");
+        long originalPartitionId = bucket.getPartitionId();
+
+        AlterTableRequest rescale =
+                newAlterTableRequest(
+                        TABLE,
+                        Collections.emptyMap(),
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        false);
+        rescale.setModifyBucketCount().setNewBucketCount(2);
+        coordinator.alterTable(rescale).get(30, TimeUnit.SECONDS);
+        createPartition(cluster, TABLE, partitionSpec("p2"), false);
+
+        PbAddColumn column =
+                new PbAddColumn()
+                        .setColumnName("new_column")
+                        .setDataTypeJson(
+                                JsonSerdeUtils.writeValueAsBytes(
+                                        DataTypes.STRING(), DataTypeJsonSerde.INSTANCE))
+                        .setColumnPositionType(0);
+        coordinator
+                .alterTable(
+                        newAlterTableRequest(
+                                TABLE,
+                                Collections.emptyMap(),
+                                Collections.emptyList(),
+                                Collections.singletonList(column),
+                                false))
+                .get(30, TimeUnit.SECONDS);
+        coordinator
+                .dropPartition(newDropPartitionRequest(TABLE, partitionSpec("p1"), false))
+                .get(30, TimeUnit.SECONDS);
+        createPartition(cluster, TABLE, partitionSpec("p1"), false);
+        PartitionRegistration replacement = client.getPartition(TABLE, "p1").get();
+        assertThat(replacement.getPartitionId()).isNotEqualTo(originalPartitionId);
+        assertThat(list("p1")).isEmpty();
+        PbBulkLoadTargetProgress withdrawn = info(handle).getTargetAt(0);
+        assertThat(withdrawn.isWithdrawn()).isTrue();
+        assertThat(withdrawn.getPartitionId()).isEqualTo(originalPartitionId);
+        assertThatThrownBy(this::allocate)
+                .hasRootCauseInstanceOf(BulkLoadTargetWithdrawnException.class);
+
+        BeginBulkLoadResponse replay = begin(LOAD_ID, "p1");
+        assertThat(replay.getTableInfo().getSchemaId())
+                .isEqualTo(first.getTableInfo().getSchemaId());
+        assertThat(TableDescriptor.fromJsonBytes(replay.getTableInfo().getTableJson()).getSchema())
+                .isEqualTo(partitionedDescriptor().getSchema());
+        PbBulkLoadTargetInfo originalTarget = replay.getTargetAt(0);
+        assertThat(originalTarget.getPartitionId()).isEqualTo(originalPartitionId);
+        assertThat(originalTarget.getBucketCount()).isEqualTo(1);
+        assertThat(originalTarget.getRemoteDataDir())
+                .isEqualTo(first.getTargetAt(0).getRemoteDataDir());
+        BeginBulkLoadResponse next = begin("replacement", "p1");
+        assertThat(next.getTargetAt(0).getPartitionId()).isEqualTo(replacement.getPartitionId());
+        assertThat(next.getTargetAt(0).getRemoteDataDir())
+                .isEqualTo(replacement.getRemoteDataDir());
+        assertThat(next.getTableInfo().getSchemaId())
+                .isGreaterThan(first.getTableInfo().getSchemaId());
+        assertThat(next.getTargetAt(0).getBucketCount()).isEqualTo(2);
+        assertThat(finish(handle).getState()).isEqualTo(BulkLoadTransaction.COMMITTED);
+
+        // p2 precedes the conflicting replacement p1 in physical target order.
+        assertThat(client.getPartition(TABLE, "p2").get().getPartitionId())
+                .isLessThan(replacement.getPartitionId());
+        assertThatThrownBy(() -> begin("overlap", "p2", "p1"))
+                .hasRootCauseInstanceOf(BulkLoadConflictException.class);
+        assertThat(list("p2")).isEmpty();
+        assertThat(client.getBulkLoadTransaction(bucket.getTableId(), "overlap")).isEmpty();
+        assertThat(begin("second", "p2").getStatus().getState())
+                .isEqualTo(BulkLoadTransaction.RUNNING);
+        assertThat(list("p1", "p2"))
+                .extracting(status -> status.getHandle().getBulkLoadId())
+                .containsExactlyInAnyOrder("replacement", "second");
+    }
+
+    private static PartitionSpec partitionSpec(String name) {
+        return new PartitionSpec(Collections.singletonMap("pt", name));
     }
 
     private Tuple2<byte[], byte[]> uploadCheckpoint(List<KvRecord> rows) throws Exception {
@@ -825,20 +1042,9 @@ class BulkLoadBucketCommitTest {
 
     @Test
     void testPartitionRecoveryReplaysWalAndPreservesSuccessorOnRetry() throws Exception {
-        Schema schema =
-                Schema.newBuilder()
-                        .column("a", DataTypes.INT())
-                        .column("b", DataTypes.STRING())
-                        .column("pt", DataTypes.STRING())
-                        .primaryKey("a", "pt")
-                        .build();
-        start(
-                TableDescriptor.builder()
-                        .schema(schema)
-                        .distributedBy(1, "a")
-                        .partitionedBy("pt")
-                        .build(),
-                "p1");
+        TableDescriptor descriptor = partitionedDescriptor();
+        Schema schema = descriptor.getSchema();
+        start(descriptor, "p1");
         putRows(genKvRecords(schema.getRowType(), new Object[] {0, "base", "p1"}));
         long recoveryOffset = cluster.triggerAndWaitSnapshot(bucket).getLogOffset();
         List<KvRecord> beforeAllocation =
@@ -855,10 +1061,20 @@ class BulkLoadBucketCommitTest {
         Tuple2<byte[], byte[]> appended = getKeyValuePairs(tail).get(0);
         FsPath dir = snapshotDirectory(snapshotId);
         commit();
+        PbBulkLoadHandle handle = commitRequest.getHandle();
+        PbBulkLoadStatus committed = finish(handle);
+        assertThat(committed.getState()).isEqualTo(BulkLoadTransaction.COMMITTED);
+        assertThat(committed.hasFinishedTime()).isTrue();
+        assertThat(list("p1")).isEmpty();
         retry(Duration.ofSeconds(30), () -> assertLookupRow(imported));
         int successorEpoch = client.getLeaderAndIsr(bucket).get().leaderEpoch();
         CompletedSnapshot next = cluster.triggerAndWaitSnapshot(bucket);
         awaitDeletion(dir);
+        assertThat(finish(handle).getFinishedTime()).isEqualTo(committed.getFinishedTime());
+        assertThat(begin(LOAD_ID, "p1").getStatus().getState())
+                .isEqualTo(BulkLoadTransaction.COMMITTED);
+        assertThatThrownBy(() -> abort(handle, "late abort"))
+                .hasRootCauseInstanceOf(BulkLoadStateException.class);
         commit();
         AllocateBulkLoadBucketSnapshotResponse replay =
                 coordinator
@@ -873,6 +1089,20 @@ class BulkLoadBucketCommitTest {
         restartTabletServer();
         retry(Duration.ofSeconds(30), () -> assertLookupRow(imported));
         assertLookupRow(appended);
+    }
+
+    private static TableDescriptor partitionedDescriptor() {
+        return TableDescriptor.builder()
+                .schema(
+                        Schema.newBuilder()
+                                .column("a", DataTypes.INT())
+                                .column("b", DataTypes.STRING())
+                                .column("pt", DataTypes.STRING())
+                                .primaryKey("a", "pt")
+                                .build())
+                .distributedBy(1, "a")
+                .partitionedBy("pt")
+                .build();
     }
 
     private static void awaitDeletion(FsPath path) {
@@ -1002,8 +1232,13 @@ class BulkLoadBucketCommitTest {
     }
 
     private void assertLookupRow(Tuple2<byte[], byte[]> row) throws Exception {
+        assertLookupRow(row, 1);
+    }
+
+    private void assertLookupRow(Tuple2<byte[], byte[]> row, int routingBucketCount)
+            throws Exception {
         LookupRequest request = newLookupRequest(bucket.getTableId(), bucket.getBucket(), row.f0);
-        request.getBucketsReqAt(0).setRoutingBucketCount(1);
+        request.getBucketsReqAt(0).setRoutingBucketCount(routingBucketCount);
         if (bucket.getPartitionId() != null) {
             request.getBucketsReqAt(0).setPartitionId(bucket.getPartitionId());
         }
