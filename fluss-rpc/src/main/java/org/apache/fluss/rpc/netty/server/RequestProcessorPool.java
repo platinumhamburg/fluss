@@ -58,9 +58,32 @@ final class RequestProcessorPool {
             RequestsMetrics requestsMetrics,
             int processorIndexOffset,
             String threadName) {
+        this(
+                numProcessors,
+                totalQueueCapacity,
+                maxPendingPerConnection,
+                service,
+                requestHandlers,
+                requestsMetrics,
+                processorIndexOffset,
+                threadName,
+                null);
+    }
+
+    RequestProcessorPool(
+            int numProcessors,
+            int totalQueueCapacity,
+            int maxPendingPerConnection,
+            RpcGatewayService service,
+            RequestHandler<?>[] requestHandlers,
+            RequestsMetrics requestsMetrics,
+            int processorIndexOffset,
+            String threadName,
+            RequestDispatchCoordinator dispatch) {
         this.processors = new RequestProcessor[numProcessors];
         this.requestChannels =
-                RequestChannel.forGroup(numProcessors, totalQueueCapacity, maxPendingPerConnection);
+                RequestChannel.forGroup(
+                        numProcessors, totalQueueCapacity, maxPendingPerConnection, dispatch);
         this.threadName = threadName;
 
         for (int i = 0; i < numProcessors; i++) {

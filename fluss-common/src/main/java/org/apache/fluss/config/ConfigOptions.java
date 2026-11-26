@@ -1360,6 +1360,22 @@ public class ConfigOptions {
                                     + "A separate internal listener has its own quota. All external "
                                     + "listeners share one quota.");
 
+    public static final ConfigOption<String> NETTY_SERVER_REQUEST_SCHEDULING_POLICY =
+            key("netty.server.request-scheduling-policy")
+                    .stringType()
+                    .defaultValue("connection")
+                    .withDescription(
+                            "RPC connection-head selection policy: connection, conflict-fifo, "
+                                    + "ready-fifo, or aged-ready. Conflict policies cover ordinary KV requests.");
+
+    public static final ConfigOption<Long> NETTY_SERVER_REQUEST_SCHEDULING_PROTECTION_MS =
+            key("netty.server.request-scheduling-protection-ms")
+                    .longType()
+                    .defaultValue(10L)
+                    .withDescription(
+                            "Waiting time in milliseconds before aged-ready protects an older "
+                                    + "conflicting request from later arrivals. Must be non-negative.");
+
     public static final ConfigOption<Integer> NETTY_SERVER_MAX_PENDING_REQUESTS_PER_CONNECTION =
             key("netty.server.max-pending-requests-per-connection")
                     .intType()

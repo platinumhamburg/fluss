@@ -141,6 +141,8 @@ When the server binds both the listener selected by `internal.listener.name` and
 | netty.server.num-worker-threads  | Integer    | 8       | The number of worker threads per listener resource group for processing requests, which may include disk and remote I/O. |
 | netty.server.max-pending-requests-per-connection | Integer | 5 | The maximum number of requests waiting to be claimed by a worker on each TCP connection, including a reserved read. |
 | netty.server.max-queued-requests | Integer | 500 | The maximum number of requests waiting to be claimed by workers in each listener resource group, including reserved reads. A separate internal listener has its own quota. All external listeners share one quota. |
+| netty.server.request-scheduling-policy | String | connection | Connection-head selection policy. Supported values are connection, conflict-fifo, ready-fifo, and aged-ready. |
+| netty.server.request-scheduling-protection-ms | Long | 10 | Waiting time before aged-ready protects an older conflicting request from later arrivals. Must be non-negative. |
 | netty.server.max-queued-historical-requests | Integer    | 50      | The maximum number of in-flight historical partition operations, including running and queued lookups and writes, before throttling new operations. This configuration can be updated dynamically without server restart. |
 | netty.server.max-request-size    | MemorySize | 100mb   | The maximum size of a single request that the server can receive. This limits the maximum frame length at the Netty pipeline level to protect the server from malicious clients sending oversized requests that could exhaust server memory. |
 | netty.connection.max-idle-time   | Duration   | 10min   | Close idle connections after the given time specified by this config.                                                                                                                                         |
@@ -359,3 +361,38 @@ The default is `10min`; connections close when neither reads nor writes occur fo
 
 See [Kafka Compatibility](../kafka-compatibility.md) for cluster setup, table properties,
 topic-to-table mapping, value conversion, and system columns.
+
+
+## RPC request scheduling
+
+The default `connection` policy uses per-connection FIFO queues and listener-group
+work stealing. The following policies additionally inspect ordinary KV request
+accesses before assigning a worker:
+
+| Policy | Selection |
+| --- | --- |
+| `conflict-fifo` | Preserve registration order between conflicting connection heads. Compatible reads may run concurrently. |
+| `ready-fifo` | Select the earliest head compatible with running accesses. A waiting multi-resource request does not reserve its idle resources. Continuous later reads may starve a writer. |
+| `aged-ready` | Select compatible heads while protecting older conflicting heads once the configured waiting interval has elapsed. In-flight accesses still finish normally. |
+
+All policies claim an entire RPC and preserve synchronous execution order within
+each TCP connection. The connection prefetch and group admission limits continue
+to apply. External and internal groups retain separate quotas and workers.
+Conflict policies share an access registry and its synchronization across groups
+within one server.
+
+Conflict extraction covers ordinary PutKv, Lookup, Lookup with insert-if-absent,
+and PrefixLookup. Historical requests, Kafka, and other request types retain
+their existing engine concurrency control. The access registry is an additional
+scheduling aid. Storage locks continue to coordinate recovery, background work,
+and accesses outside this registry.
+
+Single-bucket ordinary lookups with an independent read view and single-bucket,
+single-prefix lookups may release their read reservation after establishing
+that view. Other accesses retain their reservation until synchronous handling
+finishes. A connection's next request remains ineligible until that handler returns.
+
+The conflict policies are intended for comparative evaluation. Candidate selection
+scans visible connection heads and registered accesses. CPU overhead, shared-lock
+contention, writer waiting and business tail latency should be measured together
+before selecting a policy for a workload.

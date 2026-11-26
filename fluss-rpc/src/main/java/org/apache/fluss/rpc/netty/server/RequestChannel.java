@@ -50,10 +50,18 @@ public class RequestChannel {
     private RequestChannel(Group group) {
         this.group = group;
         this.available = group.lock.newCondition();
+        if (group.dispatch != null) {
+            group.dispatch.addWakeup(this::signal);
+        }
     }
 
     static RequestChannel[] forGroup(int workers, int capacity, int perConnection) {
-        Group group = new Group(workers, capacity, perConnection);
+        return forGroup(workers, capacity, perConnection, null);
+    }
+
+    static RequestChannel[] forGroup(
+            int workers, int capacity, int perConnection, RequestDispatchCoordinator dispatch) {
+        Group group = new Group(workers, capacity, perConnection, dispatch);
         RequestChannel[] channels = group.workers;
         for (int i = 0; i < workers; i++) {
             channels[i] = new RequestChannel(group);
@@ -160,7 +168,7 @@ public class RequestChannel {
             long remaining = TimeUnit.MILLISECONDS.toNanos(timeoutMs);
             Connection connection;
             while ((connection = claimReady()) == null) {
-                if (group.closed) {
+                if (group.closed && queued == 0) {
                     return ShutdownRequest.INSTANCE;
                 }
                 if (remaining <= 0) {
@@ -174,6 +182,11 @@ public class RequestChannel {
                 }
             }
             running = connection;
+            if (group.dispatch != null) {
+                group.dispatch.claim(connection.access);
+                RequestDispatchCoordinator.Access access = connection.access;
+                RequestAccessContext.enter(bucket -> group.dispatch.releaseRead(access, bucket));
+            }
             queued--;
             signalThief();
             if (stealWakeup) {
@@ -202,6 +215,11 @@ public class RequestChannel {
         try {
             Connection connection = running;
             running = null;
+            if (group.dispatch != null) {
+                RequestAccessContext.exit();
+                group.dispatch.remove(connection.access);
+                connection.access = null;
+            }
             if (!connection.pending.isEmpty()) {
                 makeReady(connection);
             }
@@ -246,12 +264,18 @@ public class RequestChannel {
 
     private void makeReady(Connection connection) {
         connection.readyOrder = group.nextReadyOrder++;
+        if (group.dispatch != null) {
+            connection.access = group.dispatch.register(connection.pending.getFirst());
+        }
         ready.addLast(connection);
         signal();
         signalThief();
     }
 
     private Connection claimReady() {
+        if (group.dispatch != null) {
+            return claimScheduled();
+        }
         if (!ready.isEmpty()) {
             return ready.removeFirst();
         }
@@ -282,6 +306,31 @@ public class RequestChannel {
             return oldest;
         }
         return null;
+    }
+
+    private Connection claimScheduled() {
+        Connection selected = null;
+        for (RequestChannel worker : group.workers) {
+            for (Connection candidate : worker.ready) {
+                if (group.dispatch.eligible(candidate.access)
+                        && (selected == null
+                                || group.dispatch.policy.precedes(
+                                        candidate.access.sequence, selected.access.sequence))) {
+                    selected = candidate;
+                }
+            }
+        }
+        if (selected != null) {
+            RequestChannel donor = selected.owner;
+            donor.ready.removeFirstOccurrence(selected);
+            if (donor != this) {
+                int pending = selected.pending.size();
+                donor.queued -= pending;
+                queued += pending;
+                selected.owner = this;
+            }
+        }
+        return selected;
     }
 
     private boolean canShare() {
@@ -315,6 +364,7 @@ public class RequestChannel {
         private final Runnable scheduleResume;
         private RequestChannel owner;
         private long readyOrder;
+        private RequestDispatchCoordinator.Access access;
         private ReadWait wait = ReadWait.NONE;
         private boolean readPermit;
         private boolean closed;
@@ -333,7 +383,8 @@ public class RequestChannel {
     }
 
     private static final class Group {
-        private final ReentrantLock lock = new ReentrantLock();
+        private final ReentrantLock lock;
+        private final RequestDispatchCoordinator dispatch;
         private final RequestChannel[] workers;
         private final int capacity;
         private final int perConnection;
@@ -343,6 +394,13 @@ public class RequestChannel {
         private boolean closed;
 
         private Group(int workers, int capacity, int perConnection) {
+            this(workers, capacity, perConnection, null);
+        }
+
+        private Group(
+                int workers, int capacity, int perConnection, RequestDispatchCoordinator dispatch) {
+            this.dispatch = dispatch;
+            this.lock = dispatch == null ? new ReentrantLock() : dispatch.lock;
             this.workers = new RequestChannel[workers];
             this.capacity = Math.max(1, capacity);
             this.perConnection = Math.max(1, perConnection);

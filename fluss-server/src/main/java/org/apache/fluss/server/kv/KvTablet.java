@@ -39,6 +39,7 @@ import org.apache.fluss.row.arrow.ArrowWriterPool;
 import org.apache.fluss.row.encode.KvValueLayout;
 import org.apache.fluss.row.encode.ValueDecoder;
 import org.apache.fluss.row.encode.ValueEncoder;
+import org.apache.fluss.rpc.netty.server.RequestAccessContext;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
@@ -1251,6 +1252,7 @@ public final class KvTablet {
                                 }
                                 return rocksDBKv.openMultiGet();
                             })) {
+                RequestAccessContext.releaseRead(tableBucket);
                 values = lookup.read(keys);
             }
         }
@@ -1314,6 +1316,7 @@ public final class KvTablet {
                             }
                             return rocksDBKv.openPrefixLookup(prefixKey);
                         })) {
+            RequestAccessContext.releaseRead(tableBucket);
             return toValueBodySlices(lookup.readAll());
         }
     }
