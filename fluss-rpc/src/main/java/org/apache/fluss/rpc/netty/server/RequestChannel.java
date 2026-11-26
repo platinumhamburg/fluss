@@ -265,7 +265,12 @@ public class RequestChannel {
     private void makeReady(Connection connection) {
         connection.readyOrder = group.nextReadyOrder++;
         if (group.dispatch != null) {
-            connection.access = group.dispatch.register(connection.pending.getFirst());
+            connection.access =
+                    group.dispatch.register(
+                            connection.pending.getFirst(),
+                            connection.source,
+                            group.dispatchGroup,
+                            group.workers.length);
         }
         ready.addLast(connection);
         signal();
@@ -309,17 +314,16 @@ public class RequestChannel {
     }
 
     private Connection claimScheduled() {
-        Connection selected = null;
+        java.util.List<RequestDispatchCoordinator.Access> candidates = new java.util.ArrayList<>();
+        java.util.Map<RequestDispatchCoordinator.Access, Connection> connections =
+                new java.util.HashMap<>();
         for (RequestChannel worker : group.workers) {
             for (Connection candidate : worker.ready) {
-                if (group.dispatch.eligible(candidate.access)
-                        && (selected == null
-                                || group.dispatch.policy.precedes(
-                                        candidate.access.sequence, selected.access.sequence))) {
-                    selected = candidate;
-                }
+                candidates.add(candidate.access);
+                connections.put(candidate.access, candidate);
             }
         }
+        Connection selected = connections.get(group.dispatch.select(candidates));
         if (selected != null) {
             RequestChannel donor = selected.owner;
             donor.ready.removeFirstOccurrence(selected);
@@ -365,12 +369,15 @@ public class RequestChannel {
         private RequestChannel owner;
         private long readyOrder;
         private RequestDispatchCoordinator.Access access;
+        private final RequestDispatchCoordinator.Source source;
         private ReadWait wait = ReadWait.NONE;
         private boolean readPermit;
         private boolean closed;
 
         private Connection(RequestChannel owner, Runnable scheduleResume) {
             this.owner = owner;
+            this.source =
+                    owner.group.dispatch == null ? null : new RequestDispatchCoordinator.Source();
             this.scheduleResume = scheduleResume;
         }
     }
@@ -385,6 +392,7 @@ public class RequestChannel {
     private static final class Group {
         private final ReentrantLock lock;
         private final RequestDispatchCoordinator dispatch;
+        private final int dispatchGroup;
         private final RequestChannel[] workers;
         private final int capacity;
         private final int perConnection;
@@ -400,6 +408,7 @@ public class RequestChannel {
         private Group(
                 int workers, int capacity, int perConnection, RequestDispatchCoordinator dispatch) {
             this.dispatch = dispatch;
+            this.dispatchGroup = dispatch == null ? -1 : dispatch.newGroup();
             this.lock = dispatch == null ? new ReentrantLock() : dispatch.lock;
             this.workers = new RequestChannel[workers];
             this.capacity = Math.max(1, capacity);

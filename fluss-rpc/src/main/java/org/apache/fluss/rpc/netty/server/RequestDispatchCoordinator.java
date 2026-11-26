@@ -17,15 +17,20 @@
 
 package org.apache.fluss.rpc.netty.server;
 
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.metadata.TableBucket;
 
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.LongSupplier;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
@@ -34,6 +39,13 @@ final class RequestDispatchCoordinator {
     final ReentrantLock lock = new ReentrantLock();
     final RequestSchedulingStrategy policy;
     private final long protectionNanos;
+    private final int bypassLimit;
+    private final long initialEstimateNanos;
+    private final LongSupplier clock;
+    private final Map<Integer, Long> estimates = new HashMap<>();
+    private int nextGroup;
+    private final Map<Integer, Double> virtualFloors = new HashMap<>();
+    private final int plannerMaxHeads;
     private final Map<TableBucket, Slot> slots = new HashMap<>();
     private final BitSet allocated = new BitSet();
     private final Map<Access, Boolean> requests = new LinkedHashMap<>();
@@ -41,9 +53,64 @@ final class RequestDispatchCoordinator {
     private long sequence;
 
     RequestDispatchCoordinator(RequestSchedulingStrategy policy, long protectionNanos) {
+        this(policy, protectionNanos, 1, 1_000_000L, System::nanoTime);
+    }
+
+    RequestDispatchCoordinator(
+            RequestSchedulingStrategy policy,
+            long protectionNanos,
+            int bypassLimit,
+            long initialEstimateNanos,
+            LongSupplier clock) {
+        this(policy, protectionNanos, bypassLimit, initialEstimateNanos, clock, 16);
+    }
+
+    RequestDispatchCoordinator(
+            RequestSchedulingStrategy policy,
+            long protectionNanos,
+            int bypassLimit,
+            long initialEstimateNanos,
+            LongSupplier clock,
+            int plannerMaxHeads) {
+        checkArgument(plannerMaxHeads > 0, "Planning head limit must be positive");
+        this.plannerMaxHeads = plannerMaxHeads;
         checkArgument(protectionNanos >= 0, "Negative scheduling protection interval");
+        checkArgument(bypassLimit >= 0, "Negative bypass limit");
+        checkArgument(initialEstimateNanos > 0, "Service estimate must be positive");
         this.policy = policy;
         this.protectionNanos = protectionNanos;
+        this.bypassLimit = bypassLimit;
+        this.initialEstimateNanos = initialEstimateNanos;
+        this.clock = clock;
+    }
+
+    static RequestDispatchCoordinator fromConfiguration(Configuration configuration) {
+        RequestSchedulingPolicy preset =
+                RequestSchedulingPolicy.parse(
+                        configuration.get(ConfigOptions.NETTY_SERVER_REQUEST_SCHEDULING_POLICY));
+        String waiting = configuration.get(ConfigOptions.NETTY_SERVER_REQUEST_WAITING_POLICY);
+        if (preset == RequestSchedulingPolicy.CONNECTION && waiting.isEmpty()) {
+            return null;
+        }
+        return new RequestDispatchCoordinator(
+                preset.withWaiting(waiting),
+                java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
+                        configuration.get(
+                                ConfigOptions.NETTY_SERVER_REQUEST_SCHEDULING_PROTECTION_MS)),
+                configuration.get(ConfigOptions.NETTY_SERVER_REQUEST_BYPASS_LIMIT),
+                java.util.concurrent.TimeUnit.MICROSECONDS.toNanos(
+                        configuration.get(ConfigOptions.NETTY_SERVER_REQUEST_INITIAL_ESTIMATE_US)),
+                System::nanoTime,
+                configuration.get(ConfigOptions.NETTY_SERVER_REQUEST_PLANNER_MAX_HEADS));
+    }
+
+    int newGroup() {
+        lock.lock();
+        try {
+            return nextGroup++;
+        } finally {
+            lock.unlock();
+        }
     }
 
     void addWakeup(Runnable wakeup) {
@@ -55,8 +122,21 @@ final class RequestDispatchCoordinator {
         }
     }
 
-    Access register(RpcRequest request) {
-        Access access = new Access(sequence++, System.nanoTime());
+    Access register(RpcRequest request, Source source, int group, int workers) {
+        long now = clock.getAsLong();
+        RequestSchedulingInfo info = request.schedulingInfo();
+        int type = request.getRequestType().id;
+        int estimateKey =
+                request instanceof FlussRequest
+                        ? 65536 + Short.toUnsignedInt(((FlussRequest) request).getApiKey())
+                        : type;
+        long estimate =
+                info.estimatedNanos() > 0
+                        ? info.estimatedNanos()
+                        : estimates.getOrDefault(estimateKey, initialEstimateNanos);
+        source.virtualTime = Math.max(source.virtualTime, virtualFloors.getOrDefault(group, 0.0));
+        Access access =
+                new Access(sequence++, now, estimate, info, source, group, workers, estimateKey);
         access.earlyRelease =
                 RequestAccessProvider.describe(
                         request, (bucket, write) -> add(access, bucket, write));
@@ -79,25 +159,66 @@ final class RequestDispatchCoordinator {
         (write ? access.writes : access.reads).set(slot.index);
     }
 
-    boolean eligible(Access candidate) {
-        long now = System.nanoTime();
+    Access select(List<Access> candidates) {
+        long now = clock.getAsLong();
+        List<RequestSchedulingContext.Request> waiting = new ArrayList<>();
+        List<RequestSchedulingContext.Request> running = new ArrayList<>();
+        List<RequestSchedulingContext.Request> local = new ArrayList<>();
+        Map<Long, Access> bySequence = new HashMap<>();
+        Set<Access> candidateSet = new HashSet<>(candidates);
         for (Map.Entry<Access, Boolean> entry : requests.entrySet()) {
-            Access other = entry.getKey();
-            if (other == candidate || !conflicts(candidate, other)) {
-                continue;
-            }
-            if (entry.getValue()) {
-                return false;
-            }
-            boolean protect = policy.protects(now - other.createdNanos, protectionNanos);
-            if (protect && policy.precedes(other.sequence, candidate.sequence)) {
-                return false;
+            Access access = entry.getKey();
+            boolean active = entry.getValue();
+            long elapsed = active ? Math.max(0, now - access.startedNanos) : 0;
+            RequestSchedulingContext.Request view =
+                    new RequestSchedulingContext.Request(
+                            access.sequence,
+                            access.createdNanos,
+                            access.estimateNanos,
+                            access.info.deadlineNanos(),
+                            Math.max(1, access.estimateNanos - elapsed),
+                            access.bypasses,
+                            access.group,
+                            access.workers,
+                            access.source.virtualTime,
+                            access.reads,
+                            access.writes);
+            bySequence.put(access.sequence, access);
+            (active ? running : waiting).add(view);
+            if (candidateSet.contains(access)) {
+                local.add(view);
             }
         }
-        return true;
+        RequestSchedulingContext context =
+                new RequestSchedulingContext(
+                        local,
+                        waiting,
+                        running,
+                        now,
+                        protectionNanos,
+                        bypassLimit,
+                        plannerMaxHeads);
+        RequestSchedulingContext.Request selected = policy.select(context);
+        if (selected == null) {
+            return null;
+        }
+        checkArgument(
+                local.contains(selected) && context.canRun(selected),
+                "Strategy selected an unavailable connection head");
+        return bySequence.get(selected.sequence());
     }
 
     void claim(Access access) {
+        for (Map.Entry<Access, Boolean> entry : requests.entrySet()) {
+            Access waiting = entry.getKey();
+            if (!entry.getValue()
+                    && waiting.sequence < access.sequence
+                    && conflicts(access, waiting)
+                    && waiting.bypasses < Integer.MAX_VALUE) {
+                waiting.bypasses++;
+            }
+        }
+        access.startedNanos = clock.getAsLong();
         requests.put(access, true);
     }
 
@@ -115,7 +236,20 @@ final class RequestDispatchCoordinator {
     }
 
     void remove(Access access) {
-        requests.remove(access);
+        boolean ran = Boolean.TRUE.equals(requests.remove(access));
+        if (ran) {
+            long elapsed = Math.max(1, clock.getAsLong() - access.startedNanos);
+            long old = estimates.getOrDefault(access.estimateKey, elapsed);
+            estimates.put(access.estimateKey, old - old / 8 + elapsed / 8);
+            access.source.virtualTime += elapsed / access.info.weight();
+            double minimum = access.source.virtualTime;
+            for (Access outstanding : requests.keySet()) {
+                if (outstanding.group == access.group) {
+                    minimum = Math.min(minimum, outstanding.source.virtualTime);
+                }
+            }
+            virtualFloors.merge(access.group, minimum, Math::max);
+        }
         access.resources.forEach(
                 (bucket, slot) -> {
                     if (--slot.references == 0) {
@@ -140,10 +274,37 @@ final class RequestDispatchCoordinator {
         final BitSet writes = new BitSet();
         final Map<TableBucket, Slot> resources = new HashMap<>();
 
-        Access(long sequence, long createdNanos) {
+        final long estimateNanos;
+        final RequestSchedulingInfo info;
+        final Source source;
+        final int group;
+        final int workers;
+        final int estimateKey;
+        long startedNanos;
+        int bypasses;
+
+        Access(
+                long sequence,
+                long createdNanos,
+                long estimateNanos,
+                RequestSchedulingInfo info,
+                Source source,
+                int group,
+                int workers,
+                int estimateKey) {
             this.sequence = sequence;
             this.createdNanos = createdNanos;
+            this.estimateNanos = estimateNanos;
+            this.info = info;
+            this.source = source;
+            this.group = group;
+            this.workers = workers;
+            this.estimateKey = estimateKey;
         }
+    }
+
+    static final class Source {
+        private double virtualTime;
     }
 
     private static final class Slot {

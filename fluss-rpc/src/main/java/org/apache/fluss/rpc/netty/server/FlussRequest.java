@@ -54,6 +54,8 @@ public final class FlussRequest implements RpcRequest {
     private volatile long requestCompletedTimeMs;
     private volatile boolean cancelled = false;
 
+    private final RequestSchedulingInfo schedulingInfo;
+
     public FlussRequest(
             short apiKey,
             short apiVersion,
@@ -66,6 +68,36 @@ public final class FlussRequest implements RpcRequest {
             FlussPrincipal principal,
             InetAddress address,
             CompletableFuture<ApiMessage> responseFuture) {
+        this(
+                apiKey,
+                apiVersion,
+                requestId,
+                apiMethod,
+                message,
+                buffer,
+                listenerName,
+                isInternal,
+                principal,
+                address,
+                responseFuture,
+                RequestSchedulingInfo.DEFAULT);
+    }
+
+    /** Creates a request with trusted server-side scheduling inputs. */
+    public FlussRequest(
+            short apiKey,
+            short apiVersion,
+            int requestId,
+            ApiMethod apiMethod,
+            ApiMessage message,
+            ByteBuf buffer,
+            String listenerName,
+            boolean isInternal,
+            FlussPrincipal principal,
+            InetAddress address,
+            CompletableFuture<ApiMessage> responseFuture,
+            RequestSchedulingInfo schedulingInfo) {
+        this.schedulingInfo = checkNotNull(schedulingInfo);
         this.apiKey = apiKey;
         this.apiVersion = apiVersion;
         this.requestId = requestId;
@@ -78,6 +110,11 @@ public final class FlussRequest implements RpcRequest {
         this.address = address;
         this.listenerName = listenerName;
         this.startTimeMs = System.currentTimeMillis();
+    }
+
+    @Override
+    public RequestSchedulingInfo schedulingInfo() {
+        return schedulingInfo;
     }
 
     @Override

@@ -141,8 +141,12 @@ When the server binds both the listener selected by `internal.listener.name` and
 | netty.server.num-worker-threads  | Integer    | 8       | The number of worker threads per listener resource group for processing requests, which may include disk and remote I/O. |
 | netty.server.max-pending-requests-per-connection | Integer | 5 | The maximum number of requests waiting to be claimed by a worker on each TCP connection, including a reserved read. |
 | netty.server.max-queued-requests | Integer | 500 | The maximum number of requests waiting to be claimed by workers in each listener resource group, including reserved reads. A separate internal listener has its own quota. All external listeners share one quota. |
-| netty.server.request-scheduling-policy | String | connection | Connection-head selection policy. Supported values are connection, conflict-fifo, ready-fifo, and aged-ready. |
+| netty.server.request-scheduling-policy | String | connection | Whole-RPC scheduling preset. See [RPC request scheduling](#rpc-request-scheduling). |
 | netty.server.request-scheduling-protection-ms | Long | 10 | Waiting time before aged-ready protects an older conflicting request from later arrivals. Must be non-negative. |
+| netty.server.request-scheduling-waiting-policy | String | (empty) | Optional override: none, fifo, limited-bypass, age, earliest-start, or all-starts. Empty uses the preset. |
+| netty.server.request-scheduling-bypass-limit | Integer | 1 | Later conflicting claims permitted by limited-bypass. Must be non-negative. |
+| netty.server.request-scheduling-initial-estimate-us | Long | 1000 | Bootstrap synchronous service estimate in microseconds before measurements are available. Must be positive. |
+| netty.server.request-scheduling-planner-max-heads | Integer | 16 | Maximum visible waiting and running requests for predictive interval planning. Above the limit, predictive policies try only the group's oldest head with conflict-FIFO protection. Must be positive. |
 | netty.server.max-queued-historical-requests | Integer    | 50      | The maximum number of in-flight historical partition operations, including running and queued lookups and writes, before throttling new operations. This configuration can be updated dynamically without server restart. |
 | netty.server.max-request-size    | MemorySize | 100mb   | The maximum size of a single request that the server can receive. This limits the maximum frame length at the Netty pipeline level to protect the server from malicious clients sending oversized requests that could exhaust server memory. |
 | netty.connection.max-idle-time   | Duration   | 10min   | Close idle connections after the given time specified by this config.                                                                                                                                         |
@@ -365,34 +369,126 @@ topic-to-table mapping, value conversion, and system columns.
 
 ## RPC request scheduling
 
-The default `connection` policy uses per-connection FIFO queues and listener-group
-work stealing. The following policies additionally inspect ordinary KV request
-accesses before assigning a worker:
+The default `connection` preset retains the connection queues and work stealing
+without constructing conflict snapshots. Other presets use the same whole-RPC
+claim path and combine one waiting-protection rule with one candidate-ranking
+rule. The frame decoder, per-connection FIFO, listener-group quotas, protocol
+responses, and storage locks continue to manage their existing responsibilities.
 
-| Policy | Selection |
+### Policy presets
+
+| Configuration value | Waiting protection | Candidate ranking |
+| --- | --- | --- |
+| `connection` | Original connection scheduling | Original local-first and stealing order |
+| `conflict-fifo` | Conflict registration order | Arrival |
+| `ready-fifo` | None | Arrival |
+| `aged-ready` | Waiting age | Arrival |
+| `limited-bypass` | Bounded conflicting claims | Arrival |
+| `easy-backfill` | Earliest waiting request's predicted start | Arrival |
+| `conservative-backfill` | All earlier waiting requests' predicted starts | Arrival |
+| `shortest-job` | None | Estimated synchronous service time |
+| `earliest-deadline` | None | Trusted monotonic deadline |
+| `blocking-impact` | None | Potential transitive dependents |
+| `shortest-makespan` | None | Trial schedule's final predicted completion |
+| `virtual-time` | None | Per-connection weighted synchronous service |
+
+Use `netty.server.request-scheduling-waiting-policy` to override protection
+independently of ranking. For example:
+
+```yaml
+netty.server.request-scheduling-policy: shortest-job
+netty.server.request-scheduling-waiting-policy: limited-bypass
+netty.server.request-scheduling-bypass-limit: 2
+```
+
+All six protection rules can combine with all six ranking rules. `ready-fifo`
+provides arrival ranking when choosing a protection override. A waiting-rule
+override with `connection` enables conflict-aware arrival ranking.
+
+### Waiting protection
+
+| Override value | Rule |
 | --- | --- |
-| `conflict-fifo` | Preserve registration order between conflicting connection heads. Compatible reads may run concurrently. |
-| `ready-fifo` | Select the earliest head compatible with running accesses. A waiting multi-resource request does not reserve its idle resources. Continuous later reads may starve a writer. |
-| `aged-ready` | Select compatible heads while protecting older conflicting heads once the configured waiting interval has elapsed. In-flight accesses still finish normally. |
+| `none` | Waiting requests reserve no resources. Continuous compatible reads may starve a writer. |
+| `fifo` | An older conflicting visible head has priority over a later head. Compatible reads can run concurrently. |
+| `limited-bypass` | Each actual claim increments the count of older conflicting waiters it bypasses. At the limit, further conflicting overtaking stops. |
+| `age` | At the configured waiting age, stop admitting new conflicting overtakers and let in-flight work finish. |
+| `earliest-start` | Trial a candidate now and reject it if it delays the earliest waiting head's predicted start. |
+| `all-starts` | Trial a candidate now and reject it if it delays any earlier waiting head's predicted start. |
 
-All policies claim an entire RPC and preserve synchronous execution order within
-each TCP connection. The connection prefetch and group admission limits continue
-to apply. External and internal groups retain separate quotas and workers.
-Conflict policies share an access registry and its synchronization across groups
-within one server.
+Predicted-start rules compare resource-time reservations and synchronous worker
+capacity in each listener group. A long request on unrelated data can still
+consume the worker needed by a protected request. Registrations and reservations
+are recomputed at each decision using current in-flight estimates. Predictions
+can be wrong, particularly after a running request exceeds its expected duration.
+These policies preserve predicted starts within the current decision model.
+
+### Ranking and input data
+
+Ranking breaks ties by head-registration order. Compatible candidates are ranked
+only within the claiming worker's group. Waiting protection may additionally
+restrict which candidates can participate.
+
+- Arrival chooses the earliest visible head.
+- Shortest job chooses the smallest estimated synchronous duration.
+- Earliest deadline chooses the smallest explicitly supplied deadline. Missing
+  deadlines rank last. If all deadlines are absent, arrival order breaks ties.
+- Blocking impact counts unique transitive descendants in the potential conflict
+  graph oriented from earlier to later registrations. Its graph represents structural
+  blocking potential. Engine lock-wait graphs remain separate inputs.
+- Shortest makespan trials each candidate first, then places the remaining visible
+  heads in registration order at their earliest resource- and worker-compatible
+  intervals. It chooses the trial's earliest final completion. This is one-step
+  lookahead with a fixed continuation order.
+- Virtual time chooses the connection with the least weighted synchronous service.
+  Completed handler time is divided by the request's trusted service weight.
+  History follows the connection across worker migration. Each group maintains
+  its own minimum virtual time, preventing an idle or new connection from
+  accumulating unlimited credit from time spent away.
+
+`RequestSchedulingInfo` supplies trusted server-side duration, monotonic deadline,
+and service weight. Existing Fluss request constructors remain supported, with an
+overload accepting these inputs. Other protocol request implementations can
+override `RpcRequest.schedulingInfo()`. These are server-side interfaces and do
+not add client protocol fields. Default requests have no deadline and weight one.
+
+Without an explicit duration, the server estimates synchronous occupancy per
+Fluss API key or other protocol type. It starts from the configured bootstrap
+duration, then updates with a one-eighth EWMA of measured handler occupancy.
+Predictions do not include asynchronous ACK latency. A single API-key estimate
+does not distinguish record counts, hot data, replicas, or scan lengths.
+
+### Planning cost and fallback
+
+The three predictive policies perform interval scheduling only when the total
+visible waiting and running requests is within
+`netty.server.request-scheduling-planner-max-heads`. Above the limit they
+use the group's oldest visible head with conflict-FIFO protection, without trial
+planning. If that head is blocked, the worker waits for a state change. This
+explicit fallback limits planning work while retaining a forward-progress path.
+The limit applies to the whole decision, including other listener groups.
+Increasing it requires measuring selection CPU and internal-group tail latency.
+
+Blocking-impact computes transitive weights once per decision using descendant
+bitmaps. Snapshot construction, selection and claim currently use the shared
+coordinator lock. These experimental policies still require workload-level cost
+measurements before production selection.
+
+### Access coverage and release
 
 Conflict extraction covers ordinary PutKv, Lookup, Lookup with insert-if-absent,
-and PrefixLookup. Historical requests, Kafka, and other request types retain
-their existing engine concurrency control. The access registry is an additional
-scheduling aid. Storage locks continue to coordinate recovery, background work,
-and accesses outside this registry.
+and PrefixLookup. Historical requests, Kafka, recovery and background operations
+continue to rely on engine concurrency control. External and internal listeners
+retain separate quotas and workers while sharing the conflict view.
 
-Single-bucket ordinary lookups with an independent read view and single-bucket,
-single-prefix lookups may release their read reservation after establishing
-that view. Other accesses retain their reservation until synchronous handling
-finishes. A connection's next request remains ineligible until that handler returns.
+Single-bucket lookups with an independent read view and single-bucket,
+single-prefix lookups can release a read reservation after establishing that
+view. Other reservations remain until synchronous handling finishes. A
+connection's next RPC always waits for its previous synchronous handler.
 
-The conflict policies are intended for comparative evaluation. Candidate selection
-scans visible connection heads and registered accesses. CPU overhead, shared-lock
-contention, writer waiting and business tail latency should be measured together
-before selecting a policy for a workload.
+The predicted-start rules adapt the reservation approach described in
+[Utilization and Predictability in Scheduling](https://www.cs.umd.edu/~hollings/cs818z/s99/papers/feitelson.pdf).
+Blocking-impact uses a potential dependency model inspired by
+[contention-aware scheduling](https://dev.mysql.com/worklog/task/?id=13468).
+The pure selection interface also permits other strategies to consume the same
+immutable resource, capacity, cost, and service-history snapshot.

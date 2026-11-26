@@ -57,7 +57,6 @@ import java.util.ServiceLoader;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
@@ -130,18 +129,7 @@ public final class NettyServer implements RpcServer {
             requestsMetrics.registerKafkaRequestMetrics();
         }
         this.internalListenerName = conf.get(ConfigOptions.INTERNAL_LISTENER_NAME);
-        RequestSchedulingPolicy policy =
-                RequestSchedulingPolicy.parse(
-                        conf.get(ConfigOptions.NETTY_SERVER_REQUEST_SCHEDULING_POLICY));
-        RequestDispatchCoordinator dispatch =
-                policy == RequestSchedulingPolicy.CONNECTION
-                        ? null
-                        : new RequestDispatchCoordinator(
-                                policy,
-                                TimeUnit.MILLISECONDS.toNanos(
-                                        conf.get(
-                                                ConfigOptions
-                                                        .NETTY_SERVER_REQUEST_SCHEDULING_PROTECTION_MS)));
+        RequestDispatchCoordinator dispatch = RequestDispatchCoordinator.fromConfiguration(conf);
         this.externalResources =
                 new ServerRpcResources(
                         conf, service, requestHandlers, requestsMetrics, 0, "", dispatch);

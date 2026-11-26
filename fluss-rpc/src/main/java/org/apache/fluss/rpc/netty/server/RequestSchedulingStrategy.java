@@ -17,12 +17,8 @@
 
 package org.apache.fluss.rpc.netty.server;
 
-/** Waiting protection and ordering decisions, independent of queue and resource ownership. */
+/** Selects a whole connection-head RPC from an immutable view. */
 public interface RequestSchedulingStrategy {
-
-    /** Whether an older waiting request should block later conflicting candidates. */
-    boolean protects(long waitingNanos, long protectionNanos);
-
-    /** Whether the first candidate should precede the second in registration order. */
-    boolean precedes(long firstSequence, long secondSequence);
+    /** Returns a member of the candidate list, or null. Ownership remains with the framework. */
+    RequestSchedulingContext.Request select(RequestSchedulingContext context);
 }

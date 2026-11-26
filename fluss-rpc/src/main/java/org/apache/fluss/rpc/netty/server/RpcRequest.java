@@ -25,6 +25,11 @@ public interface RpcRequest {
     /** Returns the type of the RPC request. */
     RequestType getRequestType();
 
+    /** Returns optional server-side cost, deadline and service-weight inputs. */
+    default RequestSchedulingInfo schedulingInfo() {
+        return RequestSchedulingInfo.DEFAULT;
+    }
+
     /** Releases the Netty buffer associated with this request. */
     void releaseBuffer();
 }

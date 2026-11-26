@@ -1365,8 +1365,38 @@ public class ConfigOptions {
                     .stringType()
                     .defaultValue("connection")
                     .withDescription(
-                            "RPC connection-head selection policy: connection, conflict-fifo, "
-                                    + "ready-fifo, or aged-ready. Conflict policies cover ordinary KV requests.");
+                            "Whole-RPC scheduling preset. See the request scheduling documentation for supported protection and ranking rules.");
+
+    public static final ConfigOption<Integer> NETTY_SERVER_REQUEST_PLANNER_MAX_HEADS =
+            key("netty.server.request-scheduling-planner-max-heads")
+                    .intType()
+                    .defaultValue(16)
+                    .withDescription(
+                            "Maximum total visible waiting and running requests for predictive "
+                                    + "interval planning. Above this limit, predictive policies try only the group's "
+                                    + "oldest head with conflict-FIFO protection. Must be positive.");
+
+    public static final ConfigOption<String> NETTY_SERVER_REQUEST_WAITING_POLICY =
+            key("netty.server.request-scheduling-waiting-policy")
+                    .stringType()
+                    .defaultValue("")
+                    .withDescription(
+                            "Optional waiting-rule override: none, fifo, limited-bypass, age, "
+                                    + "earliest-start, or all-starts. Empty uses the selected preset.");
+
+    public static final ConfigOption<Integer> NETTY_SERVER_REQUEST_BYPASS_LIMIT =
+            key("netty.server.request-scheduling-bypass-limit")
+                    .intType()
+                    .defaultValue(1)
+                    .withDescription(
+                            "Number of later conflicting claims allowed by limited-bypass. Must be non-negative.");
+
+    public static final ConfigOption<Long> NETTY_SERVER_REQUEST_INITIAL_ESTIMATE_US =
+            key("netty.server.request-scheduling-initial-estimate-us")
+                    .longType()
+                    .defaultValue(1000L)
+                    .withDescription(
+                            "Bootstrap synchronous service estimate in microseconds before a request type has measurements. Must be positive.");
 
     public static final ConfigOption<Long> NETTY_SERVER_REQUEST_SCHEDULING_PROTECTION_MS =
             key("netty.server.request-scheduling-protection-ms")

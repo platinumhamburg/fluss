@@ -19,25 +19,75 @@ package org.apache.fluss.rpc.netty.server;
 
 import java.util.Locale;
 
-/** Ordering rules for whole connection-head RPCs, after protocol ordering is satisfied. */
+/** Named presets for independently composable waiting protection and candidate ranking. */
 public enum RequestSchedulingPolicy implements RequestSchedulingStrategy {
-    CONNECTION,
-    CONFLICT_FIFO,
-    READY_FIFO,
-    AGED_READY;
+    CONNECTION(Waiting.NONE, Ranking.ARRIVAL),
+    CONFLICT_FIFO(Waiting.FIFO, Ranking.ARRIVAL),
+    READY_FIFO(Waiting.NONE, Ranking.ARRIVAL),
+    AGED_READY(Waiting.AGE, Ranking.ARRIVAL),
+    LIMITED_BYPASS(Waiting.LIMITED_BYPASS, Ranking.ARRIVAL),
+    EASY_BACKFILL(Waiting.EARLIEST_START, Ranking.ARRIVAL),
+    CONSERVATIVE_BACKFILL(Waiting.ALL_STARTS, Ranking.ARRIVAL),
+    SHORTEST_JOB(Waiting.NONE, Ranking.SHORTEST_JOB),
+    EARLIEST_DEADLINE(Waiting.NONE, Ranking.EARLIEST_DEADLINE),
+    BLOCKING_IMPACT(Waiting.NONE, Ranking.BLOCKING_IMPACT),
+    SHORTEST_MAKESPAN(Waiting.NONE, Ranking.SHORTEST_MAKESPAN),
+    VIRTUAL_TIME(Waiting.NONE, Ranking.VIRTUAL_TIME);
 
-    @Override
-    public boolean protects(long waitingNanos, long protectionNanos) {
-        return this == CONFLICT_FIFO || (this == AGED_READY && waitingNanos >= protectionNanos);
+    /** Rules protecting earlier waiting requests. */
+    public enum Waiting {
+        NONE,
+        FIFO,
+        LIMITED_BYPASS,
+        AGE,
+        EARLIEST_START,
+        ALL_STARTS
+    }
+
+    /** Rules ranking compatible candidate heads. */
+    public enum Ranking {
+        ARRIVAL,
+        SHORTEST_JOB,
+        EARLIEST_DEADLINE,
+        BLOCKING_IMPACT,
+        SHORTEST_MAKESPAN,
+        VIRTUAL_TIME
+    }
+
+    private final Waiting waiting;
+    private final Ranking ranking;
+
+    RequestSchedulingPolicy(Waiting waiting, Ranking ranking) {
+        this.waiting = waiting;
+        this.ranking = ranking;
     }
 
     @Override
-    public boolean precedes(long firstSequence, long secondSequence) {
-        return firstSequence < secondSequence;
+    public RequestSchedulingContext.Request select(RequestSchedulingContext context) {
+        return RequestSchedulingRules.select(context, waiting, ranking);
     }
 
-    /** Parses the configured policy name. */
+    /** Composes a waiting rule with a candidate-ranking rule. */
+    public static RequestSchedulingStrategy compose(Waiting waiting, Ranking ranking) {
+        return context -> RequestSchedulingRules.select(context, waiting, ranking);
+    }
+
+    /** Returns this preset with an explicit waiting-rule override. */
+    public RequestSchedulingStrategy withWaiting(String rule) {
+        return rule.isEmpty() ? this : compose(parseWaiting(rule), ranking);
+    }
+
+    /** Parses a named preset. */
     public static RequestSchedulingPolicy parse(String name) {
-        return valueOf(name.replace('-', '_').toUpperCase(Locale.ROOT));
+        return valueOf(normalize(name));
+    }
+
+    /** Parses a waiting rule for composition. */
+    public static Waiting parseWaiting(String name) {
+        return Waiting.valueOf(normalize(name));
+    }
+
+    private static String normalize(String name) {
+        return name.replace('-', '_').toUpperCase(Locale.ROOT);
     }
 }
